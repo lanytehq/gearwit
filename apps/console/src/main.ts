@@ -1,5 +1,6 @@
 import { events, seats } from "./fixtures";
 import {
+  countArmedWaits,
   countUnknownFacts,
   evidenceGlyph,
   evidenceLabel,
@@ -31,13 +32,18 @@ function tier(evidence: EvidenceClass): HTMLElement {
   return badge;
 }
 
-function factRow(label: string, fact: ObservedFact<string>): HTMLElement {
+function factRow<T>(
+  label: string,
+  fact: ObservedFact<T>,
+  format: (value: T) => string,
+): HTMLElement {
   const row = document.createElement("div");
   row.className = "fact-row";
   row.append(text("dt", label));
 
   const value = document.createElement("dd");
-  value.append(tier(fact.evidence), document.createTextNode(fact.value ?? "Unknown"));
+  const displayValue = fact.kind === "known" ? format(fact.value) : "Unknown";
+  value.append(tier(fact.evidence), document.createTextNode(displayValue));
   row.append(value);
   return row;
 }
@@ -73,9 +79,9 @@ function seatCard(seat: Seat): HTMLElement {
 
   const facts = document.createElement("dl");
   facts.append(
-    factRow("Harness", seat.harness),
-    factRow("Activity", seat.activity),
-    factRow("Wait", seat.wait),
+    factRow("Harness", seat.harness, String),
+    factRow("Activity", seat.activity, String),
+    factRow("Wait", seat.wait, (wait) => wait.label),
   );
   article.append(heading, facts);
   return article;
@@ -93,9 +99,7 @@ function render(): void {
   requiredElement("#attention-count").textContent = String(
     events.filter((event) => event.level === "act").length,
   );
-  requiredElement("#armed-count").textContent = String(
-    seats.filter((seat) => seat.wait.value !== null).length,
-  );
+  requiredElement("#armed-count").textContent = String(countArmedWaits(seats));
   requiredElement("#unknown-count").textContent = String(countUnknownFacts(seats));
   requiredElement("#seat-count").textContent = `${seats.length} seats`;
 

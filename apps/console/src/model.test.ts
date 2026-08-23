@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { events, seats } from "./fixtures";
-import { countUnknownFacts, filterEvents } from "./model";
+import { countArmedWaits, countUnknownFacts, filterEvents } from "./model";
 
 describe("attention projection", () => {
   test("filters without changing source order", () => {
@@ -15,5 +15,9 @@ describe("attention projection", () => {
 
   test("counts unknown facts rather than unknown seats", () => {
     expect(countUnknownFacts(seats)).toBe(3);
+  });
+
+  test("does not count ended wait coverage as armed", () => {
+    expect(countArmedWaits(seats)).toBe(1);
   });
 });

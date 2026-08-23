@@ -3,13 +3,18 @@ export type EvidenceClass =
   | "self_declared"
   | "census_inferred"
   | "unknown";
+export type KnownEvidenceClass = Exclude<EvidenceClass, "unknown">;
 
 export type AttentionLevel = "act" | "watch" | "record";
 export type AttentionFilter = "all" | "act" | "watch";
 
-export interface ObservedFact<T> {
-  value: T | null;
-  evidence: EvidenceClass;
+export type ObservedFact<T> =
+  | { kind: "known"; value: T; evidence: KnownEvidenceClass }
+  | { kind: "unknown"; evidence: "unknown" };
+
+export interface WaitState {
+  label: string;
+  phase: "armed" | "coverage_ended";
 }
 
 export interface AttentionEvent {
@@ -29,7 +34,7 @@ export interface Seat {
   source: "sourced-runwit" | "sourced-open";
   harness: ObservedFact<string>;
   activity: ObservedFact<string>;
-  wait: ObservedFact<string>;
+  wait: ObservedFact<WaitState>;
 }
 
 export const evidenceLabel: Record<EvidenceClass, string> = {
@@ -57,7 +62,13 @@ export function filterEvents(
 export function countUnknownFacts(seats: readonly Seat[]): number {
   return seats.reduce((count, seat) => {
     return count + [seat.harness, seat.activity, seat.wait].filter(
-      (fact) => fact.evidence === "unknown",
+      (fact) => fact.kind === "unknown",
     ).length;
   }, 0);
+}
+
+export function countArmedWaits(seats: readonly Seat[]): number {
+  return seats.filter(
+    (seat) => seat.wait.kind === "known" && seat.wait.value.phase === "armed",
+  ).length;
 }
