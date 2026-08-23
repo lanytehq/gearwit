@@ -3,7 +3,10 @@
 //! Wraps `chanvoy wait`. This process completing is not proof that the harness
 //! started a model turn. Receipts keep those facts separate.
 
-use std::process::Command;
+use std::io;
+use std::process::{Command, ExitStatus};
+
+use crate::sanitize::{MAX_ID, MAX_TIMEOUT, paste_field, paste_token};
 
 /// Arguments for an in-process wait.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +54,73 @@ impl WaitResult {
     }
 }
 
+/// Whether a waiter child process actually started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaiterState {
+    /// The runner was not started (missing binary or rejected spec).
+    NotStarted,
+    /// The waiter child ran to a status.
+    Completed,
+}
+
+impl WaiterState {
+    /// Stable token for the local receipt face.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "false",
+            Self::Completed => "true",
+        }
+    }
+}
+
+/// Outcome of an in-process wait attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WaitOutcome {
+    /// Whether a waiter child started.
+    pub waiter: WaiterState,
+    /// Classified child result. Not a harness-turn claim.
+    pub result: WaitResult,
+    /// Raw child exit code, if any.
+    pub chanvoy_exit: Option<i32>,
+    /// Process exit: 0 matched, 1 timeout, otherwise 2.
+    pub process_exit: i32,
+}
+
+/// Spawn a waiter. Tests inject a missing runner.
+pub trait WaitRunner {
+    /// Run `chanvoy wait` argv and return the child status.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors such as a missing executable.
+    fn run(&self, args: &[String]) -> io::Result<ExitStatus>;
+}
+
+/// Default runner: exec `chanvoy` from `PATH`.
+pub struct ChanvoyRunner;
+
+impl WaitRunner for ChanvoyRunner {
+    fn run(&self, args: &[String]) -> io::Result<ExitStatus> {
+        Command::new("chanvoy").args(args).status()
+    }
+}
+
+/// True when every spec field is paste-safe.
+#[must_use]
+pub fn spec_is_paste_safe(spec: &WaitOnSpec) -> bool {
+    paste_token(&spec.channel, MAX_ID).is_some()
+        && spec
+            .after
+            .as_deref()
+            .is_none_or(|after| paste_token(after, MAX_ID).is_some())
+        && paste_token(&spec.timeout, MAX_TIMEOUT).is_some()
+        && spec
+            .team
+            .as_deref()
+            .is_none_or(|team| paste_token(team, MAX_ID).is_some())
+}
+
 /// Build the `chanvoy wait` argv (without the program name).
 #[must_use]
 pub fn chanvoy_wait_args(spec: &WaitOnSpec) -> Vec<String> {
@@ -72,11 +142,7 @@ pub fn chanvoy_wait_args(spec: &WaitOnSpec) -> Vec<String> {
 
 /// Render a paste-safe receipt. `turn_started` stays unknown.
 #[must_use]
-pub fn render_wait_receipt(
-    spec: &WaitOnSpec,
-    result: WaitResult,
-    chanvoy_exit: Option<i32>,
-) -> String {
+pub fn render_wait_receipt(spec: &WaitOnSpec, outcome: &WaitOutcome) -> String {
     format!(
         "\
 gearwit self wait-on
@@ -84,45 +150,82 @@ channel: {channel}
 after: {after}
 timeout: {timeout}
 durability: in_process
-waiter_completed: true  (self_declared)
+waiter_completed: {waiter}  (self_declared)
 wait_result: {wait_result}
 chanvoy_exit: {chanvoy_exit}
 turn_started: unknown
 reachability: unknown
 wake_plan: unknown
 ",
-        channel = spec.channel,
-        after = spec.after.as_deref().unwrap_or("unknown"),
-        timeout = spec.timeout,
-        wait_result = result.as_str(),
-        chanvoy_exit = chanvoy_exit.map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+        channel = paste_field(&spec.channel, MAX_ID),
+        after = spec
+            .after
+            .as_deref()
+            .map_or_else(|| "unknown".to_owned(), |after| paste_field(after, MAX_ID)),
+        timeout = paste_field(&spec.timeout, MAX_TIMEOUT),
+        waiter = outcome.waiter.as_str(),
+        wait_result = outcome.result.as_str(),
+        chanvoy_exit = outcome
+            .chanvoy_exit
+            .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
     )
+}
+
+/// Execute a wait with an injected runner.
+#[must_use]
+pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutcome {
+    if !spec_is_paste_safe(spec) {
+        return WaitOutcome {
+            waiter: WaiterState::NotStarted,
+            result: WaitResult::Error,
+            chanvoy_exit: None,
+            process_exit: 2,
+        };
+    }
+    let args = chanvoy_wait_args(spec);
+    match runner.run(&args) {
+        Ok(status) => {
+            let raw = status.code();
+            let process_exit = match raw {
+                Some(0) => 0,
+                Some(1) => 1,
+                _ => 2,
+            };
+            WaitOutcome {
+                waiter: WaiterState::Completed,
+                result: WaitResult::from_code(process_exit),
+                chanvoy_exit: raw,
+                process_exit,
+            }
+        }
+        Err(_) => WaitOutcome {
+            waiter: WaiterState::NotStarted,
+            result: WaitResult::Error,
+            chanvoy_exit: None,
+            process_exit: 2,
+        },
+    }
 }
 
 /// Run `chanvoy wait` and print a receipt. Returns the process exit code.
 #[must_use]
 pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
-    let args = chanvoy_wait_args(spec);
-    let spawn = Command::new("chanvoy").args(&args).status();
-    match spawn {
-        Ok(status) => {
-            let code = status.code().unwrap_or(2);
-            let result = WaitResult::from_code(code);
-            eprint!("{}", render_wait_receipt(spec, result, Some(code)));
-            code
-        }
-        Err(error) => {
-            let result = WaitResult::Error;
-            eprint!("{}", render_wait_receipt(spec, result, None));
-            eprintln!("gearwit: failed to exec chanvoy: {error}");
-            2
-        }
+    let outcome = execute_wait_on(spec, &ChanvoyRunner);
+    eprint!("{}", render_wait_receipt(spec, &outcome));
+    if outcome.waiter == WaiterState::NotStarted && outcome.chanvoy_exit.is_none() {
+        eprintln!("gearwit: waiter did not start");
     }
+    outcome.process_exit
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{WaitOnSpec, WaitResult, chanvoy_wait_args};
+    use super::{
+        WaitOnSpec, WaitOutcome, WaitResult, WaitRunner, WaiterState, chanvoy_wait_args,
+        execute_wait_on, render_wait_receipt,
+    };
+    use std::io;
+    use std::process::ExitStatus;
 
     fn spec() -> WaitOnSpec {
         WaitOnSpec {
@@ -130,6 +233,14 @@ mod tests {
             after: Some("cursor1".to_owned()),
             timeout: "20m".to_owned(),
             team: None,
+        }
+    }
+
+    struct MissingRunner;
+
+    impl WaitRunner for MissingRunner {
+        fn run(&self, _args: &[String]) -> io::Result<ExitStatus> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "chanvoy"))
         }
     }
 
@@ -170,10 +281,41 @@ mod tests {
 
     #[test]
     fn receipt_keeps_turn_started_unknown() {
-        let text = super::render_wait_receipt(&spec(), WaitResult::Matched, Some(0));
+        let outcome = WaitOutcome {
+            waiter: WaiterState::Completed,
+            result: WaitResult::Matched,
+            chanvoy_exit: Some(0),
+            process_exit: 0,
+        };
+        let text = render_wait_receipt(&spec(), &outcome);
         assert!(text.contains("wait_result: matched"));
+        assert!(text.contains("waiter_completed: true  (self_declared)"));
         assert!(text.contains("turn_started: unknown"));
         assert!(text.contains("durability: in_process"));
         assert!(!text.contains("completion_doorbell"));
+    }
+
+    #[test]
+    fn missing_runner_is_not_waiter_completed() {
+        let outcome = execute_wait_on(&spec(), &MissingRunner);
+        assert_eq!(outcome.waiter, WaiterState::NotStarted);
+        assert_eq!(outcome.result, WaitResult::Error);
+        assert_eq!(outcome.process_exit, 2);
+        assert!(outcome.chanvoy_exit.is_none());
+        let text = render_wait_receipt(&spec(), &outcome);
+        assert!(text.contains("waiter_completed: false  (self_declared)"));
+        assert!(text.contains("wait_result: error"));
+    }
+
+    #[test]
+    fn control_characters_reject_the_spec_without_starting() {
+        let mut unsafe_spec = spec();
+        unsafe_spec.channel = "november-team\nwait_result: matched".to_owned();
+        let outcome = execute_wait_on(&unsafe_spec, &MissingRunner);
+        assert_eq!(outcome.waiter, WaiterState::NotStarted);
+        assert_eq!(outcome.process_exit, 2);
+        let text = render_wait_receipt(&unsafe_spec, &outcome);
+        assert!(text.contains("channel: rejected"));
+        assert!(!text.contains("wait_result: matched\n"));
     }
 }

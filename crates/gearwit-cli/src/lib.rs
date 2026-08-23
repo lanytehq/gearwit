@@ -5,8 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod sanitize;
 pub mod wait_on;
 pub mod who;
 
 pub use wait_on::{WaitOnSpec, WaitResult, run_wait_on};
-pub use who::{HarnessHint, ProcessCensus, WhoCard};
+pub use who::{HarnessFamily, HarnessObservation, ProcessCensus, WhoCard};
