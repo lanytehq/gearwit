@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { events, seats } from "./fixtures";
 import { countUnknownFacts, filterEvents } from "./model";
 

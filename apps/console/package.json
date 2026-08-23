@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "bun --hot index.html",
     "build": "bun build index.html --outdir dist --target browser",
-    "test": "bun test",
-    "check": "bun run test && bun run build"
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "vitest run --config vitest.config.ts",
+    "check": "bun run typecheck && bun run test && bun run build"
   }
 }

@@ -3,8 +3,11 @@ set -eu
 
 version=$(tr -d ' \n\r' < VERSION)
 cargo_version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+package_version=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -1)
 rust_version=$(awk -F'"' '/^rust-version = / { print $2; exit }' Cargo.toml)
 toolchain_version=$(awk -F'"' '/^channel = / { print $2; exit }' rust-toolchain.toml)
+bun_version=$(tr -d ' \n\r' < .bun-version)
+package_manager=$(sed -n 's/^[[:space:]]*"packageManager":[[:space:]]*"bun@\([^"]*\)".*/\1/p' package.json | head -1)
 
 check_equal() {
     label=$1
@@ -26,7 +29,9 @@ case "$version" in
 esac
 
 check_equal "Cargo workspace version" "$cargo_version" "$version"
+check_equal "JavaScript workspace version" "$package_version" "$version"
 check_equal "Rust toolchain" "$toolchain_version" "$rust_version"
+check_equal "Bun packageManager" "$package_manager" "$bun_version"
 
 retired_name='agent''kit'
 if grep -R -n -i \

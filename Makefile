@@ -27,7 +27,7 @@ test:
 	cargo test --workspace
 
 console-check:
-	cd apps/console && bun run check
+	bun run check:js
 
 msrv:
 	cargo +$(MSRV) check --workspace --locked
