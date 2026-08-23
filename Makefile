@@ -1,0 +1,40 @@
+# gearwit — single public Make interface.
+
+VERSION := $(shell tr -d ' \n\r' < VERSION)
+MSRV := $(shell awk -F'"' '/^channel/ { print $$2; exit }' rust-toolchain.toml)
+
+.PHONY: all check gate repository-check metadata fmt clippy test msrv deny help
+
+all: check
+
+check: repository-check metadata fmt clippy test
+
+gate: check deny
+
+repository-check:
+	sh scripts/check-repository.sh
+
+metadata:
+	cargo metadata --no-deps --format-version 1 > /dev/null
+
+fmt:
+	cargo fmt --all --check
+
+clippy:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+test:
+	cargo test --workspace
+
+msrv:
+	cargo +$(MSRV) check --workspace --locked
+
+deny:
+	cargo deny check
+
+help:
+	@echo "gearwit $(VERSION)"
+	@echo "  make check          repository checks + metadata + fmt + clippy + tests"
+	@echo "  make gate           check + dependency policy"
+	@echo "  make msrv           cargo +$(MSRV) check --locked"
+	@echo "  make deny           cargo-deny policy"
