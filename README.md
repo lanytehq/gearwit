@@ -52,8 +52,10 @@ Cargo and Bun remain authoritative for their own dependency graphs. The root
 ```bash
 make check
 cargo run -p gearwit-cli -- self who
+cargo run -p gearwit-cli -- self wait-on CHANNEL --after ID --timeout 20m
 ```
 
-The first command surface is `gearwit self who`: a census-safe local card with
-per-field evidence. It is not a public wire protocol. No daemon is implemented
-yet.
+`self who` is a census-safe local card with per-field evidence. `self wait-on`
+wraps `chanvoy wait` in-process. Completing the waiter is not proof that a
+harness turn started. These faces are not a public wire protocol. No daemon is
+implemented yet.
