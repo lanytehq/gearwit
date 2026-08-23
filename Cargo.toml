@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gearwit-domain"]
+members = ["crates/gearwit-domain", "crates/gearwit-cli"]
 exclude = ["apps/console/src-tauri"]
 
 [workspace.package]

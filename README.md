@@ -41,8 +41,8 @@ apps/console/           attached console projection; no second daemon
 docs/decisions/         architecture and product decision records
 ```
 
-Only `gearwit-domain` exists in the first scaffold. Other packages are added
-with their first working slice, rather than as empty roadmap directories.
+`gearwit-domain` and `gearwit-cli` exist. Other packages are added with their
+first working slice, rather than as empty roadmap directories.
 
 Cargo and Bun remain authoritative for their own dependency graphs. The root
 `Makefile` is the stable human and CI entry point.
@@ -51,6 +51,9 @@ Cargo and Bun remain authoritative for their own dependency graphs. The root
 
 ```bash
 make check
+cargo run -p gearwit-cli -- self who
 ```
 
-No production daemon, command surface, or console is implemented yet.
+The first command surface is `gearwit self who`: a census-safe local card with
+per-field evidence. It is not a public wire protocol. No daemon is implemented
+yet.

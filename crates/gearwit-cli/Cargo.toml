@@ -1,0 +1,20 @@
+[package]
+name = "gearwit-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Thin Gearwit command surface for the calling seat"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gearwit"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.45", features = ["derive"] }
+gearwit-domain.workspace = true
