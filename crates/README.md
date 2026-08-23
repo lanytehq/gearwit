@@ -6,13 +6,9 @@ names.
 The intended dependency direction is:
 
 ```text
-gearwit-cli
-     ↓
-gearwit-protocol
-     ↓
-gearwit-host
-  ↙          ↘
-gearwit-domain  gearwit-platform
+gearwit-cli ──────▶ gearwit-protocol ◀──── gearwit-host
+console / MCP ────▶ gearwit-protocol       ├──▶ gearwit-domain
+                                           └──▶ gearwit-platform
 ```
 
 Initial boundaries:
