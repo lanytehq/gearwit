@@ -1,0 +1,12 @@
+{
+  "name": "@gearwit/console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot index.html",
+    "build": "bun build index.html --outdir dist --target browser",
+    "test": "bun test",
+    "check": "bun run test && bun run build"
+  }
+}
