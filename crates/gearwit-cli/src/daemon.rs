@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::child::ChildSlot;
 use crate::wait_on::{
-    ChanvoyDrain, DrainedEvent, EventDrain, WaitOnSpec, WaitOutcome, WaitResult, WaiterState,
-    attach_drain, chanvoy_wait_args,
+    ChanvoyDrain, DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitOutcome, WaitResult,
+    WaiterState, attach_drain, chanvoy_wait_args,
 };
 use gearwit_domain::DeliveryRoute;
 use gearwit_host::{
@@ -1029,6 +1029,20 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
                 if let Err(code) = result {
                     return halt(&table, &mut children, &stop, &socket, &mut accept, code);
                 }
+                if let Some(code) = claim_historical_suffix(
+                    &mut LoopIo {
+                        children: &mut children,
+                        spec: &mut spec,
+                        arm: &arm,
+                        table: &table,
+                        pipe: &mut pipe,
+                        acks: &acks,
+                        served: &mut served,
+                    },
+                    now,
+                ) {
+                    return halt(&table, &mut children, &stop, &socket, &mut accept, code);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -1128,6 +1142,53 @@ fn poll_chanvoy(io: &mut LoopIo<'_>, now: OffsetDateTime) -> Option<i32> {
             eprintln!("gearwit: chanvoy child: {error}");
             Some(2)
         }
+    }
+}
+
+struct OwnedDrain {
+    events: Vec<DrainedEvent>,
+}
+
+impl EventDrain for OwnedDrain {
+    fn drain_after(&self, _spec: &WaitOnSpec) -> Result<Vec<DrainedEvent>, DrainError> {
+        Ok(self.events.clone())
+    }
+}
+
+fn claim_historical_suffix(io: &mut LoopIo<'_>, now: OffsetDateTime) -> Option<i32> {
+    let events = match ChanvoyDrain.drain_after(io.spec) {
+        Ok(events) if events.is_empty() => return None,
+        Ok(events) => events,
+        Err(_) => return Some(2),
+    };
+    let link = current_link(io.table);
+    let outcome = {
+        let mut acks = lock_acks(io.acks);
+        ingest_match(
+            &IngestRequest {
+                spec: io.spec,
+                wait: WaitResult::Matched,
+                drain: &OwnedDrain { events },
+                arm: io.arm,
+                link: link.as_ref(),
+                now,
+            },
+            io.pipe,
+            &mut acks,
+            None::<&mut LinkIo>,
+            || ulid::Ulid::new().to_string(),
+        )
+    };
+    match outcome.coverage {
+        DaemonCoverage::Halt { exit } => Some(exit),
+        DaemonCoverage::Pause => {
+            let _ = io.children.kill_and_reap();
+            if flush_current(io.served, io.table, io.pipe, io.acks, now) {
+                revoke_exact(io.served, io.table, io.pipe, now, true);
+            }
+            None
+        }
+        DaemonCoverage::Rearm { .. } => None,
     }
 }
 
