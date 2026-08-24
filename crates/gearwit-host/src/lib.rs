@@ -6,6 +6,7 @@ mod ack;
 mod admit;
 mod authority;
 pub mod controller;
+pub mod coordinator;
 mod deliver;
 mod link;
 mod paths;
@@ -18,13 +19,15 @@ pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };
 pub use authority::{
-    AdmissionError, AdmissionResult, AuthorityRecovery, ClaimedSignal, DaemonAuthority,
-    DispatchConclusion, DispatchError, DurableOutcome, MintedAttachment, PreparedDispatch,
+    AdmissionError, AdmissionResult, AuthorityRecovery, ClaimRequest, ClaimedSignal,
+    DaemonAuthority, DispatchConclusion, DispatchError, DurableOutcome, MintedAttachment,
+    PreparedDispatch,
 };
 pub use controller::{
     Controller, ControllerAttachment, DispatchDisposition, FakeController, LifecycleObservation,
     ReconciliationDisposition, SignalAction,
 };
+pub use coordinator::HostCoordinator;
 pub use deliver::{
     DeliveryAttempt, DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result,
     redeliver_pending, send_delivery,
