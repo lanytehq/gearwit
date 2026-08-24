@@ -2,11 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod ack;
 mod admit;
 mod deliver;
 mod link;
 mod paths;
 
+pub use ack::{AckStore, rearm_from_handled, record_handled};
 pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };

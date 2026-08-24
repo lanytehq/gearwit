@@ -1,0 +1,11 @@
+{
+  "schema": "gearwit.interrupt.handled-cursor.v0",
+  "type": "handled_cursor_request",
+  "request_id": "01J00000000000000000000051",
+  "arm_id": "01J00000000000000000000010",
+  "generation": 1,
+  "seat_id": "example-devrev",
+  "signal_id": "01J00000000000000000000021",
+  "cursor": "post02",
+  "observed_at": "2026-01-15T12:05:20Z"
+}

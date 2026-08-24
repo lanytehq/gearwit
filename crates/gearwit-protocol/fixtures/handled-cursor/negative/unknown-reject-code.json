@@ -1,0 +1,7 @@
+{
+  "schema": "gearwit.interrupt.handled-cursor.v0",
+  "type": "handled_cursor_rejected",
+  "request_id": "01J00000000000000000000052",
+  "code": "turn_started",
+  "observed_at": "2026-01-15T12:05:21Z"
+}

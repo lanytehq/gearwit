@@ -3,9 +3,13 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod handled;
 mod messages;
 
 pub use codec::{MAX_PAYLOAD, PayloadError, decode_payload, encode_payload};
+pub use handled::{
+    HANDLED_SCHEMA, HandledCursor, HandledCursorError, parse_handled_cursor, validate_handled,
+};
 pub use messages::{
     PIN_COMMIT, ProviderEvent, SCHEMA, WaiterLink, WaiterLinkError, parse_waiter_link, validate,
 };
@@ -33,6 +37,34 @@ mod tests {
             pins.contains(PIN_COMMIT),
             "protocol PIN_COMMIT must match schema-pins.toml"
         );
+    }
+
+    #[test]
+    fn handled_conforming_fixtures_parse() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/handled-cursor/conforming");
+        for entry in fs::read_dir(&dir).expect("conforming") {
+            let path = entry.expect("entry").path();
+            let text = fs::read_to_string(&path).expect("read");
+            super::parse_handled_cursor(&text).unwrap_or_else(|error| {
+                panic!("{} should parse: {error}", path.display());
+            });
+        }
+    }
+
+    #[test]
+    fn handled_negative_fixtures_are_rejected() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/handled-cursor/negative");
+        for entry in fs::read_dir(dir).expect("negative") {
+            let path = entry.expect("entry").path();
+            let text = fs::read_to_string(&path).expect("read");
+            assert!(
+                super::parse_handled_cursor(&text).is_err(),
+                "{} must fail validation",
+                path.display()
+            );
+        }
     }
 
     #[test]

@@ -5,5 +5,5 @@
 
 [gearwit_interrupt_v0]
 repository = "https://github.com/lanytehq/lanyte-crucible"
-commit = "d12164211358e25c33048b8804c0bf60429437e5"
+commit = "c2c3c7c5325eb422d1b7a41ed1558d25495aa758"
 path = "schemas/agentic/gearwit/v0"
