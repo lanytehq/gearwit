@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 gearwit-protocol.workspace = true
 ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.4", default-features = false }
+nix = { version = "0.31", default-features = false, features = ["user"] }
 rsfulmen = { version = "0.1.6", default-features = false, features = ["logging"] }
 time = { version = "0.3", default-features = false, features = ["parsing", "formatting"] }
 ulid = "1"

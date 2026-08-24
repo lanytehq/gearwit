@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ipcprims::transport::{TransportError, UnixDomainSocket};
@@ -24,6 +24,8 @@ pub enum BindError {
     NotASocket(PathBuf),
     /// A listener is already accepting on this socket.
     LiveListener(PathBuf),
+    /// Path is not owned by this process's effective user.
+    WrongOwner(PathBuf),
     /// Filesystem I/O failed.
     Io(io::Error),
     /// ipcprims transport failed.
@@ -43,6 +45,9 @@ impl std::fmt::Display for BindError {
             }
             Self::LiveListener(path) => {
                 write!(formatter, "listener already live at {}", path.display())
+            }
+            Self::WrongOwner(path) => {
+                write!(formatter, "path not owned by this user: {}", path.display())
             }
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
@@ -153,6 +158,7 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), BindError> {
     if !metadata.file_type().is_dir() {
         return Err(BindError::NotADirectory(dir.to_path_buf()));
     }
+    require_owned(&metadata, dir)?;
     let mut permissions = fs::metadata(dir)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(dir, permissions)?;
@@ -170,9 +176,13 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), BindError> {
 /// transport error.
 pub fn bind_private_socket(path: &Path) -> Result<UnixDomainSocket, BindError> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(BindError::Symlink(path.to_path_buf()));
+        }
         if !metadata.file_type().is_socket() {
             return Err(BindError::NotASocket(path.to_path_buf()));
         }
+        require_owned(&metadata, path)?;
         match UnixDomainSocket::connect(path) {
             Ok(_live) => {
                 let displayed = path.display().to_string();
@@ -192,4 +202,12 @@ pub fn bind_private_socket(path: &Path) -> Result<UnixDomainSocket, BindError> {
         }
     }
     Ok(UnixDomainSocket::bind(path)?)
+}
+
+fn require_owned(metadata: &fs::Metadata, path: &Path) -> Result<(), BindError> {
+    if metadata.uid() == nix::unistd::Uid::effective().as_raw() {
+        Ok(())
+    } else {
+        Err(BindError::WrongOwner(path.to_path_buf()))
+    }
 }

@@ -24,19 +24,26 @@ parent. Do not rely on parent-directory mode.
 | Daemon / CLI (production) | `$HOME/.lanyte/gearwit` |
 | Tests | explicit `PathBuf` passed to `GearwitPaths::from_root` |
 
-An override, if added later, must be an explicit CLI flag whose resolved path
-is printed and permission-checked. Environment variables are not a discovery
-mechanism.
+`$HOME` identifies the user. It is not a socket or config-file override.
+Environment variables are not a discovery mechanism. An override, if added
+later, must be an explicit CLI flag whose resolved path is printed and
+permission-checked.
+
+Founder v0 admits **one live waiter link** at the daemon boundary. Admission
+is still checked against `(arm_id, generation)`. The same `request_id` for
+that active pair returns the cached accept.
 
 ## Permissions and bind policy
 
 - Create `gearwit/`, `run/`, and `state/` as `0700`.
 - Socket mode is `0600` where the platform supports it.
-- Refuse a component that is a symlink or not a directory.
+- Refuse a component that is a symlink or not a directory. See
+  [ADR-0003](decisions/ADR-0003-no-follow-private-paths.md).
+- Require each private path to be owned by the process effective user.
 - Bind fails closed if the socket path exists and is not a Unix socket.
 - Bind refuses when a listener is already live (connect probe succeeds).
-- A leftover socket file with no listener (`ConnectionRefused`) may be
-  replaced. Arbitrary files are never unlinked.
+- A leftover **owned** socket file with no listener (`ConnectionRefused`) may
+  be replaced. Arbitrary files are never unlinked.
 
 ## Sandbox grants
 

@@ -72,7 +72,8 @@ impl From<TransportError> for LinkError {
 pub fn waiter_frame_config() -> FrameConfig {
     FrameConfig {
         max_payload_size: MAX_PAYLOAD,
-        ..FrameConfig::default()
+        read_timeout: Some(Duration::from_secs(5)),
+        write_timeout: Some(Duration::from_secs(5)),
     }
 }
 

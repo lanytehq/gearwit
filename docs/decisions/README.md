@@ -39,3 +39,4 @@ rewritten.
 
 - [ADR-0001: Product workspace boundaries](ADR-0001-product-workspace-boundaries.md)
 - [ADR-0002: Local persistence boundary](ADR-0002-local-persistence-boundary.md)
+- [ADR-0003: No-follow private paths](ADR-0003-no-follow-private-paths.md)

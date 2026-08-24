@@ -166,6 +166,14 @@ mod tests {
     }
 
     #[test]
+    fn waiter_frames_use_command_cap_and_timeouts() {
+        let config = super::waiter_frame_config();
+        assert_eq!(config.max_payload_size, MAX_PAYLOAD);
+        assert_eq!(config.read_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(config.write_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
     fn canonical_root_is_under_lanyte_gearwit() {
         let root = super::canonical_root().expect("HOME");
         assert!(root.ends_with(std::path::Path::new(".lanyte").join("gearwit")));
