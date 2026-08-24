@@ -225,6 +225,9 @@ pub fn render_attach_receipt(delivery: &WaiterLink) -> String {
     match delivery {
         WaiterLink::DeliverEvents {
             delivery_id,
+            arm_id,
+            generation,
+            signal_id,
             newest_event_ref,
             events,
             ..
@@ -246,6 +249,9 @@ pub fn render_attach_receipt(delivery: &WaiterLink) -> String {
                 "wait_outcome": "matched",
                 "turn_started": "unknown",
                 "delivery_id": paste_field(delivery_id, MAX_ID),
+                "arm_id": paste_field(arm_id, MAX_ID),
+                "generation": generation,
+                "signal_id": paste_field(signal_id, MAX_ID),
                 "newest_observed": paste_field(newest_event_ref, MAX_ID),
                 "event_count": events.len(),
                 "untrusted_provider_data": events,
@@ -372,6 +378,9 @@ mod tests {
         assert!(receipt.contains("\"untrusted_provider_data\""));
         assert!(receipt.contains("first bounded event"));
         assert!(receipt.contains("\"turn_started\":\"unknown\""));
+        assert!(receipt.contains("\"signal_id\":\"01J00000000000000000000021\""));
+        assert!(receipt.contains("\"arm_id\":\"01J00000000000000000000010\""));
+        assert!(receipt.contains("\"generation\":1"));
         let forged = WaiterLink::DeliverEvents {
             schema: SCHEMA.to_owned(),
             delivery_id: "01J00000000000000000000043".to_owned(),
