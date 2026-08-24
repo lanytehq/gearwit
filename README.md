@@ -47,6 +47,11 @@ first working slice, rather than as empty roadmap directories.
 Cargo and Bun remain authoritative for their own dependency graphs. The root
 `Makefile` is the stable human and CI entry point.
 
+Public control-plane contracts are schema-first and pinned in
+[`schema-pins.toml`](schema-pins.toml). Domain code remains provider- and
+serialization-free; protocol bindings consume the pinned schema rather than
+becoming a second source of truth.
+
 ## Quick start
 
 ```bash

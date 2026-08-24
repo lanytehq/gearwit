@@ -7,6 +7,14 @@
 
 use std::fmt;
 
+mod interrupt;
+
+pub use interrupt::{
+    CoverageEndReason, CoveragePolicy, CoveragePolicyError, DeliveryRoute, InterruptPhase,
+    LifecycleFact, LifecycleReceipt, PhaseObservation, ReceiptError, ReceiptLog, ReceiptSource,
+    WaiterCompletion,
+};
+
 /// The evidence supporting a known observation.
 ///
 /// This is a classification, not a numeric confidence score. Callers must not
