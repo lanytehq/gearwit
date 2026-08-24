@@ -2,6 +2,9 @@
 
 use std::collections::BTreeMap;
 
+/// Maximum distinct `request_id` outcomes retained in founder v0.
+pub const HISTORY_CAP: usize = 1024;
+
 use gearwit_protocol::{SCHEMA, WaiterLink, WaiterLinkError, validate};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -175,6 +178,9 @@ pub(crate) fn decide_attach(
             session,
         });
     }
+    if table.history.len() >= HISTORY_CAP {
+        return Err(WaiterLinkError::Semantic("request history full"));
+    }
     let Some(arm) = arms.iter().find(|arm| arm.arm_id == *arm_id) else {
         let reply = reject_message(request_id, "unknown_arm", now)?;
         return Ok(AttachDecision::Reject { request, reply });
@@ -227,9 +233,9 @@ pub(crate) fn decide_attach(
 /// Admit or reject an `attach_waiter` message.
 ///
 /// A repeated `request_id` with an identical body returns the cached
-/// [`WaiterLink::AttachAccepted`]. The same key with a different body is a
-/// hard protocol conflict. A different request while a link is live is
-/// `already_attached`.
+/// outcome. The same key with a different body is a hard protocol conflict.
+/// A different request while a link is live is `already_attached`. New keys
+/// fail closed once [`HISTORY_CAP`] outcomes are stored.
 ///
 /// # Errors
 ///

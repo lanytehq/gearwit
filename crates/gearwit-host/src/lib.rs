@@ -6,7 +6,9 @@ mod admit;
 mod link;
 mod paths;
 
-pub use admit::{AdmittedLink, KnownArm, LinkSession, LinkTable, admit_attach, drop_session};
+pub use admit::{
+    AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
+};
 pub use link::{
     LinkError, ServeAttach, read_waiter_link, serve_attach, wait_disconnect, waiter_frame_config,
     write_waiter_link,
@@ -16,8 +18,8 @@ pub use paths::{BindError, BoundListener, GearwitPaths, SOCKET_FILE, canonical_r
 #[cfg(test)]
 mod tests {
     use super::{
-        BindError, GearwitPaths, KnownArm, LinkError, LinkSession, LinkTable, SOCKET_FILE,
-        admit_attach, drop_session, serve_attach, wait_disconnect,
+        BindError, GearwitPaths, HISTORY_CAP, KnownArm, LinkError, LinkSession, LinkTable,
+        SOCKET_FILE, admit_attach, drop_session, serve_attach, wait_disconnect,
     };
     use gearwit_protocol::{
         MAX_PAYLOAD, WaiterLink, decode_payload, encode_payload, parse_waiter_link,
@@ -179,6 +181,38 @@ mod tests {
     }
 
     #[test]
+    fn history_is_capped_and_replay_still_works() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        let first =
+            admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("first");
+        for index in 0..HISTORY_CAP.saturating_sub(1) {
+            let request_id = format!("01K{index:023}");
+            admit_attach(
+                &mut table,
+                attach_with(&request_id),
+                instant,
+                &[arm(instant)],
+            )
+            .expect("fill");
+        }
+        let overflow = admit_attach(
+            &mut table,
+            attach_with("01K99999999999999999999999"),
+            instant,
+            &[arm(instant)],
+        )
+        .expect_err("full");
+        assert!(matches!(
+            overflow,
+            gearwit_protocol::WaiterLinkError::Semantic("request history full")
+        ));
+        let replay =
+            admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("replay");
+        assert_eq!(first, replay);
+    }
+
+    #[test]
     fn drop_session_does_not_revoke_successor() {
         let instant = now();
         let mut table = LinkTable::default();
@@ -293,6 +327,18 @@ mod tests {
         let listener = paths.bind().expect("bind");
         assert_eq!(mode(&paths.socket_path()), 0o600);
         drop(listener);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drop_listener_allows_rebind_and_connect() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let first = paths.bind().expect("first");
+        drop(first);
+        let second = paths.bind().expect("rebind");
+        let _client = UnixDomainSocket::connect(paths.socket_path()).expect("connect");
+        drop(second);
         let _ = std::fs::remove_dir_all(&root);
     }
 

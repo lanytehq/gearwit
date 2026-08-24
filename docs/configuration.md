@@ -31,7 +31,10 @@ permission-checked.
 
 Founder v0 admits **one live waiter link** at the daemon boundary. Admission
 is still checked against `(arm_id, generation)`. The same `request_id` for
-that active pair returns the cached accept.
+that active pair returns the cached accept. Distinct `request_id` outcomes
+are retained in memory up to **1024** entries; a new key beyond that fails
+closed. The ledger is not evicted and does not remint keys. Persistence in a
+later slice can replace this cap.
 
 ## Permissions and bind policy
 

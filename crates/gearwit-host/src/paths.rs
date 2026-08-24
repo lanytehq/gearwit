@@ -29,6 +29,8 @@ pub enum BindError {
     NotADirectory(PathBuf),
     /// Path exists and is not a Unix socket.
     NotASocket(PathBuf),
+    /// Path exists and is not a regular file.
+    NotAFile(PathBuf),
     /// A listener is already accepting on this socket.
     LiveListener(PathBuf),
     /// Path is not owned by this process's effective user.
@@ -50,6 +52,7 @@ impl std::fmt::Display for BindError {
             Self::NotASocket(path) => {
                 write!(formatter, "not a unix socket: {}", path.display())
             }
+            Self::NotAFile(path) => write!(formatter, "not a regular file: {}", path.display()),
             Self::LiveListener(path) => {
                 write!(formatter, "listener already live at {}", path.display())
             }
@@ -116,10 +119,12 @@ fn claim_lock_path(path: &Path) -> Result<PathClaim, BindError> {
 static INPROC_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 /// Bound waiter-link listener. Holds the advisory lock fd until drop.
+///
+/// Fields drop in declaration order: socket, in-process claim, then flock.
 pub struct BoundListener {
-    _lock: Flock<File>,
-    _claim: PathClaim,
     listener: UnixDomainSocket,
+    _claim: PathClaim,
+    _lock: Flock<File>,
 }
 
 impl BoundListener {
@@ -215,9 +220,9 @@ impl GearwitPaths {
         let lock = acquire_listener_lock(&lock_path)?;
         let listener = bind_private_socket(&self.socket_path())?;
         Ok(BoundListener {
-            _lock: lock,
-            _claim: claim,
             listener,
+            _claim: claim,
+            _lock: lock,
         })
     }
 }
@@ -315,6 +320,14 @@ fn acquire_listener_lock(path: &Path) -> Result<Flock<File>, BindError> {
                 BindError::Io(error)
             }
         })?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BindError::NotAFile(path.to_path_buf()));
+    }
+    require_owned(&metadata, path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(lock),
         Err((_, Errno::EAGAIN)) => {

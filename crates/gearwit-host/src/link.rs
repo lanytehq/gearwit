@@ -159,22 +159,29 @@ pub fn serve_attach(
     drop_expired(table, now);
     let (reply, session) = match decide_attach(table, request, now, arms)? {
         AttachDecision::Accept { link, reply } => {
-            write_waiter_link(&mut writer, &reply)?;
             let session = LinkSession {
                 link_id: link.link_id.clone(),
                 arm_id: link.arm_id.clone(),
                 generation: link.generation,
             };
-            let lease_until = link.lease_until;
+            apply_session_read_timeout(
+                reader.get_mut(),
+                link.lease_until,
+                OffsetDateTime::now_utc(),
+            )?;
+            write_waiter_link(&mut writer, &reply)?;
             commit_attach(table, *link);
-            apply_session_read_timeout(reader.get_mut(), lease_until, now)?;
             (reply, Some(session))
         }
         AttachDecision::Replay { reply, session } => {
-            write_waiter_link(&mut writer, &reply)?;
             if let Some(current) = table.current() {
-                apply_session_read_timeout(reader.get_mut(), current.lease_until, now)?;
+                apply_session_read_timeout(
+                    reader.get_mut(),
+                    current.lease_until,
+                    OffsetDateTime::now_utc(),
+                )?;
             }
+            write_waiter_link(&mut writer, &reply)?;
             (reply, session)
         }
         AttachDecision::Reject { request, reply } => {
@@ -201,8 +208,11 @@ fn apply_session_read_timeout(
 
 fn lease_io_timeout(lease_until: OffsetDateTime, now: OffsetDateTime) -> Duration {
     if lease_until <= now {
-        return Duration::from_secs(0);
+        return Duration::from_millis(1);
     }
     let nanos = (lease_until - now).whole_nanoseconds();
-    Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
+    match u64::try_from(nanos.max(0)) {
+        Ok(0) | Err(_) => Duration::from_millis(1),
+        Ok(nanos) => Duration::from_nanos(nanos),
+    }
 }
