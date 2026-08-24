@@ -233,14 +233,37 @@ pub fn waiter_receipt_log(outcome: &WaitOutcome) -> Result<ReceiptLog, ReceiptEr
     Ok(log)
 }
 
+/// Combine waiter facts with a provider drain. Never records handled cursor.
+///
+/// # Errors
+///
+/// Returns [`ReceiptError`] if drain facts cannot be appended.
+pub fn lifecycle_log(outcome: &WaitOutcome) -> Result<ReceiptLog, ReceiptError> {
+    let mut log = waiter_receipt_log(outcome)?;
+    if outcome.result == WaitResult::Matched && !outcome.drained_ids.is_empty() {
+        let sequence = u64::try_from(log.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let event_count = u32::try_from(outcome.drained_ids.len()).unwrap_or(u32::MAX);
+        append_fact(
+            &mut log,
+            sequence,
+            LifecycleFact::EventsDrained { event_count },
+            ReceiptSource::Provider,
+        )?;
+    }
+    Ok(log)
+}
+
 fn format_phase_line(log: &ReceiptLog, phase: InterruptPhase) -> String {
     match log.observe(phase) {
         PhaseObservation::Unknown => format!("{phase}: unknown"),
         PhaseObservation::Observed { fact, source } => {
             let detail = match fact {
-                LifecycleFact::WaiterCompleted(completion) => completion.as_str(),
-                LifecycleFact::CoverageEnded(reason) => reason.as_str(),
-                _ => "observed",
+                LifecycleFact::WaiterCompleted(completion) => completion.as_str().to_owned(),
+                LifecycleFact::CoverageEnded(reason) => reason.as_str().to_owned(),
+                LifecycleFact::EventsDrained { event_count } => event_count.to_string(),
+                _ => "observed".to_owned(),
             };
             format!("{phase}: {detail}  ({})", source.as_str())
         }
@@ -250,7 +273,7 @@ fn format_phase_line(log: &ReceiptLog, phase: InterruptPhase) -> String {
 /// Render a paste-safe receipt using interrupt-lifecycle tokens.
 #[must_use]
 pub fn render_wait_receipt(spec: &WaitOnSpec, outcome: &WaitOutcome) -> String {
-    let log = match waiter_receipt_log(outcome) {
+    let log = match lifecycle_log(outcome) {
         Ok(log) => log,
         Err(error) => {
             return format!(
@@ -283,9 +306,11 @@ coverage_ended: unknown
         InterruptPhase::WaitArmed,
         InterruptPhase::SignalMatched,
         InterruptPhase::WaiterCompleted,
+        InterruptPhase::EventsDrained,
         InterruptPhase::TurnStarted,
         InterruptPhase::ModelObserved,
         InterruptPhase::SeatActed,
+        InterruptPhase::HandledCursorRecorded,
         InterruptPhase::CoverageRearmed,
         InterruptPhase::CoverageEnded,
     ]
@@ -461,7 +486,7 @@ pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
 mod tests {
     use super::{
         EventDrain, WaitOnSpec, WaitOutcome, WaitResult, WaitRunner, WaiterState, attach_drain,
-        chanvoy_wait_args, execute_wait_on, parse_drained_ids, render_wait_receipt,
+        chanvoy_wait_args, execute_wait_on, lifecycle_log, parse_drained_ids, render_wait_receipt,
         waiter_receipt_log,
     };
     use gearwit_domain::InterruptPhase;
@@ -637,5 +662,12 @@ mod tests {
         let text = render_wait_receipt(&spec(), &outcome);
         assert!(text.contains("newest_observed: second"));
         assert!(text.contains("drained_count: 2"));
+        assert!(text.contains("events_drained: 2  (provider)"));
+        assert!(text.contains("handled_cursor_recorded: unknown"));
+        let log = lifecycle_log(&outcome).expect("lifecycle");
+        assert!(
+            log.observe(InterruptPhase::HandledCursorRecorded)
+                .is_unknown()
+        );
     }
 }
