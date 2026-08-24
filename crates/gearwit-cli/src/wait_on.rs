@@ -429,14 +429,18 @@ fn render_drained_events(events: &[DrainedEvent]) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`DrainError`] when JSON is not a `messages` object, any event is
-/// invalid, the set is empty, or ids are duplicated.
+/// Returns [`DrainError`] when JSON is not a chanvoy 0.3.0 message array (or
+/// a `messages` object), any event is invalid, the set is empty, or ids are
+/// duplicated.
 pub fn parse_drained_events(json: &str) -> Result<Vec<DrainedEvent>, DrainError> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|_| DrainError::Malformed)?;
-    let messages = value
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(DrainError::Malformed)?;
+    let messages = if let Some(array) = value.as_array() {
+        array
+    } else if let Some(array) = value.get("messages").and_then(serde_json::Value::as_array) {
+        array
+    } else {
+        return Err(DrainError::Malformed);
+    };
     if messages.is_empty() {
         return Err(DrainError::Empty);
     }
@@ -769,7 +773,7 @@ mod tests {
 
     #[test]
     fn parse_two_posts_oldest_first_with_bodies() {
-        let json = r#"{"messages":[{"id":"aaa","username":"ux","message":"one"},{"id":"bbb","username":"dv","message":"two"}]}"#;
+        let json = r#"[{"id":"aaa","username":"ux","message":"one"},{"id":"bbb","username":"dv","message":"two"}]"#;
         let events = parse_drained_events(json).expect("parsed");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].id, "aaa");
@@ -780,10 +784,11 @@ mod tests {
 
     #[test]
     fn parse_rejects_malformed_partial_and_duplicates() {
-        assert_eq!(
-            parse_drained_events("[]").unwrap_err(),
-            DrainError::Malformed
-        );
+        assert_eq!(parse_drained_events("[]").unwrap_err(), DrainError::Empty);
+        let chanvoy = r#"[{"id":"aaa","username":"ux","message":"one"},{"id":"bbb","username":"dv","message":"two"}]"#;
+        let from_array = parse_drained_events(chanvoy).expect("chanvoy 0.3.0 array");
+        assert_eq!(from_array[1].id, "bbb");
+        assert_eq!(from_array[1].message, "two");
         assert_eq!(
             parse_drained_events(r#"{"messages":[{"username":"x"}]}"#).unwrap_err(),
             DrainError::Malformed
