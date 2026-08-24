@@ -418,6 +418,43 @@ mod tests {
     }
 
     #[test]
+    fn accepted_link_survives_idle_under_future_lease() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut table = LinkTable::default();
+            let mut served =
+                serve_attach(stream, &mut table, instant, &[arm(instant)]).expect("admit");
+            let started = std::time::Instant::now();
+            wait_disconnect(&mut served.reader).expect("eof");
+            tx.send(started.elapsed()).expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut client = UnixDomainSocket::connect(&socket).expect("connect");
+        client
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("payload"),
+            ))
+            .expect("write");
+        let mut reader = FrameReader::with_config(client, super::waiter_frame_config());
+        let _ = reader.read_frame().expect("accepted");
+        thread::sleep(Duration::from_millis(50));
+        drop(reader);
+        let waited = rx.recv_timeout(Duration::from_secs(2)).expect("waited");
+        assert!(
+            waited >= Duration::from_millis(25),
+            "idle wait {waited:?} looks like the 1ms expiry path"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn oversize_frame_rejected_before_payload_alloc() {
         let root = temp_root();
         let paths = GearwitPaths::from_root(root.clone()).expect("paths");

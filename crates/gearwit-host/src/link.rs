@@ -1,6 +1,6 @@
 //! ipcprims framed waiter-link session (COMMAND channel, 256 KiB).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gearwit_protocol::{MAX_PAYLOAD, WaiterLink, WaiterLinkError, decode_payload, encode_payload};
 use ipcprims::frame::{COMMAND, FrameConfig, FrameError, FrameReader, FrameWriter};
@@ -150,36 +150,31 @@ pub fn serve_attach(
     now: OffsetDateTime,
     arms: &[KnownArm],
 ) -> Result<ServeAttach, LinkError> {
+    let started = Instant::now();
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let writer_stream = stream.try_clone()?;
     let mut reader = FrameReader::with_config(stream, waiter_frame_config());
     let mut writer = FrameWriter::with_config(writer_stream, waiter_frame_config());
     let request = read_waiter_link(&mut reader)?;
-    drop_expired(table, now);
-    let (reply, session) = match decide_attach(table, request, now, arms)? {
+    let elapsed = time::Duration::try_from(started.elapsed()).unwrap_or(time::Duration::ZERO);
+    let decision_now = now.saturating_add(elapsed);
+    drop_expired(table, decision_now);
+    let (reply, session) = match decide_attach(table, request, decision_now, arms)? {
         AttachDecision::Accept { link, reply } => {
             let session = LinkSession {
                 link_id: link.link_id.clone(),
                 arm_id: link.arm_id.clone(),
                 generation: link.generation,
             };
-            apply_session_read_timeout(
-                reader.get_mut(),
-                link.lease_until,
-                OffsetDateTime::now_utc(),
-            )?;
+            apply_session_read_timeout(reader.get_mut(), link.lease_until, decision_now)?;
             write_waiter_link(&mut writer, &reply)?;
             commit_attach(table, *link);
             (reply, Some(session))
         }
         AttachDecision::Replay { reply, session } => {
             if let Some(current) = table.current() {
-                apply_session_read_timeout(
-                    reader.get_mut(),
-                    current.lease_until,
-                    OffsetDateTime::now_utc(),
-                )?;
+                apply_session_read_timeout(reader.get_mut(), current.lease_until, decision_now)?;
             }
             write_waiter_link(&mut writer, &reply)?;
             (reply, session)
