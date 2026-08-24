@@ -11,8 +11,8 @@ pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };
 pub use deliver::{
-    DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result, redeliver_pending,
-    send_delivery,
+    DeliveryAttempt, DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result,
+    redeliver_pending, send_delivery,
 };
 pub use link::{
     LinkError, ServeAttach, read_waiter_link, serve_attach, wait_disconnect, waiter_frame_config,
@@ -809,7 +809,20 @@ mod tests {
             observed_at: "2026-01-15T12:05:03Z".to_owned(),
         };
         record_delivery_result(&mut ledger, &lost).expect("lost");
+        record_delivery_result(&mut ledger, &lost).expect("lost replay");
         assert!(ledger.should_redeliver());
+        let old_complete = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: first_link.link_id.clone(),
+            signal_id: "01J00000000000000000000021".to_owned(),
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:03Z".to_owned(),
+        };
+        assert!(matches!(
+            record_delivery_result(&mut ledger, &old_complete),
+            Err(gearwit_protocol::WaiterLinkError::Semantic("lost attempt"))
+        ));
         table.drop_current();
         admit_attach(
             &mut table,
@@ -859,6 +872,16 @@ mod tests {
             }
             other => panic!("expected redelivery, got {other:?}"),
         }
+        let successor_done = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: successor.link_id.clone(),
+            signal_id: "01J00000000000000000000021".to_owned(),
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:05Z".to_owned(),
+        };
+        record_delivery_result(&mut ledger, &successor_done).expect("successor complete");
+        assert!(!ledger.should_redeliver());
     }
 
     #[test]

@@ -15,6 +15,17 @@ pub struct DeliveryLedger {
     pending: Option<PendingDelivery>,
 }
 
+/// Lifecycle of one delivery attempt on a link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryAttempt {
+    /// Waiting for a result on the current link.
+    Awaiting,
+    /// Current link reported `link_lost`; same batch may be retried.
+    Lost,
+    /// Terminal waiter outcome (`return_completed` or `return_failed`).
+    Terminal(String),
+}
+
 /// One undelivered or unacked batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingDelivery {
@@ -24,8 +35,8 @@ pub struct PendingDelivery {
     pub link_id: String,
     /// Deliver payload to (re)send.
     pub message: WaiterLink,
-    /// Terminal waiter outcome, if any.
-    pub result: Option<String>,
+    /// Current attempt state.
+    pub attempt: DeliveryAttempt,
 }
 
 impl DeliveryLedger {
@@ -38,9 +49,12 @@ impl DeliveryLedger {
     /// Whether the same `delivery_id` should be sent again.
     #[must_use]
     pub fn should_redeliver(&self) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|pending| pending.result.is_none())
+        self.pending.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.attempt,
+                DeliveryAttempt::Awaiting | DeliveryAttempt::Lost
+            )
+        })
     }
 }
 
@@ -59,11 +73,7 @@ pub fn prepare_delivery(
     events: Vec<ProviderEvent>,
     now: OffsetDateTime,
 ) -> Result<WaiterLink, WaiterLinkError> {
-    if ledger
-        .pending
-        .as_ref()
-        .is_some_and(|pending| pending.result.is_none())
-    {
+    if ledger.should_redeliver() {
         return Err(WaiterLinkError::Semantic("delivery pending"));
     }
     let newest = events
@@ -91,7 +101,7 @@ pub fn prepare_delivery(
         delivery_id,
         link_id: link.link_id.clone(),
         message: message.clone(),
-        result: None,
+        attempt: DeliveryAttempt::Awaiting,
     });
     Ok(message)
 }
@@ -113,7 +123,7 @@ pub fn redeliver_pending(
     let Some(pending) = ledger.pending.as_mut() else {
         return Err(WaiterLinkError::Semantic("no pending delivery"));
     };
-    if pending.result.is_some() {
+    if matches!(pending.attempt, DeliveryAttempt::Terminal(_)) {
         return Err(WaiterLinkError::Semantic("delivery already terminal"));
     }
     let WaiterLink::DeliverEvents {
@@ -134,6 +144,7 @@ pub fn redeliver_pending(
     *attempted_at = format_time(now);
     validate(&pending.message)?;
     link.link_id.clone_into(&mut pending.link_id);
+    pending.attempt = DeliveryAttempt::Awaiting;
     Ok(pending.message.clone())
 }
 
@@ -197,17 +208,30 @@ pub fn record_delivery_result(
     if pending_signal != signal_id {
         return Err(WaiterLinkError::Semantic("signal_id mismatch"));
     }
-    if let Some(existing) = &pending.result {
-        if existing == outcome {
-            return Ok(());
+    match &pending.attempt {
+        DeliveryAttempt::Awaiting => {
+            if outcome == "link_lost" {
+                pending.attempt = DeliveryAttempt::Lost;
+            } else {
+                pending.attempt = DeliveryAttempt::Terminal(outcome.clone());
+            }
+            Ok(())
         }
-        return Err(WaiterLinkError::Semantic("conflicting delivery outcome"));
+        DeliveryAttempt::Lost => {
+            if outcome == "link_lost" {
+                Ok(())
+            } else {
+                Err(WaiterLinkError::Semantic("lost attempt"))
+            }
+        }
+        DeliveryAttempt::Terminal(existing) => {
+            if existing == outcome {
+                Ok(())
+            } else {
+                Err(WaiterLinkError::Semantic("conflicting delivery outcome"))
+            }
+        }
     }
-    if outcome == "link_lost" {
-        return Ok(());
-    }
-    pending.result = Some(outcome.clone());
-    Ok(())
 }
 
 fn format_time(instant: OffsetDateTime) -> String {
