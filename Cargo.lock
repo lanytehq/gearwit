@@ -212,7 +212,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "gearwit-domain",
+ "gearwit-host",
+ "gearwit-protocol",
+ "ipcprims",
  "serde_json",
+ "time",
+ "ulid",
 ]
 
 [[package]]

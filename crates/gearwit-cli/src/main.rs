@@ -3,8 +3,12 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand, ValueEnum};
-use gearwit_cli::{ProcessCensus, WaitOnSpec, WhoCard, render_check, run_wait_on};
+use gearwit_cli::{
+    AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_attach_receipt, render_check,
+    run_attach_session, run_wait_on,
+};
 use gearwit_domain::DeliveryRoute;
+use gearwit_host::GearwitPaths;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -27,6 +31,9 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             SelfCommand::WaitOn(args) => {
+                if args.attach {
+                    return run_attach_from_args(&args);
+                }
                 let code = run_wait_on(&spec_from_args(args, false));
                 ExitCode::from(u8::try_from(code).unwrap_or(2))
             }
@@ -116,6 +123,18 @@ struct WaitOnArgs {
     /// Declared return route. Not proof of a model turn.
     #[arg(long = "return", value_enum, default_value_t = ReturnArg::Foreground)]
     return_route: ReturnArg,
+    /// Attach to gearwitd over the local waiter-link instead of wrapping Chanvoy.
+    #[arg(long)]
+    attach: bool,
+    /// Arm id. Required with `--attach`.
+    #[arg(long)]
+    arm: Option<String>,
+    /// Seat token. Required with `--attach`.
+    #[arg(long)]
+    seat: Option<String>,
+    /// Arm generation. Required with `--attach`.
+    #[arg(long)]
+    generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -170,6 +189,44 @@ fn spec_from_args(args: WaitOnArgs, follow: bool) -> WaitOnSpec {
         source: args.source,
         return_route: args.return_route.route(),
         follow,
+    }
+}
+
+fn run_attach_from_args(args: &WaitOnArgs) -> ExitCode {
+    let Some(arm_id) = args.arm.clone() else {
+        eprintln!("gearwit: --attach requires --arm");
+        return ExitCode::from(2);
+    };
+    let Some(seat_id) = args.seat.clone() else {
+        eprintln!("gearwit: --attach requires --seat");
+        return ExitCode::from(2);
+    };
+    let Some(generation) = args.generation else {
+        eprintln!("gearwit: --attach requires --generation");
+        return ExitCode::from(2);
+    };
+    let spec = AttachSpec {
+        arm_id,
+        generation,
+        seat_id,
+        route: args.return_route.route().as_str().to_owned(),
+    };
+    let paths = match GearwitPaths::user_default() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gearwit: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match run_attach_session(&paths.socket_path(), &spec) {
+        Ok(delivery) => {
+            eprint!("{}", render_attach_receipt(&delivery));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gearwit: {error}");
+            ExitCode::from(2)
+        }
     }
 }
 

@@ -5,11 +5,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attach;
 pub mod check;
 pub mod sanitize;
 pub mod wait_on;
 pub mod who;
 
+pub use attach::{AttachSpec, render_attach_receipt, run_attach_session};
 pub use check::render_check;
 pub use wait_on::{WaitOnSpec, WaitResult, run_wait_on};
 pub use who::{HarnessFamily, HarnessObservation, ProcessCensus, WhoCard};
