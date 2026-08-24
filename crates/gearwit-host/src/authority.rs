@@ -861,6 +861,20 @@ impl AuthorityRecovery {
                     .is_some_and(|d| matches!(d, DispatchDisposition::Accepted { .. }))
             {
                 ambiguous.push(attempt_id.to_owned());
+                continue;
+            }
+
+            // Case 3: Ambiguous disposition recorded but ReconciliationRequired
+            // missing (partial record_conclusion for Ambiguous disposition).
+            if transitions.contains(&Transition::DispatchPrepared)
+                && !transitions.contains(&Transition::ReconciliationRequired)
+                && self
+                    .snapshot
+                    .dispositions
+                    .get(attempt_id)
+                    .is_some_and(|d| matches!(d, DispatchDisposition::Ambiguous))
+            {
+                ambiguous.push(attempt_id.to_owned());
             }
         }
         ambiguous
@@ -1560,6 +1574,334 @@ mod tests {
             controller.reconcile("attempt-1"),
             ReconciliationDisposition::Accepted
         );
+    }
+
+    // -- c5: post-send boundary failure coverage -------------------------
+
+    #[test]
+    fn ambiguous_conclusion_partial_write_is_derivable_as_ambiguous() {
+        // Disposition writes but ReconciliationRequired transition fails
+        // (partial record_conclusion for Ambiguous disposition).
+        let mut auth = sample_authority_with_persist(FakePersist {
+            next_transition_error: Some("transition write failed".to_owned()),
+            transition_allow_count: 1, // DispatchPrepared passes; ReconciliationRequired fails
+            ..Default::default()
+        });
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let prepared = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        let err = auth
+            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+            .expect_err("ReconciliationRequired failure");
+        assert!(
+            matches!(err, DispatchError::PostSend(_)),
+            "expected PostSend, got {err:?}"
+        );
+
+        // Disposition recorded, ReconciliationRequired missing → derivable ambiguous
+        let arm_id = auth.arms.keys().next().unwrap().clone();
+        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
+        auth.persist_mut().arm_states.push((arm_id, arm_gen));
+        let recovery = auth.recover().expect("recover");
+        let ambiguous = recovery.derivable_ambiguous_attempts();
+        assert!(
+            ambiguous.contains(&admission.attempt_id),
+            "Ambiguous partial write (disposition ok, ReconciliationRequired failed) must be derivable"
+        );
+    }
+
+    #[test]
+    fn observation_exact_turn_start_failure_after_conclusion_is_post_send() {
+        // record_conclusion succeeds (disposition + NativeAccepted)
+        // but ExactTurnStart observation write fails.
+        let mut auth = sample_authority_with_persist(FakePersist {
+            next_transition_error: Some("ExactTurnStart failed".to_owned()),
+            transition_allow_count: 2, // DispatchPrepared + NativeAccepted pass
+            ..Default::default()
+        });
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let prepared = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        let err = auth
+            .conclude_dispatch(
+                prepared,
+                DispatchDisposition::Accepted {
+                    correlation: "corr-1".to_owned(),
+                },
+                vec![LifecycleObservation::TurnStarted("T1".to_owned())],
+            )
+            .expect_err("ExactTurnStart failure");
+        assert!(
+            matches!(err, DispatchError::PostSend(_)),
+            "expected PostSend for observation failure, got {err:?}"
+        );
+
+        // Recover: NativeAccepted present, ExactTurnStart missing
+        let arm_id = auth.arms.keys().next().unwrap().clone();
+        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
+        auth.persist_mut().arm_states.push((arm_id, arm_gen));
+        let _recovery = auth.recover().expect("recover");
+        let ts = auth
+            .persist()
+            .get_transitions("sig-1", &admission.attempt_id);
+        assert!(
+            ts.contains(&Transition::NativeAccepted),
+            "NativeAccepted must be durable after record_conclusion"
+        );
+        assert!(
+            !ts.contains(&Transition::ExactTurnStart),
+            "ExactTurnStart must not be present after failed observation write"
+        );
+    }
+
+    #[test]
+    fn observation_exact_turn_terminal_failure_after_conclusion_is_post_send() {
+        // record_conclusion + ExactTurnStart succeed, ExactTurnTerminal fails.
+        let mut auth = sample_authority_with_persist(FakePersist {
+            next_transition_error: Some("ExactTurnTerminal failed".to_owned()),
+            transition_allow_count: 3, // DispatchPrepared + NativeAccepted + ExactTurnStart pass
+            ..Default::default()
+        });
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let prepared = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        let err = auth
+            .conclude_dispatch(
+                prepared,
+                DispatchDisposition::Accepted {
+                    correlation: "corr-1".to_owned(),
+                },
+                vec![
+                    LifecycleObservation::TurnStarted("T1".to_owned()),
+                    LifecycleObservation::TurnTerminal("T1".to_owned(), true),
+                ],
+            )
+            .expect_err("ExactTurnTerminal failure");
+        assert!(
+            matches!(err, DispatchError::PostSend(_)),
+            "expected PostSend for ExactTurnTerminal failure, got {err:?}"
+        );
+
+        // ExactTurnStart durable, ExactTurnTerminal missing
+        let ts = auth
+            .persist()
+            .get_transitions("sig-1", &admission.attempt_id);
+        assert!(ts.contains(&Transition::NativeAccepted));
+        assert!(ts.contains(&Transition::ExactTurnStart));
+        assert!(!ts.contains(&Transition::ExactTurnTerminal));
+    }
+
+    #[test]
+    fn observation_controller_lost_failure_after_conclusion_is_post_send() {
+        // record_conclusion succeeds, ControllerLost observation write fails.
+        let mut auth = sample_authority_with_persist(FakePersist {
+            next_transition_error: Some("ControllerLost failed".to_owned()),
+            transition_allow_count: 2, // DispatchPrepared + NativeAccepted pass
+            ..Default::default()
+        });
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let prepared = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        let err = auth
+            .conclude_dispatch(
+                prepared,
+                DispatchDisposition::Accepted {
+                    correlation: "corr-1".to_owned(),
+                },
+                vec![LifecycleObservation::ControllerLost],
+            )
+            .expect_err("ControllerLost failure");
+        assert!(
+            matches!(err, DispatchError::PostSend(_)),
+            "expected PostSend for ControllerLost failure, got {err:?}"
+        );
+
+        // NativeAccepted durable, ControllerLost missing
+        let ts = auth
+            .persist()
+            .get_transitions("sig-1", &admission.attempt_id);
+        assert!(ts.contains(&Transition::NativeAccepted));
+        assert!(!ts.contains(&Transition::ControllerLost));
+    }
+
+    #[test]
+    fn restart_after_post_send_failure_no_replay_grant() {
+        // After a post-send conclusion failure, a new claim admission
+        // for the same arm at the same generation must return Occupied
+        // (the arm is still occupied by the failed attempt).
+        // Replay of the same request_id works normally.
+        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+        let mut auth = sample_authority_with_persist(FakePersist {
+            next_disposition_error: Some("post-send write failed".to_owned()),
+            ..Default::default()
+        });
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let prepared = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        let _err = auth
+            .conclude_dispatch(
+                prepared,
+                DispatchDisposition::Accepted {
+                    correlation: "corr-1".to_owned(),
+                },
+                vec![],
+            )
+            .expect_err("post-send failure");
+
+        // Propagate arm state for recovery
+        let arm_id = auth.arms.keys().next().unwrap().clone();
+        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
+        auth.persist_mut().arm_states.push((arm_id, arm_gen));
+
+        // Session 2: fresh authority from same persist backend
+        let mut auth2 = DaemonAuthority::new(auth.persist().clone(), now);
+        auth2.register_arm(sample_arm());
+        let _recovery = auth2.recover().expect("recover");
+
+        // Replay of the same request_id must still work
+        let replay = auth2.admit_claim(&std_req()).expect("replay after failure");
+        assert_eq!(
+            replay.outcome,
+            ClaimOutcome::Replay,
+            "replay must work after post-send failure"
+        );
+        assert_eq!(replay.attempt_id, admission.attempt_id);
+
+        // A new claim on the same arm at same generation must be Occupied
+        let ev2 = vec![sample_event("new-claim")];
+        let new_req = claim_req("arm-01", "req-2", "sig-2", ev2);
+        let occupied = auth2.admit_claim(&new_req).expect_err("must be occupied");
+        assert!(
+            matches!(occupied, AdmissionError::Occupied),
+            "new claim must be Occupied after post-send failure, got {occupied:?}"
+        );
+
+        // After re-arm, a new claim at the new generation must succeed
+        auth2.advance_generation("arm-01").expect("re-arm");
+        let ev3 = vec![sample_event("rearmed-claim")];
+        let rearmed_req = claim_req("arm-01", "req-3", "sig-3", ev3);
+        let fresh = auth2.admit_claim(&rearmed_req).expect("fresh after re-arm");
+        assert_eq!(
+            fresh.claim.generation, 2,
+            "fresh claim must be at generation 2 after re-arm"
+        );
+        assert!(fresh.attachment.is_some(), "must mint attachment");
+    }
+
+    #[test]
+    fn full_post_send_failure_boundary_matrix() {
+        // Exercise every PostSend failure boundary and verify the
+        // correct partial state is persisted for recovery.
+
+        // -- Boundary 1: disposition write fails (entire conclusion lost) --
+        {
+            let mut auth = sample_authority_with_persist(FakePersist {
+                next_disposition_error: Some("disk full".to_owned()),
+                ..Default::default()
+            });
+            let admission = auth.admit_claim(&std_req()).expect("admit");
+            let att = admission.attachment.expect("attachment");
+            let prepared = auth
+                .prepare_dispatch(&admission.claim, &att)
+                .expect("prepare");
+            let _err = auth
+                .conclude_dispatch(
+                    prepared,
+                    DispatchDisposition::Accepted {
+                        correlation: "corr-1".to_owned(),
+                    },
+                    vec![],
+                )
+                .expect_err("disposition failure");
+
+            let ts = auth
+                .persist()
+                .get_transitions("sig-1", &admission.attempt_id);
+            assert!(ts.contains(&Transition::DispatchPrepared));
+            assert!(
+                !ts.contains(&Transition::NativeAccepted),
+                "NativeAccepted must not exist when disposition write failed"
+            );
+            assert!(
+                auth.persist()
+                    .get_disposition(&admission.attempt_id)
+                    .is_none(),
+                "no disposition stored"
+            );
+        }
+
+        // -- Boundary 2: Ambiguous + ReconciliationRequired transition fails --
+        {
+            let mut auth = sample_authority_with_persist(FakePersist {
+                next_transition_error: Some("ReconciliationRequired failed".to_owned()),
+                transition_allow_count: 1,
+                ..Default::default()
+            });
+            let admission = auth.admit_claim(&std_req()).expect("admit");
+            let att = admission.attachment.expect("attachment");
+            let prepared = auth
+                .prepare_dispatch(&admission.claim, &att)
+                .expect("prepare");
+            let _err = auth
+                .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+                .expect_err("ReconciliationRequired failure");
+
+            // Disposition exists, ReconciliationRequired missing
+            assert!(
+                auth.persist()
+                    .get_disposition(&admission.attempt_id)
+                    .is_some(),
+                "disposition must be recorded (partial write)"
+            );
+            let ts = auth
+                .persist()
+                .get_transitions("sig-1", &admission.attempt_id);
+            assert!(!ts.contains(&Transition::ReconciliationRequired));
+        }
+
+        // -- Boundary 3: NativeAccepted fails (Accepted partial write) --
+        {
+            let mut auth = sample_authority_with_persist(FakePersist {
+                next_transition_error: Some("NativeAccepted failed".to_owned()),
+                transition_allow_count: 1,
+                ..Default::default()
+            });
+            let admission = auth.admit_claim(&std_req()).expect("admit");
+            let att = admission.attachment.expect("attachment");
+            let prepared = auth
+                .prepare_dispatch(&admission.claim, &att)
+                .expect("prepare");
+            let _err = auth
+                .conclude_dispatch(
+                    prepared,
+                    DispatchDisposition::Accepted {
+                        correlation: "corr-1".to_owned(),
+                    },
+                    vec![],
+                )
+                .expect_err("NativeAccepted failure");
+
+            assert!(
+                auth.persist()
+                    .get_disposition(&admission.attempt_id)
+                    .is_some(),
+                "disposition must be recorded (partial write)"
+            );
+            let ts = auth
+                .persist()
+                .get_transitions("sig-1", &admission.attempt_id);
+            assert!(!ts.contains(&Transition::NativeAccepted));
+        }
     }
 
     #[test]
