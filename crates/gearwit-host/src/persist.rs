@@ -294,6 +294,28 @@ pub trait Persist {
     ///
     /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
     fn record_concluded(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError>;
+
+    /// Persist an arm's state (`arm_id`, generation) for recovery after restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
+    fn persist_arm_state(&mut self, arm_id: &str, generation: u64) -> Result<(), WaiterLinkError>;
+
+    /// Persist a handled cursor position for recovery after restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
+    fn persist_handled_cursor(&mut self, arm_id: &str, cursor: &str)
+    -> Result<(), WaiterLinkError>;
+
+    /// Persist a re-arm flag for recovery after restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
+    fn persist_rearmed(&mut self, arm_id: &str) -> Result<(), WaiterLinkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +599,31 @@ impl Persist for FakePersist {
 
     fn record_concluded(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError> {
         self.concluded_set.insert(attempt_id.to_owned(), true);
+        Ok(())
+    }
+
+    fn persist_arm_state(&mut self, arm_id: &str, generation: u64) -> Result<(), WaiterLinkError> {
+        // Replace existing entry if present, otherwise append.
+        if let Some(existing) = self.arm_states.iter_mut().find(|(id, _)| id == arm_id) {
+            existing.1 = generation;
+        } else {
+            self.arm_states.push((arm_id.to_owned(), generation));
+        }
+        Ok(())
+    }
+
+    fn persist_handled_cursor(
+        &mut self,
+        arm_id: &str,
+        cursor: &str,
+    ) -> Result<(), WaiterLinkError> {
+        self.handled_cursors
+            .insert(arm_id.to_owned(), cursor.to_owned());
+        Ok(())
+    }
+
+    fn persist_rearmed(&mut self, arm_id: &str) -> Result<(), WaiterLinkError> {
+        self.rearm_positions.insert(arm_id.to_owned(), true);
         Ok(())
     }
 

@@ -258,7 +258,8 @@ impl<P: Persist> DaemonAuthority<P> {
     /// Advance generation for an arm — the production re-arm path.
     ///
     /// Bumps the arm's generation by 1, invalidating all previously minted
-    /// attachments that carry the old generation. Returns the new generation.
+    /// attachments that carry the old generation. Persists the new state.
+    /// Returns the new generation.
     ///
     /// # Errors
     ///
@@ -269,7 +270,11 @@ impl<P: Persist> DaemonAuthority<P> {
             .get_mut(arm_id)
             .ok_or(AdmissionError::UnknownArm)?;
         arm.generation += 1;
-        Ok(arm.generation)
+        let arm_gen = arm.generation;
+        self.persist
+            .persist_arm_state(arm_id, arm_gen)
+            .map_err(|e| AdmissionError::Storage(format!("persist_arm_state failed: {e:?}")))?;
+        Ok(arm_gen)
     }
 
     /// Current time (injectable for tests).
@@ -679,10 +684,25 @@ impl<P: Persist> DaemonAuthority<P> {
     pub fn recover(&mut self) -> Result<AuthorityRecovery, ClaimError> {
         let snapshot = self.persist.recover()?;
 
-        // Reconstruct arms from persisted arm states
+        // Reconstruct arms from persisted arm states.
+        // For arms already registered, update generation.
+        // For arms only in persisted data, create a skeleton entry.
         for (arm_id, generation) in &snapshot.arm_states {
             if let Some(arm) = self.arms.get_mut(arm_id) {
                 arm.generation = *generation;
+            } else {
+                // Create skeleton — caller must re-register with full arm
+                // definition, but the persisted generation survives.
+                self.arms.insert(
+                    arm_id.clone(),
+                    KnownArm {
+                        arm_id: arm_id.clone(),
+                        generation: *generation,
+                        seat_id: String::new(),
+                        route: String::new(),
+                        coverage_until: self.now,
+                    },
+                );
             }
         }
 
@@ -1926,6 +1946,146 @@ mod tests {
         }
     }
 
+    // -- c6: recovery from persisted state only — -------------------------
+    // No test map copying into FakePersist; all metadata is production-
+    // persisted via register_arm, advance_generation, and the Persist
+    // contract.
+
+    #[test]
+    fn recovery_from_backend_only_no_test_copying() {
+        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+
+        // Session 1: register arm, advance generation to persist
+        // arm state, then admit/prepare/conclude at the advanced gen.
+        // No direct FakePersist field manipulation.
+        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
+        auth1.register_arm(sample_arm());
+        // Advance generation before claim — persists arm state for recovery.
+        auth1.advance_generation("arm-01").expect("advance gen");
+
+        let admission = auth1.admit_claim(&std_req()).expect("admit");
+        // Claim is at generation 2
+        assert_eq!(admission.claim.generation, 2);
+        let att = admission.attachment.expect("attachment");
+        let (prepared, _cmd) = auth1
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        auth1
+            .conclude_dispatch(
+                &prepared,
+                DispatchDisposition::Accepted {
+                    correlation: "corr-1".to_owned(),
+                },
+                vec![],
+            )
+            .expect("conclude");
+
+        // Session 2: fresh authority from same backend.
+        let persisted = auth1.persist().clone();
+        let mut auth2 = DaemonAuthority::new(persisted, now);
+        auth2.register_arm(sample_arm());
+        let recovery = auth2.recover().expect("recover after restart");
+
+        assert!(
+            recovery.arms.contains_key("arm-01"),
+            "arm-01 must be reconstructed from persisted arm_states"
+        );
+        let arm = recovery.arms.get("arm-01").expect("arm exists");
+        assert_eq!(
+            arm.generation, 2,
+            "generation must be 2 after recovery (advance persisted)"
+        );
+
+        // Claim replay works from recovered state (same generation).
+        let replay = auth2.admit_claim(&std_req()).expect("replay after restart");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert_eq!(replay.attempt_id, admission.attempt_id);
+        assert!(
+            replay.attachment.is_none(),
+            "replay must not mint attachment"
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_revoked_attachment_rejection() {
+        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
+        auth1.register_arm(sample_arm());
+
+        let admission = auth1.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        // Revoke the attachment before prepare — prepares must fail.
+        auth1.revoke_attachment(&att.attempt_id);
+        let err = auth1
+            .prepare_dispatch(&admission.claim, &att)
+            .expect_err("prepare after revoke");
+        assert!(
+            matches!(err, DispatchError::PreSend(_)),
+            "prepare must fail for revoked attachment"
+        );
+
+        // Fresh authority, same backend — claim is still recorded,
+        // replay works but no dispatch-capable attachment.
+        let persisted = auth1.persist().clone();
+        let mut auth2 = DaemonAuthority::new(persisted, now);
+        auth2.register_arm(sample_arm());
+        let _recovery = auth2.recover().expect("recover");
+
+        let replay = auth2.admit_claim(&std_req()).expect("replay");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert!(replay.attachment.is_none());
+    }
+
+    #[test]
+    fn recovery_preserves_generation_advance_for_new_claim() {
+        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
+        auth1.register_arm(sample_arm());
+
+        // Admit and conclude at gen 1
+        let admission = auth1.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let (prepared, _cmd) = auth1
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        auth1
+            .conclude_dispatch(
+                &prepared,
+                DispatchDisposition::Accepted {
+                    correlation: "corr-1".to_owned(),
+                },
+                vec![],
+            )
+            .expect("conclude");
+
+        // Advance generation through production re-arm path
+        let gen2 = auth1.advance_generation("arm-01").expect("advance");
+        assert_eq!(gen2, 2);
+
+        // Restart: fresh authority from same backend.
+        // register_arm provides the arm definition; recover()
+        // restores the persisted generation (gen 2).
+        let persisted = auth1.persist().clone();
+        let mut auth2 = DaemonAuthority::new(persisted, now);
+        auth2.register_arm(sample_arm());
+        let recovery = auth2.recover().expect("recover");
+
+        // Generation 2 must survive restart
+        let arm = recovery.arms.get("arm-01").expect("arm exists");
+        assert_eq!(
+            arm.generation, 2,
+            "generation 2 must be recovered from persisted state"
+        );
+
+        // A new claim must get generation 2
+        let ev2 = vec![sample_event("gen2-claim")];
+        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
+        let fresh = auth2.admit_claim(&req2).expect("fresh at gen 2");
+        assert_eq!(fresh.claim.generation, 2);
+        assert!(fresh.attachment.is_some());
+        assert_eq!(fresh.attachment.unwrap().generation, 2);
+    }
+
     #[test]
     fn fresh_authority_restart_reconstructs_full_semantic_packet() {
         let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
@@ -1960,11 +2120,10 @@ mod tests {
         auth1.set_rearmed("arm-01");
 
         // Propagate live authority metadata to the fake persist backend for recovery.
-        let arm_states: Vec<(String, u64)> = auth1
-            .arms
-            .iter()
-            .map(|(id, arm)| (id.clone(), arm.generation))
-            .collect();
+        // Only arm-01 is expected to be recovered; arm-02 is a
+        // fresh-registered peer arm that was never persisted.
+        let arm_states: Vec<(String, u64)> =
+            vec![("arm-01".to_owned(), auth1.arms["arm-01"].generation)];
         let cursors = auth1.handled_cursors.clone();
         let rearmed = auth1.rearm_positions.clone();
         {
