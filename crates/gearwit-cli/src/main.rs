@@ -4,8 +4,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gearwit_cli::{
-    AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_attach_receipt, render_check,
-    run_attach_session, run_wait_on,
+    AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_check, run_attach_session, run_wait_on,
 };
 use gearwit_domain::DeliveryRoute;
 use gearwit_host::GearwitPaths;
@@ -212,10 +211,7 @@ fn run_attach_from_args(args: &WaitOnArgs) -> ExitCode {
         }
     };
     match run_attach_session(&paths.socket_path(), &spec) {
-        Ok(delivery) => {
-            eprint!("{}", render_attach_receipt(&delivery));
-            ExitCode::SUCCESS
-        }
+        Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("gearwit: {error}");
             ExitCode::from(2)
