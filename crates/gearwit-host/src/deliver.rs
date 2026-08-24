@@ -38,31 +38,33 @@ impl DeliveryLedger {
     /// Whether the same `delivery_id` should be sent again.
     #[must_use]
     pub fn should_redeliver(&self) -> bool {
-        self.pending.as_ref().is_some_and(|pending| {
-            pending.result.as_deref() != Some("return_completed")
-                && pending.result.as_deref() != Some("return_failed")
-        })
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.result.is_none())
     }
 }
 
-/// Build a validated `deliver_events` message and store it as pending.
+/// Build a new validated `deliver_events` batch.
+///
+/// Fails if a non-terminal delivery is already pending. Route is taken from
+/// the admitted link, not the caller.
 ///
 /// # Errors
 ///
-/// Returns [`WaiterLinkError`] if the constructed message fails validation.
+/// Returns [`WaiterLinkError`] if a delivery is pending or validation fails.
 pub fn prepare_delivery(
     ledger: &mut DeliveryLedger,
     link: &AdmittedLink,
     signal_id: String,
-    route: String,
     events: Vec<ProviderEvent>,
     now: OffsetDateTime,
 ) -> Result<WaiterLink, WaiterLinkError> {
-    if let Some(pending) = &ledger.pending
-        && pending.result.as_deref() != Some("return_completed")
-        && pending.result.as_deref() != Some("return_failed")
+    if ledger
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.result.is_none())
     {
-        return retarget_pending(ledger, &link.link_id);
+        return Err(WaiterLinkError::Semantic("delivery pending"));
     }
     let newest = events
         .last()
@@ -75,7 +77,7 @@ pub fn prepare_delivery(
         arm_id: link.arm_id.clone(),
         generation: link.generation,
         signal_id,
-        route,
+        route: link.route.clone(),
         events,
         newest_event_ref: newest,
         attempted_at: format_time(now),
@@ -94,41 +96,73 @@ pub fn prepare_delivery(
     Ok(message)
 }
 
-fn retarget_pending(
+/// Resend the pending batch on a successor link.
+///
+/// Updates `link_id` and `attempted_at` only. Arm, generation, signal, route,
+/// and events must still match the successor link's authority.
+///
+/// # Errors
+///
+/// Returns [`WaiterLinkError`] if there is nothing to redeliver or the
+/// successor does not match the original authority.
+pub fn redeliver_pending(
     ledger: &mut DeliveryLedger,
-    link_id: &str,
+    link: &AdmittedLink,
+    now: OffsetDateTime,
 ) -> Result<WaiterLink, WaiterLinkError> {
     let Some(pending) = ledger.pending.as_mut() else {
         return Err(WaiterLinkError::Semantic("no pending delivery"));
     };
-    if let WaiterLink::DeliverEvents {
+    if pending.result.is_some() {
+        return Err(WaiterLinkError::Semantic("delivery already terminal"));
+    }
+    let WaiterLink::DeliverEvents {
+        arm_id,
+        generation,
+        route,
         link_id: stored_link,
+        attempted_at,
         ..
     } = &mut pending.message
-    {
-        link_id.clone_into(stored_link);
+    else {
+        return Err(WaiterLinkError::Semantic("expected deliver_events"));
+    };
+    if *arm_id != link.arm_id || *generation != link.generation || *route != link.route {
+        return Err(WaiterLinkError::Semantic("successor authority mismatch"));
     }
-    link_id.clone_into(&mut pending.link_id);
+    link.link_id.clone_into(stored_link);
+    *attempted_at = format_time(now);
+    validate(&pending.message)?;
+    link.link_id.clone_into(&mut pending.link_id);
     Ok(pending.message.clone())
 }
 
-/// Write `deliver_events`. Does not record `turn_started`.
+/// Write one `deliver_events` frame. Does not record `turn_started`.
 ///
 /// # Errors
 ///
-/// Returns [`LinkError`] if the frame cannot be written.
+/// Returns [`LinkError`] if the message is not `deliver_events` or write fails.
 pub fn send_delivery(
     writer: &mut FrameWriter<IpcStream>,
     message: &WaiterLink,
 ) -> Result<(), LinkError> {
+    if !matches!(message, WaiterLink::DeliverEvents { .. }) {
+        return Err(LinkError::Message(WaiterLinkError::Semantic(
+            "expected deliver_events",
+        )));
+    }
     write_waiter_link(writer, message)
 }
 
-/// Record a waiter `delivery_result`. Same `delivery_id` only.
+/// Record a waiter `delivery_result` against the current attempt.
+///
+/// Requires `delivery_id`, current attempt `link_id`, and `signal_id`.
+/// Terminal outcomes are monotonic: exact replay is idempotent; a different
+/// outcome is a hard error; `link_lost` cannot follow a terminal result.
 ///
 /// # Errors
 ///
-/// Returns [`WaiterLinkError`] on type or id mismatch.
+/// Returns [`WaiterLinkError`] on type, correlation, or transition failure.
 pub fn record_delivery_result(
     ledger: &mut DeliveryLedger,
     result: &WaiterLink,
@@ -136,6 +170,8 @@ pub fn record_delivery_result(
     validate(result)?;
     let WaiterLink::DeliveryResult {
         delivery_id,
+        link_id,
+        signal_id,
         outcome,
         ..
     } = result
@@ -145,11 +181,29 @@ pub fn record_delivery_result(
     let Some(pending) = ledger.pending.as_mut() else {
         return Err(WaiterLinkError::Semantic("no pending delivery"));
     };
+    let WaiterLink::DeliverEvents {
+        signal_id: pending_signal,
+        ..
+    } = &pending.message
+    else {
+        return Err(WaiterLinkError::Semantic("expected deliver_events"));
+    };
     if pending.delivery_id != *delivery_id {
         return Err(WaiterLinkError::Semantic("delivery_id mismatch"));
     }
+    if pending.link_id != *link_id {
+        return Err(WaiterLinkError::Semantic("link_id mismatch"));
+    }
+    if pending_signal != signal_id {
+        return Err(WaiterLinkError::Semantic("signal_id mismatch"));
+    }
+    if let Some(existing) = &pending.result {
+        if existing == outcome {
+            return Ok(());
+        }
+        return Err(WaiterLinkError::Semantic("conflicting delivery outcome"));
+    }
     if outcome == "link_lost" {
-        pending.result = None;
         return Ok(());
     }
     pending.result = Some(outcome.clone());

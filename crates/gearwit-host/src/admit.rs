@@ -42,6 +42,8 @@ pub struct AdmittedLink {
     pub waiter_id: String,
     /// Lease end.
     pub lease_until: OffsetDateTime,
+    /// Admitted return route.
+    pub route: String,
     request: WaiterLink,
     last_accepted: WaiterLink,
 }
@@ -221,6 +223,7 @@ pub(crate) fn decide_attach(
         generation: *generation,
         waiter_id: waiter_id.clone(),
         lease_until,
+        route: route.clone(),
         request,
         last_accepted: accepted.clone(),
     };

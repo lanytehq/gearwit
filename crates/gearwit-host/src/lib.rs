@@ -11,7 +11,8 @@ pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };
 pub use deliver::{
-    DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result, send_delivery,
+    DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result, redeliver_pending,
+    send_delivery,
 };
 pub use link::{
     LinkError, ServeAttach, read_waiter_link, serve_attach, wait_disconnect, waiter_frame_config,
@@ -24,7 +25,7 @@ mod tests {
     use super::{
         BindError, DeliveryLedger, GearwitPaths, HISTORY_CAP, KnownArm, LinkError, LinkSession,
         LinkTable, SOCKET_FILE, admit_attach, drop_session, prepare_delivery,
-        record_delivery_result, send_delivery, serve_attach, wait_disconnect,
+        record_delivery_result, redeliver_pending, send_delivery, serve_attach, wait_disconnect,
     };
     use gearwit_protocol::{
         MAX_PAYLOAD, ProviderEvent, SCHEMA, WaiterLink, decode_payload, encode_payload,
@@ -718,12 +719,23 @@ mod tests {
             &mut ledger,
             &link,
             "01J00000000000000000000021".to_owned(),
-            "complete_background_tool".to_owned(),
             vec![sample_event()],
             instant,
         )
         .expect("prepare");
         assert!(ledger.should_redeliver());
+        assert!(matches!(
+            prepare_delivery(
+                &mut ledger,
+                &link,
+                "01J00000000000000000000022".to_owned(),
+                vec![sample_event()],
+                instant,
+            ),
+            Err(gearwit_protocol::WaiterLinkError::Semantic(
+                "delivery pending"
+            ))
+        ));
         let WaiterLink::DeliverEvents { delivery_id, .. } = &first else {
             panic!("deliver");
         };
@@ -736,12 +748,26 @@ mod tests {
             observed_at: "2026-01-15T12:05:03Z".to_owned(),
         };
         record_delivery_result(&mut ledger, &result).expect("result");
+        record_delivery_result(&mut ledger, &result).expect("replay");
+        let lost = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: link.link_id.clone(),
+            signal_id: "01J00000000000000000000021".to_owned(),
+            outcome: "link_lost".to_owned(),
+            observed_at: "2026-01-15T12:05:04Z".to_owned(),
+        };
+        assert!(matches!(
+            record_delivery_result(&mut ledger, &lost),
+            Err(gearwit_protocol::WaiterLinkError::Semantic(
+                "conflicting delivery outcome"
+            ))
+        ));
         assert!(!ledger.should_redeliver());
         let second = prepare_delivery(
             &mut ledger,
             &link,
             "01J00000000000000000000022".to_owned(),
-            "complete_background_tool".to_owned(),
             vec![sample_event()],
             instant,
         )
@@ -767,7 +793,6 @@ mod tests {
             &mut ledger,
             &first_link,
             "01J00000000000000000000021".to_owned(),
-            "complete_background_tool".to_owned(),
             vec![sample_event()],
             instant,
         )
@@ -794,15 +819,35 @@ mod tests {
         )
         .expect("successor");
         let successor = table.current().expect("successor").clone();
-        let again = prepare_delivery(
-            &mut ledger,
-            &successor,
-            "01J00000000000000000000021".to_owned(),
-            "complete_background_tool".to_owned(),
-            vec![sample_event()],
-            instant,
-        )
-        .expect("redeliver");
+        let stale = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: first_link.link_id.clone(),
+            signal_id: "01J00000000000000000000021".to_owned(),
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:04Z".to_owned(),
+        };
+        let again = redeliver_pending(&mut ledger, &successor, instant).expect("redeliver");
+        assert!(matches!(
+            record_delivery_result(&mut ledger, &stale),
+            Err(gearwit_protocol::WaiterLinkError::Semantic(
+                "link_id mismatch"
+            ))
+        ));
+        let wrong_signal = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: successor.link_id.clone(),
+            signal_id: "01J00000000000000000000099".to_owned(),
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:04Z".to_owned(),
+        };
+        assert!(matches!(
+            record_delivery_result(&mut ledger, &wrong_signal),
+            Err(gearwit_protocol::WaiterLinkError::Semantic(
+                "signal_id mismatch"
+            ))
+        ));
         match again {
             WaiterLink::DeliverEvents {
                 delivery_id: again_id,
@@ -835,7 +880,6 @@ mod tests {
                 &mut ledger,
                 &link,
                 "01J00000000000000000000021".to_owned(),
-                "complete_background_tool".to_owned(),
                 vec![sample_event()],
                 instant,
             )
