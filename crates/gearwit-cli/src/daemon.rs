@@ -156,20 +156,69 @@ fn delivery_id_of(message: &WaiterLink) -> Option<String> {
     }
 }
 
-/// True when `served` is the live table session and no writer is already held.
+/// True when `incoming` is the live table session.
+///
+/// An existing writer blocks it only while that writer still owns `current`.
 #[must_use]
-pub fn retain_live_attach(served: &ServeAttach, table: &LinkTable, writer_occupied: bool) -> bool {
-    if writer_occupied {
-        return false;
-    }
-    let Some(session) = served.session.as_ref() else {
+pub fn retain_live_attach(
+    incoming: &ServeAttach,
+    table: &LinkTable,
+    existing: Option<&ServeAttach>,
+) -> bool {
+    let Some(session) = incoming.session.as_ref() else {
         return false;
     };
-    table.current().is_some_and(|current| {
-        current.link_id == session.link_id
-            && current.arm_id == session.arm_id
-            && current.generation == session.generation
-    })
+    let Some(current) = table.current() else {
+        return false;
+    };
+    if current.link_id != session.link_id
+        || current.arm_id != session.arm_id
+        || current.generation != session.generation
+    {
+        return false;
+    }
+    if let Some(existing) = existing
+        && let Some(held) = existing.session.as_ref()
+        && held.link_id == current.link_id
+        && held.arm_id == current.arm_id
+        && held.generation == current.generation
+    {
+        return false;
+    }
+    true
+}
+
+/// How a waiter `delivery_result` should affect the live session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultApply {
+    /// Leave the writer in place.
+    Keep,
+    /// Revoke this session as loss; the batch stays pending.
+    RevokeLost,
+    /// Revoke this session; the batch is delivered-not-handled.
+    RevokeTerminal,
+}
+
+/// Record a waiter result. Uncorrelated outcomes are treated as loss.
+#[must_use]
+pub fn apply_waiter_result(pipe: &mut DaemonPipe, result: &WaiterLink) -> ResultApply {
+    if record_delivery_result(&mut pipe.ledger, result).is_ok() {
+        match result {
+            WaiterLink::DeliveryResult { outcome, .. } if outcome == "link_lost" => {
+                pipe.attempted = false;
+                ResultApply::RevokeLost
+            }
+            WaiterLink::DeliveryResult { outcome, .. }
+                if outcome == "return_completed" || outcome == "return_failed" =>
+            {
+                ResultApply::RevokeTerminal
+            }
+            _ => ResultApply::Keep,
+        }
+    } else {
+        pipe.attempted = false;
+        ResultApply::RevokeLost
+    }
 }
 
 /// Mark the current attempt lost without consuming the batch, then drop `session`.
@@ -667,21 +716,11 @@ fn poll_result(
         .as_mut()
         .map(|current| read_waiter_link(&mut current.reader));
     match read {
-        Some(Ok(result)) => {
-            let _ = record_delivery_result(&mut pipe.ledger, &result);
-            match &result {
-                WaiterLink::DeliveryResult { outcome, .. } if outcome == "link_lost" => {
-                    pipe.attempted = false;
-                    revoke_exact(served, table, pipe, now, true);
-                }
-                WaiterLink::DeliveryResult { outcome, .. }
-                    if outcome == "return_completed" || outcome == "return_failed" =>
-                {
-                    revoke_exact(served, table, pipe, now, false);
-                }
-                _ => {}
-            }
-        }
+        Some(Ok(result)) => match apply_waiter_result(pipe, &result) {
+            ResultApply::Keep => {}
+            ResultApply::RevokeLost => revoke_exact(served, table, pipe, now, true),
+            ResultApply::RevokeTerminal => revoke_exact(served, table, pipe, now, false),
+        },
         Some(Err(error)) if is_read_idle(&error) => {}
         Some(Err(_)) | None => revoke_exact(served, table, pipe, now, true),
     }
@@ -804,12 +843,19 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(DaemonEvent::Attached(next)) => {
-                let occupied = served.is_some();
                 let keep = {
-                    let table = lock_table(&table);
-                    retain_live_attach(&next, &table, occupied)
+                    let locked = lock_table(&table);
+                    retain_live_attach(&next, &locked, served.as_ref())
                 };
                 if keep {
+                    if let Some(old) = served.take() {
+                        let old_session = old.session.clone();
+                        drop(old);
+                        if let Some(old_session) = old_session {
+                            let mut locked = lock_table(&table);
+                            on_transport_loss(&mut pipe, &mut locked, Some(&old_session), now);
+                        }
+                    }
                     let mut next = next;
                     let lease_until = {
                         let locked = lock_table(&table);
@@ -872,9 +918,9 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimError, DaemonCoverage, DeliveryIo, IngestOutcome, claim_or_reuse, ingest_match,
-        lease_expired, on_transport_loss, provider_events_from_drain, retain_live_attach,
-        shutdown_daemon, spawn_accept,
+        ClaimError, DaemonCoverage, DeliveryIo, IngestOutcome, ResultApply, apply_waiter_result,
+        claim_or_reuse, ingest_match, lease_expired, on_transport_loss, provider_events_from_drain,
+        retain_live_attach, shutdown_daemon, spawn_accept,
     };
     use crate::child::ChildSlot;
     use crate::wait_on::{DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitResult};
@@ -1274,6 +1320,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn stalled_admission_shutdown_completes_within_admission_bound() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let mut live_arm = arm();
+        live_arm.coverage_until = OffsetDateTime::now_utc() + TimeDuration::minutes(20);
+        let handle = spawn_accept(
+            listener,
+            Arc::new(Mutex::new(LinkTable::default())),
+            Arc::clone(&stop),
+            live_arm,
+            tx,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _stalled = ipcprims::transport::UnixDomainSocket::connect(&socket).expect("stalled");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let mut children = ChildSlot::new();
+        let mut accept = Some(handle);
+        let mut dummy = LinkTable::default();
+        shutdown_daemon(&mut dummy, &mut children, &stop, Some(&socket), &mut accept)
+            .expect("shutdown");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "in-flight admission is bounded by the 5s attach read timeout"
+        );
+        let again = paths.bind().expect("rebind");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn attach_with(request_id: &str) -> WaiterLink {
         let mut message = fixture_attach();
         if let WaiterLink::AttachWaiter { request_id: id, .. } = &mut message {
@@ -1323,7 +1405,7 @@ mod tests {
         };
         {
             let table = table.lock().expect("table");
-            assert!(retain_live_attach(&first_served, &table, false));
+            assert!(retain_live_attach(&first_served, &table, None));
         }
         let mut second = ipcprims::transport::UnixDomainSocket::connect(&socket).expect("second");
         second
@@ -1338,9 +1420,37 @@ mod tests {
         };
         {
             let table = table.lock().expect("table");
-            assert!(!retain_live_attach(&second_served, &table, true));
-            assert!(retain_live_attach(&first_served, &table, false));
+            assert!(!retain_live_attach(
+                &second_served,
+                &table,
+                Some(&first_served)
+            ));
+            assert!(retain_live_attach(&first_served, &table, None));
         }
+        {
+            let mut table = table.lock().expect("table");
+            table.drop_current();
+        }
+        let mut successor = ipcprims::transport::UnixDomainSocket::connect(&socket).expect("succ");
+        successor
+            .write_all(&ipc_frame(
+                &gearwit_protocol::encode_payload(&attach_with("01J00000000000000000000098"))
+                    .expect("p"),
+            ))
+            .expect("write");
+        let successor_served = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(super::DaemonEvent::Attached(served)) => served,
+            Err(error) => panic!("successor attach {error}"),
+        };
+        {
+            let table = table.lock().expect("table");
+            assert!(retain_live_attach(
+                &successor_served,
+                &table,
+                Some(&first_served)
+            ));
+        }
+        drop(successor);
         drop(first);
         drop(second);
         let mut children = ChildSlot::new();
@@ -1419,6 +1529,48 @@ mod tests {
                 .map(|pending| pending.delivery_id.as_str()),
             Some(id.as_str())
         );
+        let WaiterLink::DeliverEvents {
+            delivery_id,
+            link_id,
+            signal_id,
+            ..
+        } = io.sent.expect("sent")
+        else {
+            panic!("deliver");
+        };
+        for (bad_delivery, bad_link, bad_signal) in [
+            (
+                "01J00000000000000000000099",
+                link_id.as_str(),
+                signal_id.as_str(),
+            ),
+            (
+                delivery_id.as_str(),
+                "01J00000000000000000000098",
+                signal_id.as_str(),
+            ),
+            (
+                delivery_id.as_str(),
+                link_id.as_str(),
+                "01J00000000000000000000097",
+            ),
+        ] {
+            let forged = WaiterLink::DeliveryResult {
+                schema: SCHEMA.to_owned(),
+                delivery_id: bad_delivery.to_owned(),
+                link_id: bad_link.to_owned(),
+                signal_id: bad_signal.to_owned(),
+                outcome: "return_completed".to_owned(),
+                observed_at: "2026-01-15T12:05:03Z".to_owned(),
+            };
+            pipe.attempted = true;
+            assert_eq!(
+                apply_waiter_result(&mut pipe, &forged),
+                ResultApply::RevokeLost
+            );
+            assert!(pipe.ledger.should_redeliver());
+            assert!(!pipe.attempted);
+        }
     }
 
     #[test]
