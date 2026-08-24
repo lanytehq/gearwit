@@ -29,7 +29,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
     use time::{Duration as TimeDuration, OffsetDateTime};
@@ -135,21 +135,47 @@ mod tests {
     }
 
     #[test]
-    fn expired_lease_allows_new_admission() {
+    fn expired_lease_replays_same_admission() {
         let instant = now();
         let mut table = LinkTable::default();
         let first =
             admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("first");
         let later = instant + TimeDuration::minutes(11);
         let second =
-            admit_attach(&mut table, fixture_attach(), later, &[arm(later)]).expect("renew");
-        match (first, second) {
-            (
-                WaiterLink::AttachAccepted { link_id: a, .. },
-                WaiterLink::AttachAccepted { link_id: b, .. },
-            ) => assert_ne!(a, b),
-            other => panic!("expected two accepts, got {other:?}"),
-        }
+            admit_attach(&mut table, fixture_attach(), later, &[arm(later)]).expect("replay");
+        assert_eq!(first, second);
+        assert!(table.current().is_none());
+        let successor = admit_attach(
+            &mut table,
+            attach_with("01J00000000000000000000098"),
+            later,
+            &[arm(later)],
+        )
+        .expect("successor");
+        assert_ne!(first, successor);
+        assert!(table.current().is_some());
+    }
+
+    #[test]
+    fn conflict_is_detected_before_arm_checks() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        let unknown = admit_attach(&mut table, fixture_attach(), instant, &[]).expect("unknown");
+        assert!(matches!(
+            unknown,
+            WaiterLink::AttachRejected { code, .. } if code == "unknown_arm"
+        ));
+        let error = admit_attach(
+            &mut table,
+            attach_waiter_id("01J00000000000000000000077"),
+            instant,
+            &[arm(instant)],
+        )
+        .expect_err("conflict");
+        assert!(matches!(
+            error,
+            gearwit_protocol::WaiterLinkError::Semantic("request_id conflict")
+        ));
     }
 
     #[test]
@@ -205,8 +231,13 @@ mod tests {
         ));
         let mut stale = arm(instant);
         stale.generation = 2;
-        let rejected =
-            admit_attach(&mut table, fixture_attach(), instant, &[stale]).expect("stale");
+        let rejected = admit_attach(
+            &mut table,
+            attach_with("01J00000000000000000000097"),
+            instant,
+            &[stale],
+        )
+        .expect("stale");
         assert!(matches!(
             rejected,
             WaiterLink::AttachRejected { code, .. } if code == "stale_generation"
@@ -391,35 +422,38 @@ mod tests {
 
     #[test]
     fn concurrent_bind_has_one_winner() {
-        let root = temp_root();
-        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
-        let barrier = Arc::new(Barrier::new(2));
-        let a_paths = paths.clone();
-        let b_paths = paths.clone();
-        let a_barrier = barrier.clone();
-        let a = thread::spawn(move || {
-            a_barrier.wait();
-            a_paths.bind()
-        });
-        let b = thread::spawn(move || {
-            barrier.wait();
-            b_paths.bind()
-        });
-        let a = a.join().expect("a");
-        let b = b.join().expect("b");
-        let winners = [a.is_ok(), b.is_ok()].into_iter().filter(|ok| *ok).count();
-        assert_eq!(winners, 1);
-        let winner = match (a, b) {
-            (Ok(listener), Err(_)) | (Err(_), Ok(listener)) => listener,
-            (Ok(listener), Ok(other)) => {
-                drop(other);
-                listener
+        if let Ok(root) = std::env::var("GEARWIT_TEST_BIND_ROOT") {
+            let paths = GearwitPaths::from_root(PathBuf::from(root)).expect("paths");
+            match paths.bind() {
+                Ok(listener) => {
+                    thread::sleep(Duration::from_millis(800));
+                    drop(listener);
+                    std::process::exit(0);
+                }
+                Err(_) => std::process::exit(2),
             }
-            (Err(_), Err(_)) => panic!("expected one bind to succeed"),
-        };
-        let _client = UnixDomainSocket::connect(paths.socket_path()).expect("connect");
-        drop(winner);
-        let _ = std::fs::remove_dir_all(&root);
+        }
+        let exe = std::env::current_exe().expect("exe");
+        for round in 0..5 {
+            let root = temp_root();
+            GearwitPaths::from_root(root.clone()).expect("layout");
+            let spawn_child = |exe: PathBuf, root: PathBuf| {
+                thread::spawn(move || {
+                    std::process::Command::new(exe)
+                        .args(["--exact", "tests::concurrent_bind_has_one_winner"])
+                        .env("GEARWIT_TEST_BIND_ROOT", root)
+                        .status()
+                        .expect("child")
+                })
+            };
+            let a = spawn_child(exe.clone(), root.clone());
+            let b = spawn_child(exe.clone(), root.clone());
+            let a = a.join().expect("a");
+            let b = b.join().expect("b");
+            let wins = usize::from(a.success()) + usize::from(b.success());
+            assert_eq!(wins, 1, "round {round} codes {a:?} {b:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -504,8 +538,8 @@ mod tests {
         let home = temp_root();
         std::fs::create_dir(&home).expect("home");
         let paths = GearwitPaths::from_user_home(&home).expect("home");
-        assert_eq!(mode(&home.join(".lanyte")), 0o700);
         assert_eq!(mode(paths.root()), 0o700);
+        assert_eq!(mode(&paths.root().join("run")), 0o700);
 
         let linked = temp_root();
         std::fs::create_dir(&linked).expect("linked home");

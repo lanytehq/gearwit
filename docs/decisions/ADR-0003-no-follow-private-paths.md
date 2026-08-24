@@ -24,13 +24,15 @@ environment variables:
 - Verify `HOME` and `.lanyte` are owned real directories (no symlink). Create
   `.lanyte`, `gearwit/`, `run/`, and `state/` one component at a time with
   `create_dir`, never `create_dir_all`.
+- Do not chmod the shared `$HOME/.lanyte` root. Tighten only `gearwit/`,
+  `run/`, and `state/` to `0700`.
 - Inspect every component with `symlink_metadata`. A symlink, wrong type, or
   wrong owner (effective UID) fails closed.
-- An existing owned directory with a broader mode is tightened to `0700`. Mode
-  repair is not a substitute for type/owner checks.
-- An existing socket file is replaced only when it is an owned Unix socket
-  with no live listener, and only while holding the exclusive listener lock
-  directory. Non-sockets are never unlinked.
+- Bind holds a kernel advisory lock (`flock`) on an owned `run/gearwit.lock`
+  file for the listener lifetime. Process death releases the lock; the file
+  stays. An existing socket file is replaced only when it is an owned Unix
+  socket with no live listener, and only under that lock. Non-sockets are
+  never unlinked.
 
 ## Consequences
 

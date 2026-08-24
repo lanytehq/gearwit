@@ -1,5 +1,7 @@
 //! One attached return link per `(arm_id, generation)`.
 
+use std::collections::BTreeMap;
+
 use gearwit_protocol::{SCHEMA, WaiterLink, WaiterLinkError, validate};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -52,10 +54,17 @@ pub struct LinkSession {
     pub generation: u64,
 }
 
-/// At most one live link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestRecord {
+    request: WaiterLink,
+    reply: WaiterLink,
+}
+
+/// At most one live link, plus durable request-id outcomes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LinkTable {
     current: Option<AdmittedLink>,
+    history: BTreeMap<String, RequestRecord>,
 }
 
 impl LinkTable {
@@ -100,15 +109,31 @@ pub(crate) enum AttachDecision {
     },
     Replay {
         reply: WaiterLink,
-        session: LinkSession,
+        session: Option<LinkSession>,
     },
     Reject {
+        request: WaiterLink,
         reply: WaiterLink,
     },
 }
 
 pub(crate) fn commit_attach(table: &mut LinkTable, link: AdmittedLink) {
+    table.history.insert(
+        link.request_id.clone(),
+        RequestRecord {
+            request: link.request.clone(),
+            reply: link.last_accepted.clone(),
+        },
+    );
     table.current = Some(link);
+}
+
+pub(crate) fn commit_reject(table: &mut LinkTable, request: WaiterLink, reply: WaiterLink) {
+    if let WaiterLink::AttachWaiter { request_id, .. } = &request {
+        table
+            .history
+            .insert(request_id.clone(), RequestRecord { request, reply });
+    }
 }
 
 pub(crate) fn decide_attach(
@@ -130,43 +155,45 @@ pub(crate) fn decide_attach(
     else {
         return Err(WaiterLinkError::Semantic("expected attach_waiter"));
     };
-    let Some(arm) = arms.iter().find(|arm| arm.arm_id == *arm_id) else {
-        return Ok(AttachDecision::Reject {
-            reply: reject_message(request_id, "unknown_arm", now)?,
-        });
-    };
-    if arm.generation != *generation {
-        return Ok(AttachDecision::Reject {
-            reply: reject_message(request_id, "stale_generation", now)?,
-        });
-    }
-    if arm.seat_id != *seat_id || arm.route != *route {
-        return Ok(AttachDecision::Reject {
-            reply: reject_message(request_id, "route_mismatch", now)?,
-        });
-    }
-    if now >= arm.coverage_until {
-        return Ok(AttachDecision::Reject {
-            reply: reject_message(request_id, "coverage_ended", now)?,
-        });
-    }
-    if let Some(current) = &table.current {
-        if current.request_id == *request_id {
-            if current.request != request {
-                return Err(WaiterLinkError::Semantic("request_id conflict"));
-            }
-            return Ok(AttachDecision::Replay {
-                reply: current.last_accepted.clone(),
-                session: LinkSession {
+    if let Some(record) = table.history.get(request_id) {
+        if record.request != request {
+            return Err(WaiterLinkError::Semantic("request_id conflict"));
+        }
+        let session = table.current.as_ref().and_then(|current| {
+            if current.request_id == *request_id && now < current.lease_until {
+                Some(LinkSession {
                     link_id: current.link_id.clone(),
                     arm_id: current.arm_id.clone(),
                     generation: current.generation,
-                },
-            });
-        }
-        return Ok(AttachDecision::Reject {
-            reply: reject_message(request_id, "already_attached", now)?,
+                })
+            } else {
+                None
+            }
         });
+        return Ok(AttachDecision::Replay {
+            reply: record.reply.clone(),
+            session,
+        });
+    }
+    let Some(arm) = arms.iter().find(|arm| arm.arm_id == *arm_id) else {
+        let reply = reject_message(request_id, "unknown_arm", now)?;
+        return Ok(AttachDecision::Reject { request, reply });
+    };
+    if arm.generation != *generation {
+        let reply = reject_message(request_id, "stale_generation", now)?;
+        return Ok(AttachDecision::Reject { request, reply });
+    }
+    if arm.seat_id != *seat_id || arm.route != *route {
+        let reply = reject_message(request_id, "route_mismatch", now)?;
+        return Ok(AttachDecision::Reject { request, reply });
+    }
+    if now >= arm.coverage_until {
+        let reply = reject_message(request_id, "coverage_ended", now)?;
+        return Ok(AttachDecision::Reject { request, reply });
+    }
+    if table.current.is_some() {
+        let reply = reject_message(request_id, "already_attached", now)?;
+        return Ok(AttachDecision::Reject { request, reply });
     }
     let link_id = ulid::Ulid::new().to_string();
     let lease_until = (now + Duration::minutes(10)).min(arm.coverage_until);
@@ -221,7 +248,11 @@ pub fn admit_attach(
             commit_attach(table, *link);
             Ok(reply)
         }
-        AttachDecision::Replay { reply, .. } | AttachDecision::Reject { reply } => Ok(reply),
+        AttachDecision::Replay { reply, .. } => Ok(reply),
+        AttachDecision::Reject { request, reply } => {
+            commit_reject(table, request, reply.clone());
+            Ok(reply)
+        }
     }
 }
 

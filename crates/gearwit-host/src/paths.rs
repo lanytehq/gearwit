@@ -1,9 +1,12 @@
 //! Canonical Gearwit home, private directories, and waiter-link bind.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 
 use ipcprims::transport::{IpcStream, TransportError, UnixDomainSocket};
 use rsfulmen::logging::{Severity, new_cli};
@@ -11,7 +14,7 @@ use rsfulmen::logging::{Severity, new_cli};
 /// Socket file name under `run/`.
 pub const SOCKET_FILE: &str = "gearwit.sock";
 
-const LISTENER_LOCK: &str = "listener.lock";
+const LOCK_FILE: &str = "gearwit.lock";
 
 /// Failure to resolve, create, or bind the local waiter-link endpoint.
 #[derive(Debug)]
@@ -81,19 +84,9 @@ pub fn canonical_root() -> Result<PathBuf, BindError> {
     Ok(PathBuf::from(home).join(".lanyte").join("gearwit"))
 }
 
-struct ListenerLock {
-    path: PathBuf,
-}
-
-impl Drop for ListenerLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
-    }
-}
-
-/// Bound waiter-link listener. Holds the per-home exclusive lock until drop.
+/// Bound waiter-link listener. Holds the advisory lock fd until drop.
 pub struct BoundListener {
-    _lock: ListenerLock,
+    _lock: Flock<File>,
     listener: UnixDomainSocket,
 }
 
@@ -147,7 +140,7 @@ impl GearwitPaths {
     pub fn from_user_home(home: &Path) -> Result<Self, BindError> {
         inspect_existing_dir(home)?;
         let lanyte = home.join(".lanyte");
-        ensure_private_dir(&lanyte)?;
+        ensure_shared_lanyte(&lanyte)?;
         Self::from_root(lanyte.join("gearwit"))
     }
 
@@ -185,7 +178,7 @@ impl GearwitPaths {
     ///
     /// Returns [`BindError`] for live listeners, non-sockets, or transport failure.
     pub fn bind(&self) -> Result<BoundListener, BindError> {
-        let lock = acquire_listener_lock(&self.root.join("run"), &self.socket_path())?;
+        let lock = acquire_listener_lock(&self.root.join("run"))?;
         let listener = bind_private_socket(&self.socket_path())?;
         Ok(BoundListener {
             _lock: lock,
@@ -242,43 +235,55 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), BindError> {
     Ok(())
 }
 
-fn acquire_listener_lock(run_dir: &Path, socket: &Path) -> Result<ListenerLock, BindError> {
-    let path = run_dir.join(LISTENER_LOCK);
-    match fs::create_dir(&path) {
-        Ok(()) => {
-            let mut permissions = fs::metadata(&path)?.permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&path, permissions)?;
-            return Ok(ListenerLock { path });
+fn ensure_shared_lanyte(dir: &Path) -> Result<(), BindError> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(BindError::Symlink(dir.to_path_buf()));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(BindError::NotADirectory(dir.to_path_buf()));
+            }
+            require_owned(&metadata, dir)
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(BindError::Io(error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(dir)?;
+            let metadata = fs::symlink_metadata(dir)?;
+            if metadata.file_type().is_symlink() {
+                return Err(BindError::Symlink(dir.to_path_buf()));
+            }
+            require_owned(&metadata, dir)
+        }
+        Err(error) => Err(BindError::Io(error)),
     }
-    let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() {
+}
+
+fn acquire_listener_lock(run_dir: &Path) -> Result<Flock<File>, BindError> {
+    let path = run_dir.join(LOCK_FILE);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            return Err(BindError::Symlink(path));
+        }
+        require_owned(&metadata, &path)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
         return Err(BindError::Symlink(path));
     }
-    require_owned(&metadata, &path)?;
-    match UnixDomainSocket::connect(socket) {
-        Ok(_live) => {
-            warn_live(socket);
-            return Err(BindError::LiveListener(socket.to_path_buf()));
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(lock),
+        Err((_, Errno::EAGAIN)) => {
+            warn_live(&path);
+            Err(BindError::LiveListener(path))
         }
-        Err(TransportError::Connect { source, .. })
-            if source.kind() == io::ErrorKind::ConnectionRefused
-                || source.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(BindError::Transport(error)),
+        Err((_, error)) => Err(BindError::Io(io::Error::other(error))),
     }
-    match fs::remove_dir(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(BindError::LiveListener(socket.to_path_buf())),
-    }
-    fs::create_dir(&path)?;
-    let mut permissions = fs::metadata(&path)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&path, permissions)?;
-    Ok(ListenerLock { path })
 }
 
 fn warn_live(path: &Path) {

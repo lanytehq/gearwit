@@ -41,9 +41,10 @@ that active pair returns the cached accept.
   [ADR-0003](decisions/ADR-0003-no-follow-private-paths.md).
 - Require each private path to be owned by the process effective user.
 - Create `.lanyte`, `gearwit/`, `run/`, and `state/` one component at a time
-  (`create_dir`). Owned directories with a broader mode are tightened to
-  `0700`.
-- Bind holds `run/listener.lock` for the listener lifetime.
+  (`create_dir`). Inspect `$HOME/.lanyte` type and owner only; do not chmod it.
+  Tighten only `gearwit/`, `run/`, and `state/` to `0700`.
+- Bind holds an advisory `flock` on `run/gearwit.lock` for the listener
+  lifetime. The lock file is not removed on drop.
 - Bind fails closed if the socket path exists and is not a Unix socket.
 - Bind refuses when a listener is already live (connect probe succeeds).
 - A leftover **owned** socket file with no listener (`ConnectionRefused`) may

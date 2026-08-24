@@ -125,6 +125,12 @@ pub struct ServeAttach {
 pub fn wait_disconnect(reader: &mut FrameReader<IpcStream>) -> Result<(), LinkError> {
     match reader.read_frame() {
         Err(FrameError::ConnectionClosed) => Ok(()),
+        Err(FrameError::Io(error))
+            if error.kind() == std::io::ErrorKind::TimedOut
+                || error.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error.into()),
         Ok(_) => Err(LinkError::Message(WaiterLinkError::Semantic(
             "unexpected frame",
@@ -159,15 +165,21 @@ pub fn serve_attach(
                 arm_id: link.arm_id.clone(),
                 generation: link.generation,
             };
+            let lease_until = link.lease_until;
             commit_attach(table, *link);
+            apply_session_read_timeout(reader.get_mut(), lease_until, now)?;
             (reply, Some(session))
         }
         AttachDecision::Replay { reply, session } => {
             write_waiter_link(&mut writer, &reply)?;
-            (reply, Some(session))
+            if let Some(current) = table.current() {
+                apply_session_read_timeout(reader.get_mut(), current.lease_until, now)?;
+            }
+            (reply, session)
         }
-        AttachDecision::Reject { reply } => {
+        AttachDecision::Reject { request, reply } => {
             write_waiter_link(&mut writer, &reply)?;
+            crate::admit::commit_reject(table, request, reply.clone());
             (reply, None)
         }
     };
@@ -176,4 +188,21 @@ pub fn serve_attach(
         session,
         reader,
     })
+}
+
+fn apply_session_read_timeout(
+    stream: &IpcStream,
+    lease_until: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), LinkError> {
+    stream.set_read_timeout(Some(lease_io_timeout(lease_until, now)))?;
+    Ok(())
+}
+
+fn lease_io_timeout(lease_until: OffsetDateTime, now: OffsetDateTime) -> Duration {
+    if lease_until <= now {
+        return Duration::from_secs(0);
+    }
+    let nanos = (lease_until - now).whole_nanoseconds();
+    Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
