@@ -1,5 +1,6 @@
 export type EvidenceClass =
   | "controller_proven"
+  | "provider_proven"
   | "self_declared"
   | "census_inferred"
   | "unknown";
@@ -7,6 +8,16 @@ export type KnownEvidenceClass = Exclude<EvidenceClass, "unknown">;
 
 export type AttentionLevel = "act" | "watch" | "record";
 export type AttentionFilter = "all" | "act" | "watch";
+export type LifecyclePhaseId = "observed" | "drained" | "delivery" | "turn" | "handled";
+export type LifecycleState = "complete" | "pending" | "failed" | "unknown";
+export type ScenarioStatus =
+  | "fixture"
+  | "offline"
+  | "denied"
+  | "pending"
+  | "retrying"
+  | "warning"
+  | "healthy";
 
 export type ObservedFact<T> =
   | { kind: "known"; value: T; evidence: KnownEvidenceClass }
@@ -19,6 +30,29 @@ export interface WaitState {
 
 export type ControllerAttachment = "attached" | "detached";
 
+export type LifecyclePhase =
+  | {
+      id: LifecyclePhaseId;
+      label: string;
+      state: Exclude<LifecycleState, "unknown">;
+      evidence: KnownEvidenceClass;
+      detail: string;
+    }
+  | {
+      id: LifecyclePhaseId;
+      label: string;
+      state: "unknown";
+      evidence: "unknown";
+      detail: string;
+    };
+
+export interface SystemScenario {
+  id: string;
+  status: ScenarioStatus;
+  title: string;
+  detail: string;
+}
+
 export interface AttentionEvent {
   id: string;
   level: AttentionLevel;
@@ -28,6 +62,7 @@ export interface AttentionEvent {
   seat: string;
   age: string;
   source: ObservedFact<string>;
+  lifecycle: readonly LifecyclePhase[];
 }
 
 export interface Seat {
@@ -42,6 +77,7 @@ export interface Seat {
 
 export const evidenceLabel: Record<EvidenceClass, string> = {
   controller_proven: "Controller-proven",
+  provider_proven: "Provider-proven",
   self_declared: "Self-declared",
   census_inferred: "Census-inferred",
   unknown: "Unknown",
@@ -49,10 +85,26 @@ export const evidenceLabel: Record<EvidenceClass, string> = {
 
 export const evidenceGlyph: Record<EvidenceClass, string> = {
   controller_proven: "P",
+  provider_proven: "V",
   self_declared: "D",
   census_inferred: "I",
   unknown: "?",
 };
+
+export const lifecycleGlyph: Record<LifecycleState, string> = {
+  complete: "✓",
+  pending: "…",
+  failed: "!",
+  unknown: "?",
+};
+
+export const lifecycleOrder: readonly LifecyclePhaseId[] = [
+  "observed",
+  "drained",
+  "delivery",
+  "turn",
+  "handled",
+];
 
 export function filterEvents(
   events: readonly AttentionEvent[],
@@ -90,4 +142,11 @@ export function prependEventOnce(
 ): AttentionEvent[] {
   if (events.some((candidate) => candidate.id === event.id)) return [...events];
   return [event, ...events];
+}
+
+export function lifecycleIsOrdered(phases: readonly LifecyclePhase[]): boolean {
+  return (
+    phases.length === lifecycleOrder.length &&
+    phases.every((phase, index) => phase.id === lifecycleOrder[index])
+  );
 }

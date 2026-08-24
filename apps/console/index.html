@@ -22,12 +22,16 @@
             An attention view for declared and observed seat state. Unknown stays unknown.
           </p>
         </div>
-        <div class="connection" aria-label="Development data source">
-          <span class="connection-mark" aria-hidden="true"></span>
-          <span>
-            <strong>Fixture mode</strong>
-            <small>No daemon attached</small>
-          </span>
+        <div class="connection connection-fixture" aria-label="Development data source">
+          <div class="connection-status">
+            <span class="connection-mark" aria-hidden="true"></span>
+            <span>
+              <strong id="connection-title">Fixture mode</strong>
+              <small id="connection-detail">No daemon attached</small>
+            </span>
+          </div>
+          <label for="fixture-scenario">Fixture scenario</label>
+          <select id="fixture-scenario"></select>
         </div>
       </header>
 
@@ -35,7 +39,7 @@
         <div><strong id="attention-count">0</strong><span>need attention</span></div>
         <div><strong id="armed-count">0</strong><span>armed waits</span></div>
         <div><strong id="unknown-count">0</strong><span>unknown facts</span></div>
-        <p id="snapshot-time">Development snapshot</p>
+        <p id="snapshot-time">Development snapshot / no live claims</p>
       </section>
 
       <section class="doorbell-bench" aria-labelledby="doorbell-title">
@@ -89,6 +93,7 @@
       <footer class="legend" aria-label="Evidence legend">
         <strong>Evidence</strong>
         <span><i class="tier tier-proven">P</i> Controller-proven</span>
+        <span><i class="tier tier-proven">V</i> Provider-proven</span>
         <span><i class="tier tier-declared">D</i> Self-declared</span>
         <span><i class="tier tier-inferred">I</i> Census-inferred</span>
         <span><i class="tier tier-unknown">?</i> Unknown</span>

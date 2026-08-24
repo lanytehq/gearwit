@@ -96,14 +96,33 @@ h1 {
 
 .connection {
   align-self: flex-start;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  min-width: 12.5rem;
+  min-width: 15rem;
   padding: 0.75rem;
   border: 1px solid var(--ink);
   background: rgba(245, 241, 230, 0.76);
 }
+
+.connection-status { display: flex; align-items: center; gap: 0.75rem; }
+.connection label {
+  display: block;
+  margin: 0.75rem 0 0.3rem;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.62rem;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.connection select {
+  width: 100%;
+  padding: 0.48rem 1.8rem 0.48rem 0.55rem;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  color: var(--ink);
+  background: var(--paper);
+  font: inherit;
+  font-size: 0.75rem;
+}
+.connection select:focus-visible { outline: 3px solid var(--cool); outline-offset: 2px; }
 
 .connection-mark {
   width: 0.8rem;
@@ -116,6 +135,14 @@ h1 {
 .connection strong,
 .connection small { display: block; }
 .connection small { margin-top: 0.15rem; color: var(--muted); }
+.connection-offline .connection-mark,
+.connection-denied .connection-mark { background: var(--urgent); }
+.connection-pending .connection-mark,
+.connection-retrying .connection-mark,
+.connection-warning .connection-mark { background: var(--watch); }
+.connection-healthy .connection-mark { background: var(--acid); }
+.connection-denied { box-shadow: inset 5px 0 0 var(--urgent); }
+.connection-retrying { box-shadow: inset 5px 0 0 var(--watch); }
 
 .summary-strip {
   display: grid;
@@ -234,7 +261,61 @@ h2 { margin: 0; font-family: Georgia, serif; font-size: clamp(2rem, 4vw, 3.4rem)
 .event-watch article::before { background: var(--watch); }
 .event-meta { display: flex; align-items: center; gap: 0.55rem; color: var(--muted); }
 .event h3 { margin: 0.55rem 0 0.45rem; font-size: 1.22rem; line-height: 1.25; }
-.event-detail { max-width: 48rem; margin: 0; color: var(--muted); line-height: 1.5; }
+.event-detail { max-width: 48rem; margin: 0; overflow-wrap: anywhere; color: var(--muted); line-height: 1.5; }
+.lifecycle {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(3.5rem, 1fr));
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.phase {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: 0.32rem;
+  min-width: 0;
+  color: var(--muted);
+  text-align: center;
+}
+.phase::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: 0.68rem;
+  right: 50%;
+  width: 100%;
+  height: 1px;
+  background: var(--rule);
+}
+.phase:first-child::before { display: none; }
+.phase-mark {
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 1.45rem;
+  height: 1.45rem;
+  border: 1px solid var(--muted);
+  border-radius: 50%;
+  background: var(--paper);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.7rem;
+  font-weight: 800;
+}
+.phase-label {
+  overflow: hidden;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+}
+.phase-complete { color: var(--dark); }
+.phase-complete .phase-mark { border-color: var(--dark); color: var(--acid); background: var(--dark); }
+.phase-pending .phase-mark { border-color: var(--watch); color: var(--ink); background: #f0ce79; }
+.phase-failed .phase-mark { border-color: var(--urgent); color: var(--paper); background: var(--urgent); }
+.phase-unknown .phase-mark { border-style: dashed; }
 .event-seat { display: flex; justify-content: space-between; gap: 1rem; margin: 1rem 0 0; font-size: 0.78rem; font-weight: 650; }
 .event-seat span:last-child { color: var(--muted); text-transform: uppercase; }
 .empty-state { padding: 3rem 1rem; border: 1px dashed var(--rule); color: var(--muted); text-align: center; }
@@ -317,4 +398,13 @@ h2 { margin: 0; font-family: Georgia, serif; font-size: clamp(2rem, 4vw, 3.4rem)
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; }
+}
+
+@media (prefers-contrast: more) {
+  :root { --rule: #6d6d67; --muted: #404843; }
+  .phase-unknown .phase-mark { border-width: 2px; }
+  .filter:focus-visible,
+  .ring-button:focus-visible,
+  .bench-controls select:focus-visible,
+  .connection select:focus-visible { outline-color: #005f56; outline-width: 4px; }
 }

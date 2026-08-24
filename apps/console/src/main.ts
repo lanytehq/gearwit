@@ -1,4 +1,4 @@
-import { events, seats } from "./fixtures";
+import { events, scenarios, seats } from "./fixtures";
 import {
   canRingController,
   countArmedWaits,
@@ -6,12 +6,16 @@ import {
   evidenceGlyph,
   evidenceLabel,
   filterEvents,
+  lifecycleGlyph,
+  lifecycleIsOrdered,
   prependEventOnce,
   type AttentionEvent,
   type AttentionFilter,
   type EvidenceClass,
+  type LifecyclePhase,
   type ObservedFact,
   type Seat,
+  type SystemScenario,
 } from "./model";
 
 let visibleEvents = [...events];
@@ -52,6 +56,31 @@ function factRow<T>(
   return row;
 }
 
+function lifecycleRail(phases: readonly LifecyclePhase[]): HTMLOListElement {
+  if (!lifecycleIsOrdered(phases)) throw new Error("Lifecycle phases are incomplete or unordered");
+
+  const list = document.createElement("ol");
+  list.className = "lifecycle";
+  list.setAttribute("aria-label", "Event lifecycle");
+  list.append(
+    ...phases.map((phase) => {
+      const item = document.createElement("li");
+      item.className = `phase phase-${phase.state}`;
+      item.title = `${phase.detail} · ${evidenceLabel[phase.evidence]}`;
+      item.setAttribute(
+        "aria-label",
+        `${phase.label}: ${phase.state}. ${phase.detail}. ${evidenceLabel[phase.evidence]}.`,
+      );
+      item.append(
+        text("span", lifecycleGlyph[phase.state], "phase-mark"),
+        text("span", phase.label, "phase-label"),
+      );
+      return item;
+    }),
+  );
+  return list;
+}
+
 function eventItem(event: AttentionEvent): HTMLLIElement {
   const item = document.createElement("li");
   item.className = `event event-${event.level}`;
@@ -64,7 +93,12 @@ function eventItem(event: AttentionEvent): HTMLLIElement {
   const meta = document.createElement("p");
   meta.className = "event-meta";
   meta.append(text("span", event.kind), tier(event.source.evidence));
-  content.append(meta, text("h3", event.title), text("p", event.detail, "event-detail"));
+  content.append(
+    meta,
+    text("h3", event.title),
+    text("p", event.detail, "event-detail"),
+    lifecycleRail(event.lifecycle),
+  );
 
   const footer = document.createElement("p");
   footer.className = "event-seat";
@@ -171,6 +205,13 @@ function setupDoorbellBench(): void {
       seat: seat.name,
       age: "now",
       source: { kind: "known", value: "fixture receipt", evidence: "controller_proven" },
+      lifecycle: [
+        { id: "observed", label: "Observed", state: "complete", evidence: "provider_proven", detail: "Fixture signal observed" },
+        { id: "drained", label: "Drained", state: "complete", evidence: "provider_proven", detail: "Fixture event set drained" },
+        { id: "delivery", label: "Delivery", state: "complete", evidence: "controller_proven", detail: "Fixture attachment selected" },
+        { id: "turn", label: "Turn", state: "unknown", evidence: "unknown", detail: "No harness contacted" },
+        { id: "handled", label: "Handled", state: "unknown", evidence: "unknown", detail: "No seat acknowledgement" },
+      ],
     };
     const previousCount = visibleEvents.length;
     visibleEvents = prependEventOnce(visibleEvents, event);
@@ -187,6 +228,33 @@ function setupDoorbellBench(): void {
   renderDoorbellSeat(selectedSeat());
 }
 
+function renderScenario(scenario: SystemScenario): void {
+  const connection = requiredElement(".connection");
+  connection.className = `connection connection-${scenario.status}`;
+  requiredElement("#connection-title").textContent = scenario.title;
+  requiredElement("#connection-detail").textContent = scenario.detail;
+}
+
+function setupScenarioFixtures(): void {
+  const select = requiredElement<HTMLSelectElement>("#fixture-scenario");
+  select.replaceChildren(
+    ...scenarios.map((scenario) => {
+      const option = document.createElement("option");
+      option.value = scenario.id;
+      option.textContent = scenario.title;
+      return option;
+    }),
+  );
+  select.addEventListener("change", () => {
+    const scenario = scenarios.find((candidate) => candidate.id === select.value);
+    if (!scenario) throw new Error("Selected fixture scenario is unavailable");
+    renderScenario(scenario);
+  });
+  const initial = scenarios[0];
+  if (!initial) throw new Error("At least one fixture scenario is required");
+  renderScenario(initial);
+}
+
 function render(): void {
   requiredElement("#attention-count").textContent = String(
     visibleEvents.filter((event) => event.level === "act").length,
@@ -199,6 +267,7 @@ function render(): void {
   roster.replaceChildren(...seats.map(seatCard));
   renderEvents("all");
   setupDoorbellBench();
+  setupScenarioFixtures();
 
   document.querySelectorAll<HTMLButtonElement>(".filter").forEach((button) => {
     button.addEventListener("click", () => {

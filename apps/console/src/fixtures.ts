@@ -1,4 +1,20 @@
-import type { AttentionEvent, Seat } from "./model";
+import type {
+  AttentionEvent,
+  KnownEvidenceClass,
+  LifecyclePhase,
+  Seat,
+  SystemScenario,
+} from "./model";
+
+function observedOnly(evidence: KnownEvidenceClass, detail: string): LifecyclePhase[] {
+  return [
+    { id: "observed", label: "Observed", state: "complete", evidence, detail },
+    { id: "drained", label: "Drained", state: "unknown", evidence: "unknown", detail: "No drain receipt" },
+    { id: "delivery", label: "Delivery", state: "unknown", evidence: "unknown", detail: "No delivery receipt" },
+    { id: "turn", label: "Turn", state: "unknown", evidence: "unknown", detail: "No harness evidence" },
+    { id: "handled", label: "Handled", state: "unknown", evidence: "unknown", detail: "No seat acknowledgement" },
+  ];
+}
 
 export const events: AttentionEvent[] = [
   {
@@ -10,6 +26,7 @@ export const events: AttentionEvent[] = [
     seat: "November / reviewer",
     age: "8m",
     source: { kind: "known", value: "renewal expected", evidence: "self_declared" },
+    lifecycle: observedOnly("self_declared", "Coverage obligation declared by seat"),
   },
   {
     id: "evt-2",
@@ -20,6 +37,7 @@ export const events: AttentionEvent[] = [
     seat: "November / builder",
     age: "14m",
     source: { kind: "known", value: "lease expired", evidence: "controller_proven" },
+    lifecycle: observedOnly("controller_proven", "Controller lease expiry observed"),
   },
   {
     id: "evt-3",
@@ -30,6 +48,7 @@ export const events: AttentionEvent[] = [
     seat: "Open seat / local",
     age: "22m",
     source: { kind: "known", value: "process present", evidence: "census_inferred" },
+    lifecycle: observedOnly("census_inferred", "Host census observed a process"),
   },
 ];
 
@@ -69,4 +88,15 @@ export const seats: Seat[] = [
     wait: { kind: "unknown", evidence: "unknown" },
     controller: { kind: "unknown", evidence: "unknown" },
   },
+];
+
+export const scenarios: SystemScenario[] = [
+  { id: "fixture", status: "fixture", title: "Fixture mode", detail: "No daemon attached" },
+  { id: "offline", status: "offline", title: "Daemon offline", detail: "Gearwit endpoint is not listening" },
+  { id: "denied", status: "denied", title: "Gearwit home denied", detail: "Sandbox cannot access the private runtime path" },
+  { id: "pending", status: "pending", title: "Delivery pending", detail: "Events observed; attached return has not completed" },
+  { id: "retrying", status: "retrying", title: "Link lost / retrying", detail: "Stable delivery is waiting for an authority-matched link" },
+  { id: "unhandled", status: "warning", title: "Delivered, not handled", detail: "Return completed; handled cursor remains unknown" },
+  { id: "handled", status: "healthy", title: "Handled and covered", detail: "Seat acknowledged and successor coverage is armed" },
+  { id: "expired", status: "warning", title: "Coverage expired", detail: "Expected renewal was not observed" },
 ];

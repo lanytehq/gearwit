@@ -1,10 +1,11 @@
 import { describe, expect, test } from "vitest";
-import { events, seats } from "./fixtures";
+import { events, scenarios, seats } from "./fixtures";
 import {
   canRingController,
   countArmedWaits,
   countUnknownFacts,
   filterEvents,
+  lifecycleIsOrdered,
   prependEventOnce,
 } from "./model";
 
@@ -40,5 +41,26 @@ describe("attention projection", () => {
     expect(first).toHaveLength(events.length + 1);
     expect(duplicate).toHaveLength(first.length);
     expect(duplicate[0]?.id).toBe(ring.id);
+  });
+
+  test("requires one ordered status for every lifecycle phase", () => {
+    expect(events.every((event) => lifecycleIsOrdered(event.lifecycle))).toBe(true);
+    expect(events.every((event) => event.lifecycle[0]?.state === "complete")).toBe(true);
+    expect(events.every((event) => event.lifecycle[4]?.state === "unknown")).toBe(true);
+  });
+
+  test("covers operational failure and recovery fixtures", () => {
+    expect(new Set(scenarios.map((scenario) => scenario.id)).size).toBe(scenarios.length);
+    expect(scenarios.map((scenario) => scenario.id)).toEqual(
+      expect.arrayContaining([
+        "offline",
+        "denied",
+        "pending",
+        "retrying",
+        "unhandled",
+        "handled",
+        "expired",
+      ]),
+    );
   });
 });
