@@ -614,21 +614,55 @@ pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
     run_wait_on_once(spec).process_exit
 }
 
+/// How coverage should continue after one daemon interval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoverageAdvance {
+    /// Re-arm with this exclusive cursor.
+    Continue {
+        /// Next `--after` baseline.
+        after: String,
+    },
+    /// Stop the watcher.
+    Stop {
+        /// Process exit code.
+        exit: i32,
+    },
+}
+
+/// One-interval coverage transition. Does not claim a handled cursor.
+#[must_use]
+pub fn coverage_advance(outcome: &WaitOutcome, current_after: &str) -> CoverageAdvance {
+    match outcome.result {
+        WaitResult::Matched => match outcome.newest_observed.as_deref() {
+            Some(newest) => CoverageAdvance::Continue {
+                after: newest.to_owned(),
+            },
+            None => CoverageAdvance::Stop { exit: 2 },
+        },
+        WaitResult::Timeout => CoverageAdvance::Continue {
+            after: current_after.to_owned(),
+        },
+        WaitResult::Error => CoverageAdvance::Stop {
+            exit: if outcome.process_exit == 0 {
+                2
+            } else {
+                outcome.process_exit
+            },
+        },
+    }
+}
+
 /// Coverage loop: re-arm from newest observed after match, same cursor after deadman.
 #[must_use]
 pub fn run_watch_loop(mut spec: WaitOnSpec) -> i32 {
     spec.follow = true;
+    spec.return_route = DeliveryRoute::NotifyOperator;
     loop {
+        let current_after = spec.after.clone().unwrap_or_default();
         let outcome = run_wait_on_once(&spec);
-        match outcome.result {
-            WaitResult::Matched => {
-                let Some(newest) = outcome.newest_observed else {
-                    return 2;
-                };
-                spec.after = Some(newest);
-            }
-            WaitResult::Timeout => {}
-            WaitResult::Error => return outcome.process_exit,
+        match coverage_advance(&outcome, &current_after) {
+            CoverageAdvance::Continue { after } => spec.after = Some(after),
+            CoverageAdvance::Stop { exit } => return exit,
         }
     }
 }
@@ -636,9 +670,9 @@ pub fn run_watch_loop(mut spec: WaitOnSpec) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitOutcome, WaitResult, WaitRunner,
-        WaiterState, attach_drain, chanvoy_wait_args, execute_wait_on, parse_drained_events,
-        render_wait_receipt, waiter_receipt_log,
+        CoverageAdvance, DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitOutcome, WaitResult,
+        WaitRunner, WaiterState, attach_drain, chanvoy_wait_args, coverage_advance,
+        execute_wait_on, parse_drained_events, render_wait_receipt, waiter_receipt_log,
     };
     use gearwit_domain::InterruptPhase;
     use std::io;
@@ -889,5 +923,67 @@ mod tests {
         );
         assert_eq!(missing.drain_error, Some(DrainError::MissingBaseline));
         assert_eq!(missing.process_exit, 2);
+    }
+
+    #[test]
+    fn coverage_match_rearms_at_newest_observed() {
+        let outcome = WaitOutcome {
+            waiter: WaiterState::Completed,
+            result: WaitResult::Matched,
+            chanvoy_exit: Some(0),
+            process_exit: 0,
+            drained_events: vec![event("first", "a"), event("second", "b")],
+            newest_observed: Some("second".to_owned()),
+            drain_error: None,
+        };
+        assert_eq!(
+            coverage_advance(&outcome, "arm"),
+            CoverageAdvance::Continue {
+                after: "second".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn coverage_timeout_keeps_the_same_cursor() {
+        let outcome = WaitOutcome {
+            waiter: WaiterState::Completed,
+            result: WaitResult::Timeout,
+            chanvoy_exit: Some(1),
+            process_exit: 1,
+            drained_events: Vec::new(),
+            newest_observed: None,
+            drain_error: None,
+        };
+        assert_eq!(
+            coverage_advance(&outcome, "arm"),
+            CoverageAdvance::Continue {
+                after: "arm".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn coverage_errors_and_missing_newest_stop() {
+        let mut failed = WaitOutcome {
+            waiter: WaiterState::Completed,
+            result: WaitResult::Error,
+            chanvoy_exit: Some(2),
+            process_exit: 2,
+            drained_events: Vec::new(),
+            newest_observed: None,
+            drain_error: Some(DrainError::Empty),
+        };
+        assert_eq!(
+            coverage_advance(&failed, "arm"),
+            CoverageAdvance::Stop { exit: 2 }
+        );
+        failed.result = WaitResult::Matched;
+        failed.process_exit = 0;
+        failed.newest_observed = None;
+        assert_eq!(
+            coverage_advance(&failed, "arm"),
+            CoverageAdvance::Stop { exit: 2 }
+        );
     }
 }
