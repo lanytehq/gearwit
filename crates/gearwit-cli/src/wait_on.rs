@@ -3,10 +3,11 @@
 //! Wraps `chanvoy wait`. This process completing is not proof that the harness
 //! started a model turn. Receipts keep those facts separate.
 
+use std::fmt::Write as _;
 use std::io;
 use std::process::{Command, ExitStatus};
 
-use crate::sanitize::{MAX_ID, MAX_TIMEOUT, paste_field, paste_token};
+use crate::sanitize::{MAX_BODY, MAX_ID, MAX_TIMEOUT, paste_body, paste_field, paste_token};
 use gearwit_domain::{
     CoverageEndReason, DeliveryRoute, InterruptPhase, LifecycleFact, LifecycleReceipt,
     PhaseObservation, ReceiptError, ReceiptLog, ReceiptSource, WaiterCompletion,
@@ -94,9 +95,54 @@ pub struct WaitOutcome {
     /// Process exit: 0 matched, 1 timeout, otherwise 2.
     pub process_exit: i32,
     /// Provider posts observed after the exclusive arm baseline.
-    pub drained_ids: Vec<String>,
+    pub drained_events: Vec<DrainedEvent>,
     /// Newest observed post id from that drain, if any.
     pub newest_observed: Option<String>,
+    /// Drain failed closed after a waiter match.
+    pub drain_error: Option<DrainError>,
+}
+
+/// One validated provider event from a post-match drain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrainedEvent {
+    /// Provider event id.
+    pub id: String,
+    /// Username when present and paste-safe.
+    pub username: String,
+    /// Body, control-stripped and bounded.
+    pub message: String,
+}
+
+/// Why a post-match drain failed closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainError {
+    /// Exclusive `--after` was missing.
+    MissingBaseline,
+    /// Provider CLI exited nonzero.
+    NonZeroExit,
+    /// JSON shape or required fields were invalid.
+    Malformed,
+    /// Match succeeded but drain returned no events.
+    Empty,
+    /// Duplicate event ids in one drain.
+    DuplicateId,
+    /// Provider CLI could not be started or read.
+    Io,
+}
+
+impl DrainError {
+    /// Stable token for the local receipt face.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingBaseline => "missing_baseline",
+            Self::NonZeroExit => "nonzero_exit",
+            Self::Malformed => "malformed",
+            Self::Empty => "empty",
+            Self::DuplicateId => "duplicate_id",
+            Self::Io => "io",
+        }
+    }
 }
 
 /// Spawn a waiter. Tests inject a missing runner.
@@ -125,7 +171,7 @@ pub fn spec_is_paste_safe(spec: &WaitOnSpec) -> bool {
         && spec
             .after
             .as_deref()
-            .is_none_or(|after| paste_token(after, MAX_ID).is_some())
+            .is_some_and(|after| paste_token(after, MAX_ID).is_some())
         && paste_token(&spec.timeout, MAX_TIMEOUT).is_some()
         && spec
             .team
@@ -240,11 +286,18 @@ pub fn waiter_receipt_log(outcome: &WaitOutcome) -> Result<ReceiptLog, ReceiptEr
 /// Returns [`ReceiptError`] if drain facts cannot be appended.
 pub fn lifecycle_log(outcome: &WaitOutcome) -> Result<ReceiptLog, ReceiptError> {
     let mut log = waiter_receipt_log(outcome)?;
-    if outcome.result == WaitResult::Matched && !outcome.drained_ids.is_empty() {
-        let sequence = u64::try_from(log.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        let event_count = u32::try_from(outcome.drained_ids.len()).unwrap_or(u32::MAX);
+    let sequence = u64::try_from(log.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    if outcome.drain_error.is_some() {
+        append_fact(
+            &mut log,
+            sequence,
+            LifecycleFact::CoverageEnded(CoverageEndReason::ProviderFailed),
+            ReceiptSource::ControlPlane,
+        )?;
+    } else if outcome.result == WaitResult::Matched && !outcome.drained_events.is_empty() {
+        let event_count = u32::try_from(outcome.drained_events.len()).unwrap_or(u32::MAX);
         append_fact(
             &mut log,
             sequence,
@@ -328,8 +381,10 @@ timeout: {timeout}
 return: {return_route}  (self_declared)
 durability: in_process
 chanvoy_exit: {chanvoy_exit}
+drain_error: {drain_error}
 drained_count: {drained_count}
 newest_observed: {newest_observed}
+{events}
 {phases}
 ",
         source = paste_field(&spec.source, MAX_ID),
@@ -343,70 +398,112 @@ newest_observed: {newest_observed}
         chanvoy_exit = outcome
             .chanvoy_exit
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-        drained_count = outcome.drained_ids.len(),
+        drain_error = outcome.drain_error.map_or("none", DrainError::as_str),
+        drained_count = outcome.drained_events.len(),
         newest_observed = outcome
             .newest_observed
             .as_deref()
-            .map_or_else(|| "unknown".to_owned(), |id| paste_field(id, MAX_ID),),
+            .map_or_else(|| "unknown".to_owned(), |id| paste_field(id, MAX_ID)),
+        events = render_drained_events(&outcome.drained_events),
     )
 }
 
-/// Parse post ids from `chanvoy read --json` (object with `messages` or a bare array).
-#[must_use]
-pub fn parse_drained_ids(json: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
+fn render_drained_events(events: &[DrainedEvent]) -> String {
+    if events.is_empty() {
+        return "drained_events: none".to_owned();
+    }
+    let mut out = String::from("drained_events:");
+    for event in events {
+        let _ = write!(
+            out,
+            "\n- id={id} user={user}\n  {body}",
+            id = paste_field(&event.id, MAX_ID),
+            user = paste_field(&event.username, MAX_ID),
+            body = event.message.replace('\n', " / "),
+        );
+    }
+    out
+}
+
+/// Parse a full `chanvoy read --json` object. Rejects partial or duplicate sets.
+///
+/// # Errors
+///
+/// Returns [`DrainError`] when JSON is not a `messages` object, any event is
+/// invalid, the set is empty, or ids are duplicated.
+pub fn parse_drained_events(json: &str) -> Result<Vec<DrainedEvent>, DrainError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|_| DrainError::Malformed)?;
     let messages = value
         .get("messages")
         .and_then(serde_json::Value::as_array)
-        .or_else(|| value.as_array());
-    let Some(messages) = messages else {
-        return Vec::new();
-    };
-    messages
-        .iter()
-        .filter_map(|message| {
-            message
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|id| paste_token(id, MAX_ID).map(ToOwned::to_owned))
-        })
-        .collect()
+        .ok_or(DrainError::Malformed)?;
+    if messages.is_empty() {
+        return Err(DrainError::Empty);
+    }
+    let mut events = Vec::with_capacity(messages.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for message in messages {
+        let id = message
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| paste_token(id, MAX_ID))
+            .ok_or(DrainError::Malformed)?;
+        if !seen.insert(id.to_owned()) {
+            return Err(DrainError::DuplicateId);
+        }
+        let username = message
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|name| paste_token(name, MAX_ID))
+            .unwrap_or("unknown");
+        let body = message
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        events.push(DrainedEvent {
+            id: id.to_owned(),
+            username: username.to_owned(),
+            message: paste_body(body, MAX_BODY),
+        });
+    }
+    Ok(events)
 }
 
 /// Drain provider posts after the exclusive arm baseline.
 pub trait EventDrain {
-    /// Return observed post ids, oldest-first.
+    /// Return validated events, oldest-first.
     ///
     /// # Errors
     ///
-    /// Returns I/O errors from the provider CLI.
-    fn drain_after(&self, spec: &WaitOnSpec) -> io::Result<Vec<String>>;
+    /// Returns [`DrainError`] when the provider output cannot be trusted.
+    fn drain_after(&self, spec: &WaitOnSpec) -> Result<Vec<DrainedEvent>, DrainError>;
 }
 
 /// Default drain: `chanvoy read --json --after`.
 pub struct ChanvoyDrain;
 
 impl EventDrain for ChanvoyDrain {
-    fn drain_after(&self, spec: &WaitOnSpec) -> io::Result<Vec<String>> {
+    fn drain_after(&self, spec: &WaitOnSpec) -> Result<Vec<DrainedEvent>, DrainError> {
+        let after = spec.after.as_deref().ok_or(DrainError::MissingBaseline)?;
         let mut command = Command::new("chanvoy");
         command.arg("read");
         if let Some(team) = &spec.team {
             command.arg("--team").arg(team);
         }
         command.arg(&spec.channel);
-        if let Some(after) = &spec.after {
-            command.arg("--after").arg(after);
-        }
+        command.arg("--after").arg(after);
         command.arg("--json");
-        let output = command.output()?;
+        let output = command.output().map_err(|_| DrainError::Io)?;
+        if !output.status.success() {
+            return Err(DrainError::NonZeroExit);
+        }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(parse_drained_ids(&stdout))
+        parse_drained_events(&stdout)
     }
 }
 
-/// Fill drain fields after a matched waiter. Timeouts and errors skip drain.
+/// Fill drain fields after a matched waiter. Fail closed on drain errors.
+#[must_use]
 pub fn attach_drain(
     mut outcome: WaitOutcome,
     spec: &WaitOnSpec,
@@ -415,12 +512,23 @@ pub fn attach_drain(
     if outcome.result != WaitResult::Matched {
         return outcome;
     }
-    if let Ok(ids) = drain.drain_after(spec) {
-        outcome.newest_observed = ids.last().cloned();
-        outcome.drained_ids = ids;
-    } else {
-        outcome.drained_ids.clear();
-        outcome.newest_observed = None;
+    if spec.after.is_none() {
+        outcome.drain_error = Some(DrainError::MissingBaseline);
+        outcome.process_exit = 2;
+        return outcome;
+    }
+    match drain.drain_after(spec) {
+        Ok(events) => {
+            outcome.newest_observed = events.last().map(|event| event.id.clone());
+            outcome.drained_events = events;
+            outcome.drain_error = None;
+        }
+        Err(error) => {
+            outcome.drained_events.clear();
+            outcome.newest_observed = None;
+            outcome.drain_error = Some(error);
+            outcome.process_exit = 2;
+        }
     }
     outcome
 }
@@ -434,8 +542,9 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
             result: WaitResult::Error,
             chanvoy_exit: None,
             process_exit: 2,
-            drained_ids: Vec::new(),
+            drained_events: Vec::new(),
             newest_observed: None,
+            drain_error: None,
         };
     }
     let args = chanvoy_wait_args(spec);
@@ -452,8 +561,9 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
                 result: WaitResult::from_code(process_exit),
                 chanvoy_exit: raw,
                 process_exit,
-                drained_ids: Vec::new(),
+                drained_events: Vec::new(),
                 newest_observed: None,
+                drain_error: None,
             }
         }
         Err(_) => WaitOutcome {
@@ -461,8 +571,9 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
             result: WaitResult::Error,
             chanvoy_exit: None,
             process_exit: 2,
-            drained_ids: Vec::new(),
+            drained_events: Vec::new(),
             newest_observed: None,
+            drain_error: None,
         },
     }
 }
@@ -485,9 +596,9 @@ pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventDrain, WaitOnSpec, WaitOutcome, WaitResult, WaitRunner, WaiterState, attach_drain,
-        chanvoy_wait_args, execute_wait_on, lifecycle_log, parse_drained_ids, render_wait_receipt,
-        waiter_receipt_log,
+        DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitOutcome, WaitResult, WaitRunner,
+        WaiterState, attach_drain, chanvoy_wait_args, execute_wait_on, parse_drained_events,
+        render_wait_receipt, waiter_receipt_log,
     };
     use gearwit_domain::InterruptPhase;
     use std::io;
@@ -554,8 +665,20 @@ mod tests {
             result: WaitResult::Matched,
             chanvoy_exit: Some(0),
             process_exit: 0,
-            drained_ids: vec!["post-a".to_owned(), "post-b".to_owned()],
+            drained_events: vec![
+                DrainedEvent {
+                    id: "post-a".to_owned(),
+                    username: "peer".to_owned(),
+                    message: "first".to_owned(),
+                },
+                DrainedEvent {
+                    id: "post-b".to_owned(),
+                    username: "peer".to_owned(),
+                    message: "second".to_owned(),
+                },
+            ],
             newest_observed: Some("post-b".to_owned()),
+            drain_error: None,
         };
         let text = render_wait_receipt(&spec(), &outcome);
         assert!(text.contains("source: chanvoy"));
@@ -636,38 +759,93 @@ mod tests {
         assert!(!text.contains("wait_result: matched\n"));
     }
 
-    #[test]
-    fn parse_two_posts_oldest_first() {
-        let json = r#"{"messages":[{"id":"aaa"},{"id":"bbb"}]}"#;
-        assert_eq!(parse_drained_ids(json), ["aaa", "bbb"]);
-    }
-
-    struct FixedDrain(Vec<String>);
-
-    impl EventDrain for FixedDrain {
-        fn drain_after(&self, _spec: &WaitOnSpec) -> io::Result<Vec<String>> {
-            Ok(self.0.clone())
+    fn event(id: &str, body: &str) -> DrainedEvent {
+        DrainedEvent {
+            id: id.to_owned(),
+            username: "peer".to_owned(),
+            message: body.to_owned(),
         }
     }
 
     #[test]
-    fn matched_wait_drains_beyond_first_match() {
+    fn parse_two_posts_oldest_first_with_bodies() {
+        let json = r#"{"messages":[{"id":"aaa","username":"ux","message":"one"},{"id":"bbb","username":"dv","message":"two"}]}"#;
+        let events = parse_drained_events(json).expect("parsed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "aaa");
+        assert_eq!(events[0].message, "one");
+        assert_eq!(events[1].id, "bbb");
+        assert_eq!(events[1].message, "two");
+    }
+
+    #[test]
+    fn parse_rejects_malformed_partial_and_duplicates() {
+        assert_eq!(
+            parse_drained_events("[]").unwrap_err(),
+            DrainError::Malformed
+        );
+        assert_eq!(
+            parse_drained_events(r#"{"messages":[{"username":"x"}]}"#).unwrap_err(),
+            DrainError::Malformed
+        );
+        assert_eq!(
+            parse_drained_events(r#"{"messages":[{"id":"aaa"},{"id":"aaa"}]}"#).unwrap_err(),
+            DrainError::DuplicateId
+        );
+        assert_eq!(
+            parse_drained_events(r#"{"messages":[]}"#).unwrap_err(),
+            DrainError::Empty
+        );
+    }
+
+    struct FixedDrain(Result<Vec<DrainedEvent>, DrainError>);
+
+    impl EventDrain for FixedDrain {
+        fn drain_after(&self, _spec: &WaitOnSpec) -> Result<Vec<DrainedEvent>, DrainError> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn matched_wait_drains_burst_bodies_not_only_ids() {
         let outcome = attach_drain(
             execute_wait_on(&spec(), &ExitCodeRunner(0)),
             &spec(),
-            &FixedDrain(vec!["first".to_owned(), "second".to_owned()]),
+            &FixedDrain(Ok(vec![event("first", "alpha"), event("second", "beta")])),
         );
-        assert_eq!(outcome.drained_ids, ["first", "second"]);
+        assert_eq!(outcome.process_exit, 0);
         assert_eq!(outcome.newest_observed.as_deref(), Some("second"));
         let text = render_wait_receipt(&spec(), &outcome);
         assert!(text.contains("newest_observed: second"));
-        assert!(text.contains("drained_count: 2"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
         assert!(text.contains("events_drained: 2  (provider)"));
         assert!(text.contains("handled_cursor_recorded: unknown"));
-        let log = lifecycle_log(&outcome).expect("lifecycle");
-        assert!(
-            log.observe(InterruptPhase::HandledCursorRecorded)
-                .is_unknown()
+        assert!(text.contains("drain_error: none"));
+    }
+
+    #[test]
+    fn empty_or_failed_drain_fails_closed() {
+        let empty = attach_drain(
+            execute_wait_on(&spec(), &ExitCodeRunner(0)),
+            &spec(),
+            &FixedDrain(Err(DrainError::Empty)),
         );
+        assert_eq!(empty.process_exit, 2);
+        assert_eq!(empty.drain_error, Some(DrainError::Empty));
+        let text = render_wait_receipt(&spec(), &empty);
+        assert!(text.contains("drain_error: empty"));
+        assert!(text.contains("events_drained: unknown"));
+        assert!(text.contains("coverage_ended: provider_failed  (control_plane)"));
+
+        let mut no_after = spec();
+        no_after.after = None;
+        let missing = attach_drain(
+            execute_wait_on(&spec(), &ExitCodeRunner(0)),
+            &no_after,
+            &FixedDrain(Ok(vec![event("x", "y")])),
+        );
+        assert_eq!(missing.drain_error, Some(DrainError::MissingBaseline));
+        assert_eq!(missing.process_exit, 2);
     }
 }

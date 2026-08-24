@@ -19,7 +19,7 @@ fn main() -> ExitCode {
             SelfCommand::WaitOn(args) => {
                 let code = run_wait_on(&WaitOnSpec {
                     channel: args.channel,
-                    after: args.after,
+                    after: Some(args.after),
                     timeout: args.timeout,
                     team: args.team,
                     source: args.source,
@@ -81,9 +81,9 @@ enum SelfCommand {
 struct WaitOnArgs {
     /// Channel name (`november-team`) or `team/channel`.
     channel: String,
-    /// Exclusive cursor; posts at or before this id do not fire.
+    /// Exclusive cursor; required so drain uses the same arm baseline.
     #[arg(long)]
-    after: Option<String>,
+    after: String,
     /// Deadman duration (`20m`, `60s`).
     #[arg(long, default_value = "20m")]
     timeout: String,

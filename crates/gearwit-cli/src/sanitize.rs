@@ -9,6 +9,17 @@ pub const MAX_TERM: usize = 32;
 pub const MAX_ID: usize = 128;
 /// Maximum length for a timeout token (`20m`, `60s`).
 pub const MAX_TIMEOUT: usize = 16;
+/// Maximum length for a drained message body on the local face.
+pub const MAX_BODY: usize = 4096;
+
+/// Truncate and strip control characters from a message body.
+#[must_use]
+pub fn paste_body(raw: &str, max: usize) -> String {
+    raw.chars()
+        .filter(|character| !character.is_control() || *character == '\n')
+        .take(max)
+        .collect()
+}
 
 /// Return the token when it is bounded and free of control characters.
 #[must_use]
