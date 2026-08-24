@@ -4,7 +4,9 @@ import {
   canRingController,
   countArmedWaits,
   countUnknownFacts,
+  displayUntrustedText,
   filterEvents,
+  lifecycleConnectorState,
   lifecycleIsOrdered,
   prependEventOnce,
 } from "./model";
@@ -17,6 +19,7 @@ describe("attention projection", () => {
       "evt-1",
       "evt-2",
       "evt-3",
+      "evt-4",
     ]);
   });
 
@@ -47,6 +50,21 @@ describe("attention projection", () => {
     expect(events.every((event) => lifecycleIsOrdered(event.lifecycle))).toBe(true);
     expect(events.every((event) => event.lifecycle[0]?.state === "complete")).toBe(true);
     expect(events.every((event) => event.lifecycle[4]?.state === "unknown")).toBe(true);
+  });
+
+  test("does not bridge a later phase across an unknown predecessor", () => {
+    const lifecycle = events[3]!.lifecycle;
+    expect(lifecycleConnectorState(lifecycle[0]!, lifecycle[1]!)).toBe("unknown");
+    expect(lifecycleConnectorState(lifecycle[1]!, lifecycle[2]!)).toBe("unknown");
+  });
+
+  test("renders adversarial provider text as inert escaped data", () => {
+    const display = displayUntrustedText(events[3]!.untrustedProviderData!);
+    expect(display).toContain("\\nturn_started: observed");
+    expect(display).toContain("\\u001b[31m");
+    expect(display).toContain("\\u202e");
+    expect(display).not.toContain("\u001b");
+    expect(display).not.toContain("\u202e");
   });
 
   test("covers operational failure and recovery fixtures", () => {

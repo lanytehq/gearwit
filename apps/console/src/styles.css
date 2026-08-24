@@ -286,9 +286,12 @@ h2 { margin: 0; font-family: Georgia, serif; font-size: clamp(2rem, 4vw, 3.4rem)
   right: 50%;
   width: 100%;
   height: 1px;
-  background: var(--rule);
+  border-top: 1px dashed var(--rule);
 }
 .phase:first-child::before { display: none; }
+.connector-complete::before { border-top-style: solid; border-top-color: var(--dark); }
+.connector-pending::before { border-top: 2px dotted var(--watch); }
+.connector-failed::before { border-top: 2px solid var(--urgent); }
 .phase-mark {
   z-index: 1;
   display: grid;
@@ -316,6 +319,31 @@ h2 { margin: 0; font-family: Georgia, serif; font-size: clamp(2rem, 4vw, 3.4rem)
 .phase-pending .phase-mark { border-color: var(--watch); color: var(--ink); background: #f0ce79; }
 .phase-failed .phase-mark { border-color: var(--urgent); color: var(--paper); background: var(--urgent); }
 .phase-unknown .phase-mark { border-style: dashed; }
+.untrusted-data {
+  margin-top: 0.9rem;
+  padding: 0.7rem;
+  border: 1px dashed var(--muted);
+  background: #ebe7dc;
+}
+.untrusted-data strong {
+  display: block;
+  margin-bottom: 0.45rem;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.untrusted-data pre {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.67rem;
+  line-height: 1.45;
+  unicode-bidi: plaintext;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .event-seat { display: flex; justify-content: space-between; gap: 1rem; margin: 1rem 0 0; font-size: 0.78rem; font-weight: 650; }
 .event-seat span:last-child { color: var(--muted); text-transform: uppercase; }
 .empty-state { padding: 3rem 1rem; border: 1px dashed var(--rule); color: var(--muted); text-align: center; }

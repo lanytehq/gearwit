@@ -5,7 +5,9 @@ import {
   countUnknownFacts,
   evidenceGlyph,
   evidenceLabel,
+  displayUntrustedText,
   filterEvents,
+  lifecycleConnectorState,
   lifecycleGlyph,
   lifecycleIsOrdered,
   prependEventOnce,
@@ -63,9 +65,11 @@ function lifecycleRail(phases: readonly LifecyclePhase[]): HTMLOListElement {
   list.className = "lifecycle";
   list.setAttribute("aria-label", "Event lifecycle");
   list.append(
-    ...phases.map((phase) => {
+    ...phases.map((phase, index) => {
       const item = document.createElement("li");
-      item.className = `phase phase-${phase.state}`;
+      const previous = phases[index - 1];
+      const connector = previous ? lifecycleConnectorState(previous, phase) : "unknown";
+      item.className = `phase phase-${phase.state} connector-${connector}`;
       item.title = `${phase.detail} · ${evidenceLabel[phase.evidence]}`;
       item.setAttribute(
         "aria-label",
@@ -99,6 +103,14 @@ function eventItem(event: AttentionEvent): HTMLLIElement {
     text("p", event.detail, "event-detail"),
     lifecycleRail(event.lifecycle),
   );
+  if (event.untrustedProviderData !== undefined) {
+    const data = document.createElement("div");
+    data.className = "untrusted-data";
+    const payload = document.createElement("pre");
+    payload.textContent = displayUntrustedText(event.untrustedProviderData);
+    data.append(text("strong", "Untrusted provider data"), payload);
+    content.append(data);
+  }
 
   const footer = document.createElement("p");
   footer.className = "event-seat";

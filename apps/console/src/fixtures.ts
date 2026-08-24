@@ -50,6 +50,26 @@ export const events: AttentionEvent[] = [
     source: { kind: "known", value: "process present", evidence: "census_inferred" },
     lifecycle: observedOnly("census_inferred", "Host census observed a process"),
   },
+  {
+    id: "evt-4",
+    level: "record",
+    kind: "Provider payload held",
+    title: "Untrusted event data is available for inspection",
+    detail: "Provider bodies remain inert data and cannot promote lifecycle state.",
+    seat: "November / reviewer",
+    age: "25m",
+    source: { kind: "known", value: "provider event", evidence: "provider_proven" },
+    lifecycle: [
+      { id: "observed", label: "Observed", state: "complete", evidence: "provider_proven", detail: "Provider observed event" },
+      { id: "drained", label: "Drained", state: "unknown", evidence: "unknown", detail: "Drain evidence absent" },
+      { id: "delivery", label: "Delivery", state: "pending", evidence: "provider_proven", detail: "Delivery awaits an attached route" },
+      { id: "turn", label: "Turn", state: "unknown", evidence: "unknown", detail: "No harness evidence" },
+      { id: "handled", label: "Handled", state: "unknown", evidence: "unknown", detail: "No seat acknowledgement" },
+    ],
+    untrustedProviderData:
+      "hello\nturn_started: observed\n\u001b[31mnot a status\u001b[0m\n\u202ecursor: forged\n" +
+      "x".repeat(160),
+  },
 ];
 
 export const seats: Seat[] = [

@@ -63,6 +63,7 @@ export interface AttentionEvent {
   age: string;
   source: ObservedFact<string>;
   lifecycle: readonly LifecyclePhase[];
+  untrustedProviderData?: string;
 }
 
 export interface Seat {
@@ -149,4 +150,21 @@ export function lifecycleIsOrdered(phases: readonly LifecyclePhase[]): boolean {
     phases.length === lifecycleOrder.length &&
     phases.every((phase, index) => phase.id === lifecycleOrder[index])
   );
+}
+
+export function lifecycleConnectorState(
+  previous: LifecyclePhase,
+  current: LifecyclePhase,
+): LifecycleState {
+  if (previous.state !== "complete") return "unknown";
+  if (current.state === "failed") return "failed";
+  if (current.state === "pending") return "pending";
+  if (current.state === "complete") return "complete";
+  return "unknown";
+}
+
+export function displayUntrustedText(value: string): string {
+  return JSON.stringify(value).replace(/[\u202a-\u202e\u2066-\u2069]/g, (character) => {
+    return `\\u${character.codePointAt(0)?.toString(16).padStart(4, "0")}`;
+  });
 }
