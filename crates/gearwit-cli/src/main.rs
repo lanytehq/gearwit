@@ -4,7 +4,8 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gearwit_cli::{
-    AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_check, run_attach_session, run_wait_on,
+    AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_check, run_attach_session,
+    run_daemon_wait, run_wait_on,
 };
 use gearwit_domain::DeliveryRoute;
 use gearwit_host::GearwitPaths;
@@ -15,7 +16,7 @@ fn main() -> ExitCode {
     match cli.command {
         Commands::Daemon(daemon) => match daemon.command {
             DaemonCommand::WaitOn(args) => {
-                let code = run_wait_on(&daemon_spec_from_args(args));
+                let code = run_daemon_wait(daemon_spec_from_args(args));
                 ExitCode::from(u8::try_from(code).unwrap_or(2))
             }
             DaemonCommand::Status => {
@@ -74,7 +75,7 @@ struct DaemonArgs {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Sit on a channel and re-arm from `newest_observed`. Notify/observe only.
+    /// Sit on a channel, own Chanvoy coverage, and deliver to an attached waiter.
     #[command(name = "wait-on")]
     WaitOn(DaemonWaitOnArgs),
     /// Print the last stored receipt.
