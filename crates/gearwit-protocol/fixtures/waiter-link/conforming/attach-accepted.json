@@ -1,0 +1,11 @@
+{
+  "schema": "gearwit.interrupt.waiter-link.v0",
+  "type": "attach_accepted",
+  "request_id": "01J00000000000000000000040",
+  "link_id": "01J00000000000000000000042",
+  "arm_id": "01J00000000000000000000010",
+  "generation": 1,
+  "route": "complete_background_tool",
+  "accepted_at": "2026-01-15T12:05:00Z",
+  "lease_until": "2026-01-15T12:15:00Z"
+}

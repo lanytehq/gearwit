@@ -1,0 +1,11 @@
+{
+  "schema": "gearwit.interrupt.waiter-link.v0",
+  "type": "attach_waiter",
+  "request_id": "01J00000000000000000000040",
+  "waiter_id": "01J00000000000000000000041",
+  "arm_id": "01J00000000000000000000010",
+  "generation": 1,
+  "seat_id": "example-devrev",
+  "route": "complete_background_tool",
+  "observed_at": "2026-01-15T12:04:59Z"
+}

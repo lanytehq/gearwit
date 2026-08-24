@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gearwit-domain", "crates/gearwit-cli"]
+members = ["crates/gearwit-domain", "crates/gearwit-protocol", "crates/gearwit-cli"]
 exclude = ["apps/console/src-tauri"]
 
 [workspace.package]
@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 gearwit-domain = { path = "crates/gearwit-domain" }
+gearwit-protocol = { path = "crates/gearwit-protocol" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

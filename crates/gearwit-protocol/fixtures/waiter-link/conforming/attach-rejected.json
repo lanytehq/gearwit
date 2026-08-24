@@ -1,0 +1,7 @@
+{
+  "schema": "gearwit.interrupt.waiter-link.v0",
+  "type": "attach_rejected",
+  "request_id": "01J00000000000000000000040",
+  "code": "already_attached",
+  "observed_at": "2026-01-15T12:05:00Z"
+}

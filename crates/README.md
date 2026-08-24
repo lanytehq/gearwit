@@ -14,7 +14,8 @@ console / MCP ────▶ gearwit-protocol       ├──▶ gearwit-domain
 Initial boundaries:
 
 - `gearwit-domain`: platform-free facts, evidence, and state transitions.
-- `gearwit-protocol`: schema-backed daemon/client types. No schema, no type.
+- `gearwit-protocol`: schema-backed daemon/client types. First slice: waiter-link
+  frames + length-prefixed codec pinned to Crucible `d121642`.
 - `gearwit-platform`: host paths, process census, and OS capability traits.
 - `gearwit-host`: daemon plus internal registry, router, policy, adapter, and
   persistence modules.

@@ -1,0 +1,26 @@
+{
+  "schema": "gearwit.interrupt.waiter-link.v0",
+  "type": "deliver_events",
+  "delivery_id": "01J00000000000000000000043",
+  "link_id": "01J00000000000000000000042",
+  "arm_id": "01J00000000000000000000010",
+  "generation": 1,
+  "signal_id": "01J00000000000000000000021",
+  "route": "complete_background_tool",
+  "events": [
+    {
+      "provider": "mattermost",
+      "event_ref": "post02",
+      "observed_at": "2026-01-15T12:05:00Z",
+      "body": "first"
+    },
+    {
+      "provider": "mattermost",
+      "event_ref": "post02",
+      "observed_at": "2026-01-15T12:05:01Z",
+      "body": "duplicate"
+    }
+  ],
+  "newest_event_ref": "post02",
+  "attempted_at": "2026-01-15T12:05:02Z"
+}
