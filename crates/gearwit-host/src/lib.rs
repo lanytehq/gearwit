@@ -6,15 +6,18 @@ mod admit;
 mod link;
 mod paths;
 
-pub use admit::{AdmittedLink, KnownArm, LinkTable, admit_attach};
-pub use link::{LinkError, read_waiter_link, serve_attach, waiter_frame_config, write_waiter_link};
-pub use paths::{BindError, GearwitPaths, SOCKET_FILE, bind_private_socket, canonical_root};
+pub use admit::{AdmittedLink, KnownArm, LinkSession, LinkTable, admit_attach, drop_session};
+pub use link::{
+    LinkError, ServeAttach, read_waiter_link, serve_attach, wait_disconnect, waiter_frame_config,
+    write_waiter_link,
+};
+pub use paths::{BindError, BoundListener, GearwitPaths, SOCKET_FILE, canonical_root};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BindError, GearwitPaths, KnownArm, LinkError, LinkTable, SOCKET_FILE, admit_attach,
-        bind_private_socket, serve_attach,
+        BindError, GearwitPaths, KnownArm, LinkError, LinkSession, LinkTable, SOCKET_FILE,
+        admit_attach, drop_session, serve_attach, wait_disconnect,
     };
     use gearwit_protocol::{
         MAX_PAYLOAD, WaiterLink, decode_payload, encode_payload, parse_waiter_link,
@@ -26,7 +29,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
     use std::time::Duration;
     use time::{Duration as TimeDuration, OffsetDateTime};
@@ -44,6 +47,14 @@ mod tests {
         let mut message = fixture_attach();
         if let WaiterLink::AttachWaiter { request_id: id, .. } = &mut message {
             *id = request_id.to_owned();
+        }
+        message
+    }
+
+    fn attach_waiter_id(waiter_id: &str) -> WaiterLink {
+        let mut message = fixture_attach();
+        if let WaiterLink::AttachWaiter { waiter_id: id, .. } = &mut message {
+            *id = waiter_id.to_owned();
         }
         message
     }
@@ -103,6 +114,63 @@ mod tests {
             first,
             WaiterLink::AttachAccepted { generation: 1, .. }
         ));
+    }
+
+    #[test]
+    fn same_key_different_body_is_conflict() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("admit");
+        let error = admit_attach(
+            &mut table,
+            attach_waiter_id("01J00000000000000000000077"),
+            instant,
+            &[arm(instant)],
+        )
+        .expect_err("conflict");
+        assert!(matches!(
+            error,
+            gearwit_protocol::WaiterLinkError::Semantic("request_id conflict")
+        ));
+    }
+
+    #[test]
+    fn expired_lease_allows_new_admission() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        let first =
+            admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("first");
+        let later = instant + TimeDuration::minutes(11);
+        let second =
+            admit_attach(&mut table, fixture_attach(), later, &[arm(later)]).expect("renew");
+        match (first, second) {
+            (
+                WaiterLink::AttachAccepted { link_id: a, .. },
+                WaiterLink::AttachAccepted { link_id: b, .. },
+            ) => assert_ne!(a, b),
+            other => panic!("expected two accepts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_session_does_not_revoke_successor() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("first");
+        let old = LinkSession {
+            link_id: table.current().expect("current").link_id.clone(),
+        };
+        table.drop_current();
+        admit_attach(
+            &mut table,
+            attach_with("01J00000000000000000000098"),
+            instant,
+            &[arm(instant)],
+        )
+        .expect("successor");
+        let successor = table.current().expect("successor").link_id.clone();
+        drop_session(&mut table, &old);
+        assert_eq!(table.current().expect("still live").link_id, successor);
     }
 
     #[test]
@@ -319,11 +387,167 @@ mod tests {
     }
 
     #[test]
-    fn bind_private_socket_uses_injected_path() {
+    fn concurrent_bind_has_one_winner() {
         let root = temp_root();
         let paths = GearwitPaths::from_root(root.clone()).expect("paths");
-        let listener = bind_private_socket(&paths.socket_path()).expect("bind");
-        drop(listener);
+        let barrier = Arc::new(Barrier::new(2));
+        let a_paths = paths.clone();
+        let b_paths = paths.clone();
+        let a_barrier = barrier.clone();
+        let a = thread::spawn(move || {
+            a_barrier.wait();
+            a_paths.bind()
+        });
+        let b = thread::spawn(move || {
+            barrier.wait();
+            b_paths.bind()
+        });
+        let a = a.join().expect("a");
+        let b = b.join().expect("b");
+        let winners = [a.is_ok(), b.is_ok()].into_iter().filter(|ok| *ok).count();
+        assert_eq!(winners, 1);
+        let winner = match (a, b) {
+            (Ok(listener), Err(_)) | (Err(_), Ok(listener)) => listener,
+            (Ok(listener), Ok(other)) => {
+                drop(other);
+                listener
+            }
+            (Err(_), Err(_)) => panic!("expected one bind to succeed"),
+        };
+        let _client = UnixDomainSocket::connect(paths.socket_path()).expect("connect");
+        drop(winner);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_failure_does_not_commit() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut table = LinkTable::default();
+            let result = serve_attach(stream, &mut table, instant, &[arm(instant)]);
+            tx.send((result.is_err(), table.current().is_none()))
+                .expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut client = UnixDomainSocket::connect(&socket).expect("connect");
+        let payload = encode_payload(&fixture_attach()).expect("payload");
+        client
+            .write_all(&ipc_frame(COMMAND, &payload))
+            .expect("write");
+        drop(client);
+        let (failed, empty) = rx.recv_timeout(Duration::from_secs(2)).expect("served");
+        assert!(failed);
+        assert!(empty);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disconnect_revokes_then_successor_attaches() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut table = LinkTable::default();
+            let first = listener.accept().expect("accept");
+            let mut served =
+                serve_attach(first, &mut table, instant, &[arm(instant)]).expect("first");
+            let session = served.session.expect("session");
+            wait_disconnect(&mut served.reader).expect("eof");
+            drop_session(&mut table, &session);
+            let second = listener.accept().expect("second accept");
+            let served =
+                serve_attach(second, &mut table, instant, &[arm(instant)]).expect("second");
+            tx.send(served.reply).expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut first = UnixDomainSocket::connect(&socket).expect("first");
+        first
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("p"),
+            ))
+            .expect("write");
+        let mut reader = FrameReader::with_config(first, super::waiter_frame_config());
+        let _ = reader.read_frame().expect("accepted");
+        drop(reader);
+        thread::sleep(Duration::from_millis(20));
+        let mut second = UnixDomainSocket::connect(&socket).expect("second");
+        second
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&attach_with("01J00000000000000000000098")).expect("p"),
+            ))
+            .expect("write");
+        let mut reader = FrameReader::with_config(second, super::waiter_frame_config());
+        let frame = reader.read_frame().expect("reply");
+        let reply = decode_payload(&frame.payload).expect("decode");
+        assert!(matches!(reply, WaiterLink::AttachAccepted { .. }));
+        let served = rx.recv_timeout(Duration::from_secs(2)).expect("served");
+        assert!(matches!(served, WaiterLink::AttachAccepted { .. }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn user_home_and_symlink_components_are_checked() {
+        let home = temp_root();
+        std::fs::create_dir(&home).expect("home");
+        let paths = GearwitPaths::from_user_home(&home).expect("home");
+        assert_eq!(mode(&home.join(".lanyte")), 0o700);
+        assert_eq!(mode(paths.root()), 0o700);
+
+        let linked = temp_root();
+        std::fs::create_dir(&linked).expect("linked home");
+        let real_lanyte = linked.join("real-lanyte");
+        std::fs::create_dir(&real_lanyte).expect("real");
+        std::os::unix::fs::symlink(&real_lanyte, linked.join(".lanyte")).expect("symlink");
+        assert!(matches!(
+            GearwitPaths::from_user_home(&linked),
+            Err(BindError::Symlink(_))
+        ));
+
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("root");
+        let run = root.join("run");
+        std::fs::remove_dir_all(&run).expect("remove run");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &run).expect("run link");
+        assert!(matches!(
+            GearwitPaths::from_root(root.clone()),
+            Err(BindError::Symlink(_))
+        ));
+        drop(paths);
+
+        let sock_root = temp_root();
+        let paths = GearwitPaths::from_root(sock_root.clone()).expect("root");
+        let target = sock_root.join("target");
+        std::fs::create_dir(&target).expect("target");
+        std::os::unix::fs::symlink(&target, paths.socket_path()).expect("sock link");
+        assert!(matches!(paths.bind(), Err(BindError::Symlink(_))));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&linked);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&sock_root);
+    }
+
+    #[test]
+    fn owned_broad_mode_is_tightened() {
+        let root = temp_root();
+        std::fs::create_dir(&root).expect("root");
+        let mut permissions = std::fs::metadata(&root).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&root, permissions).expect("chmod");
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        assert_eq!(mode(paths.root()), 0o700);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

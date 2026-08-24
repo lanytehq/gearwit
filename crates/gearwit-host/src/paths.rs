@@ -5,11 +5,13 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use ipcprims::transport::{TransportError, UnixDomainSocket};
+use ipcprims::transport::{IpcStream, TransportError, UnixDomainSocket};
 use rsfulmen::logging::{Severity, new_cli};
 
 /// Socket file name under `run/`.
 pub const SOCKET_FILE: &str = "gearwit.sock";
+
+const LISTENER_LOCK: &str = "listener.lock";
 
 /// Failure to resolve, create, or bind the local waiter-link endpoint.
 #[derive(Debug)]
@@ -79,6 +81,39 @@ pub fn canonical_root() -> Result<PathBuf, BindError> {
     Ok(PathBuf::from(home).join(".lanyte").join("gearwit"))
 }
 
+struct ListenerLock {
+    path: PathBuf,
+}
+
+impl Drop for ListenerLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+/// Bound waiter-link listener. Holds the per-home exclusive lock until drop.
+pub struct BoundListener {
+    _lock: ListenerLock,
+    listener: UnixDomainSocket,
+}
+
+impl BoundListener {
+    /// Accept one connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport errors from ipcprims.
+    pub fn accept(&self) -> Result<IpcStream, BindError> {
+        Ok(self.listener.accept()?)
+    }
+
+    /// Bound socket path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.listener.path()
+    }
+}
+
 /// Resolved Gearwit directories. Tests inject `from_root`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GearwitPaths {
@@ -88,23 +123,42 @@ pub struct GearwitPaths {
 impl GearwitPaths {
     /// Create `root`, `run/`, and `state/` as owner-only directories.
     ///
+    /// The parent of `root` must already exist as an owned real directory.
+    ///
     /// # Errors
     ///
     /// Returns [`BindError`] when a component is a symlink or not a directory.
     pub fn from_root(root: PathBuf) -> Result<Self, BindError> {
+        let parent = root
+            .parent()
+            .ok_or_else(|| BindError::NotADirectory(root.clone()))?;
+        inspect_existing_dir(parent)?;
         ensure_private_dir(&root)?;
         ensure_private_dir(&root.join("run"))?;
         ensure_private_dir(&root.join("state"))?;
         Ok(Self { root })
     }
 
+    /// Resolve from an explicit user home (`$HOME` equivalent).
+    ///
+    /// # Errors
+    ///
+    /// Fails if `home` or `.lanyte` is a symlink, wrong type, or wrong owner.
+    pub fn from_user_home(home: &Path) -> Result<Self, BindError> {
+        inspect_existing_dir(home)?;
+        let lanyte = home.join(".lanyte");
+        ensure_private_dir(&lanyte)?;
+        Self::from_root(lanyte.join("gearwit"))
+    }
+
     /// Resolve and create the per-user canonical home.
     ///
     /// # Errors
     ///
-    /// Same as [`from_root`] plus [`BindError::HomeUnset`].
+    /// Same as [`Self::from_user_home`] plus [`BindError::HomeUnset`].
     pub fn user_default() -> Result<Self, BindError> {
-        Self::from_root(canonical_root()?)
+        let home = std::env::var_os("HOME").ok_or(BindError::HomeUnset)?;
+        Self::from_user_home(Path::new(&home))
     }
 
     /// Gearwit home root.
@@ -125,31 +179,54 @@ impl GearwitPaths {
         self.root.join("state")
     }
 
-    /// Bind the waiter-link socket with live-listener protection.
+    /// Bind the waiter-link socket while holding the exclusive listener lock.
     ///
     /// # Errors
     ///
     /// Returns [`BindError`] for live listeners, non-sockets, or transport failure.
-    pub fn bind(&self) -> Result<UnixDomainSocket, BindError> {
-        bind_private_socket(&self.socket_path())
+    pub fn bind(&self) -> Result<BoundListener, BindError> {
+        let lock = acquire_listener_lock(&self.root.join("run"), &self.socket_path())?;
+        let listener = bind_private_socket(&self.socket_path())?;
+        Ok(BoundListener {
+            _lock: lock,
+            listener,
+        })
     }
 }
 
+fn inspect_existing_dir(dir: &Path) -> Result<(), BindError> {
+    let metadata = fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() {
+        return Err(BindError::Symlink(dir.to_path_buf()));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(BindError::NotADirectory(dir.to_path_buf()));
+    }
+    require_owned(&metadata, dir)
+}
+
 /// Create or reuse a `0o700` directory. Rejects symlinks and non-directories.
+///
+/// Existing owned directories with a broader mode are tightened to `0o700`.
 ///
 /// # Errors
 ///
 /// Returns [`BindError`] when the path cannot be a private directory.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), BindError> {
-    if let Ok(metadata) = fs::symlink_metadata(dir) {
-        if metadata.file_type().is_symlink() {
-            return Err(BindError::Symlink(dir.to_path_buf()));
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(BindError::Symlink(dir.to_path_buf()));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(BindError::NotADirectory(dir.to_path_buf()));
+            }
+            require_owned(&metadata, dir)?;
         }
-        if !metadata.file_type().is_dir() {
-            return Err(BindError::NotADirectory(dir.to_path_buf()));
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(dir)?;
         }
-    } else {
-        fs::create_dir_all(dir)?;
+        Err(error) => return Err(BindError::Io(error)),
     }
     let metadata = fs::symlink_metadata(dir)?;
     if metadata.file_type().is_symlink() {
@@ -163,6 +240,54 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), BindError> {
     permissions.set_mode(0o700);
     fs::set_permissions(dir, permissions)?;
     Ok(())
+}
+
+fn acquire_listener_lock(run_dir: &Path, socket: &Path) -> Result<ListenerLock, BindError> {
+    let path = run_dir.join(LISTENER_LOCK);
+    match fs::create_dir(&path) {
+        Ok(()) => {
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions)?;
+            return Ok(ListenerLock { path });
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(BindError::Io(error)),
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(BindError::Symlink(path));
+    }
+    require_owned(&metadata, &path)?;
+    match UnixDomainSocket::connect(socket) {
+        Ok(_live) => {
+            warn_live(socket);
+            return Err(BindError::LiveListener(socket.to_path_buf()));
+        }
+        Err(TransportError::Connect { source, .. })
+            if source.kind() == io::ErrorKind::ConnectionRefused
+                || source.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(BindError::Transport(error)),
+    }
+    match fs::remove_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(BindError::LiveListener(socket.to_path_buf())),
+    }
+    fs::create_dir(&path)?;
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions)?;
+    Ok(ListenerLock { path })
+}
+
+fn warn_live(path: &Path) {
+    let displayed = path.display().to_string();
+    let log = new_cli("gearwitd", Severity::Warn);
+    log.warn(
+        "refusing bind; listener is live",
+        &[("path", displayed.as_str())],
+    );
 }
 
 /// Bind `path` as an owner-only Unix socket without stealing a live listener.
@@ -185,19 +310,11 @@ pub fn bind_private_socket(path: &Path) -> Result<UnixDomainSocket, BindError> {
         require_owned(&metadata, path)?;
         match UnixDomainSocket::connect(path) {
             Ok(_live) => {
-                let displayed = path.display().to_string();
-                let log = new_cli("gearwitd", Severity::Warn);
-                log.warn(
-                    "refusing bind; listener is live",
-                    &[("path", displayed.as_str())],
-                );
+                warn_live(path);
                 return Err(BindError::LiveListener(path.to_path_buf()));
             }
             Err(TransportError::Connect { source, .. })
-                if source.kind() == io::ErrorKind::ConnectionRefused =>
-            {
-                // Stale socket file. ipcprims bind removes socket files only.
-            }
+                if source.kind() == io::ErrorKind::ConnectionRefused => {}
             Err(error) => return Err(BindError::Transport(error)),
         }
     }

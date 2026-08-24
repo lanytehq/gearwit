@@ -7,7 +7,9 @@ use ipcprims::frame::{COMMAND, FrameConfig, FrameError, FrameReader, FrameWriter
 use ipcprims::transport::{IpcStream, TransportError};
 use time::OffsetDateTime;
 
-use crate::admit::{KnownArm, LinkTable, admit_attach};
+use crate::admit::{
+    AttachDecision, KnownArm, LinkSession, LinkTable, commit_attach, decide_attach, drop_expired,
+};
 
 /// Waiter-link session failure.
 #[derive(Debug)]
@@ -104,24 +106,72 @@ pub fn write_waiter_link(
     Ok(())
 }
 
-/// Read one attach, admit, and write the reply on the same stream.
+/// Outcome of one attach exchange.
+pub struct ServeAttach {
+    /// Reply written to the waiter.
+    pub reply: WaiterLink,
+    /// Session token when a live link was admitted or replayed.
+    pub session: Option<LinkSession>,
+    /// Remaining reader used to observe disconnect.
+    pub reader: FrameReader<IpcStream>,
+}
+
+/// Block until the waiter closes the stream.
 ///
 /// # Errors
 ///
-/// Returns [`LinkError`] when the session or admission fails.
+/// Returns [`LinkError`] on I/O other than a clean close, or if another frame
+/// arrives.
+pub fn wait_disconnect(reader: &mut FrameReader<IpcStream>) -> Result<(), LinkError> {
+    match reader.read_frame() {
+        Err(FrameError::ConnectionClosed) => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(LinkError::Message(WaiterLinkError::Semantic(
+            "unexpected frame",
+        ))),
+    }
+}
+
+/// Read one attach, write the reply, and commit only after a successful write.
+///
+/// # Errors
+///
+/// Returns [`LinkError`] when the session or admission fails. A failed reply
+/// write does not leave a new table entry.
 pub fn serve_attach(
     stream: IpcStream,
     table: &mut LinkTable,
     now: OffsetDateTime,
     arms: &[KnownArm],
-) -> Result<WaiterLink, LinkError> {
+) -> Result<ServeAttach, LinkError> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let writer_stream = stream.try_clone()?;
     let mut reader = FrameReader::with_config(stream, waiter_frame_config());
     let mut writer = FrameWriter::with_config(writer_stream, waiter_frame_config());
     let request = read_waiter_link(&mut reader)?;
-    let reply = admit_attach(table, request, now, arms)?;
-    write_waiter_link(&mut writer, &reply)?;
-    Ok(reply)
+    drop_expired(table, now);
+    let (reply, session) = match decide_attach(table, request, now, arms)? {
+        AttachDecision::Accept { link, reply } => {
+            write_waiter_link(&mut writer, &reply)?;
+            let session = LinkSession {
+                link_id: link.link_id.clone(),
+            };
+            commit_attach(table, *link);
+            (reply, Some(session))
+        }
+        AttachDecision::Replay { reply, session } => {
+            write_waiter_link(&mut writer, &reply)?;
+            (reply, Some(session))
+        }
+        AttachDecision::Reject { reply } => {
+            write_waiter_link(&mut writer, &reply)?;
+            (reply, None)
+        }
+    };
+    Ok(ServeAttach {
+        reply,
+        session,
+        reader,
+    })
 }

@@ -40,10 +40,14 @@ that active pair returns the cached accept.
 - Refuse a component that is a symlink or not a directory. See
   [ADR-0003](decisions/ADR-0003-no-follow-private-paths.md).
 - Require each private path to be owned by the process effective user.
+- Create `.lanyte`, `gearwit/`, `run/`, and `state/` one component at a time
+  (`create_dir`). Owned directories with a broader mode are tightened to
+  `0700`.
+- Bind holds `run/listener.lock` for the listener lifetime.
 - Bind fails closed if the socket path exists and is not a Unix socket.
 - Bind refuses when a listener is already live (connect probe succeeds).
 - A leftover **owned** socket file with no listener (`ConnectionRefused`) may
-  be replaced. Arbitrary files are never unlinked.
+  be replaced under the lock. Arbitrary files are never unlinked.
 
 ## Sandbox grants
 

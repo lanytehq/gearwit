@@ -37,13 +37,21 @@ pub struct AdmittedLink {
     pub waiter_id: String,
     /// Lease end.
     pub lease_until: OffsetDateTime,
+    request: WaiterLink,
+    last_accepted: WaiterLink,
+}
+
+/// Token that may revoke only the link it admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkSession {
+    /// Admitted link id.
+    pub link_id: String,
 }
 
 /// At most one live link.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LinkTable {
     current: Option<AdmittedLink>,
-    last_accepted: Option<WaiterLink>,
 }
 
 impl LinkTable {
@@ -56,26 +64,55 @@ impl LinkTable {
     /// Drop the link (disconnect). Does not advance handled cursor.
     pub fn drop_current(&mut self) {
         self.current = None;
-        self.last_accepted = None;
     }
 }
 
-/// Admit or reject an `attach_waiter` message.
-///
-/// A repeated `request_id` for the active `(arm_id, generation)` returns the
-/// cached [`WaiterLink::AttachAccepted`]. A different request while a link is
-/// live is `already_attached`.
-///
-/// # Errors
-///
-/// Returns [`WaiterLinkError`] if the request is not a valid attach or the
-/// constructed reply fails validation.
-pub fn admit_attach(
-    table: &mut LinkTable,
+/// Revoke `session` only when it still owns the live link.
+pub fn drop_session(table: &mut LinkTable, session: &LinkSession) {
+    if table
+        .current
+        .as_ref()
+        .is_some_and(|current| current.link_id == session.link_id)
+    {
+        table.current = None;
+    }
+}
+
+/// Drop a live link whose lease has elapsed.
+pub fn drop_expired(table: &mut LinkTable, now: OffsetDateTime) {
+    if table
+        .current
+        .as_ref()
+        .is_some_and(|current| now >= current.lease_until)
+    {
+        table.current = None;
+    }
+}
+
+pub(crate) enum AttachDecision {
+    Accept {
+        link: Box<AdmittedLink>,
+        reply: WaiterLink,
+    },
+    Replay {
+        reply: WaiterLink,
+        session: LinkSession,
+    },
+    Reject {
+        reply: WaiterLink,
+    },
+}
+
+pub(crate) fn commit_attach(table: &mut LinkTable, link: AdmittedLink) {
+    table.current = Some(link);
+}
+
+pub(crate) fn decide_attach(
+    table: &LinkTable,
     request: WaiterLink,
     now: OffsetDateTime,
     arms: &[KnownArm],
-) -> Result<WaiterLink, WaiterLinkError> {
+) -> Result<AttachDecision, WaiterLinkError> {
     validate(&request)?;
     let WaiterLink::AttachWaiter {
         request_id,
@@ -85,33 +122,45 @@ pub fn admit_attach(
         seat_id,
         route,
         ..
-    } = request
+    } = &request
     else {
         return Err(WaiterLinkError::Semantic("expected attach_waiter"));
     };
-    let Some(arm) = arms.iter().find(|arm| arm.arm_id == arm_id) else {
-        return reject(&request_id, "unknown_arm", now);
+    let Some(arm) = arms.iter().find(|arm| arm.arm_id == *arm_id) else {
+        return Ok(AttachDecision::Reject {
+            reply: reject_message(request_id, "unknown_arm", now)?,
+        });
     };
-    if arm.generation != generation {
-        return reject(&request_id, "stale_generation", now);
+    if arm.generation != *generation {
+        return Ok(AttachDecision::Reject {
+            reply: reject_message(request_id, "stale_generation", now)?,
+        });
     }
-    if arm.seat_id != seat_id || arm.route != route {
-        return reject(&request_id, "route_mismatch", now);
+    if arm.seat_id != *seat_id || arm.route != *route {
+        return Ok(AttachDecision::Reject {
+            reply: reject_message(request_id, "route_mismatch", now)?,
+        });
     }
     if now >= arm.coverage_until {
-        return reject(&request_id, "coverage_ended", now);
+        return Ok(AttachDecision::Reject {
+            reply: reject_message(request_id, "coverage_ended", now)?,
+        });
     }
     if let Some(current) = &table.current {
-        if current.request_id == request_id
-            && current.arm_id == arm_id
-            && current.generation == generation
-        {
-            return table
-                .last_accepted
-                .clone()
-                .ok_or(WaiterLinkError::Semantic("missing cached admission"));
+        if current.request_id == *request_id {
+            if current.request != request {
+                return Err(WaiterLinkError::Semantic("request_id conflict"));
+            }
+            return Ok(AttachDecision::Replay {
+                reply: current.last_accepted.clone(),
+                session: LinkSession {
+                    link_id: current.link_id.clone(),
+                },
+            });
         }
-        return reject(&request_id, "already_attached", now);
+        return Ok(AttachDecision::Reject {
+            reply: reject_message(request_id, "already_attached", now)?,
+        });
     }
     let link_id = ulid::Ulid::new().to_string();
     let lease_until = (now + Duration::minutes(10)).min(arm.coverage_until);
@@ -120,25 +169,57 @@ pub fn admit_attach(
         request_id: request_id.clone(),
         link_id: link_id.clone(),
         arm_id: arm_id.clone(),
-        generation,
-        route,
+        generation: *generation,
+        route: route.clone(),
         accepted_at: format_time(now),
         lease_until: format_time(lease_until),
     };
     validate(&accepted)?;
-    table.current = Some(AdmittedLink {
-        request_id,
+    let session_link = AdmittedLink {
+        request_id: request_id.clone(),
         link_id,
-        arm_id,
-        generation,
-        waiter_id,
+        arm_id: arm_id.clone(),
+        generation: *generation,
+        waiter_id: waiter_id.clone(),
         lease_until,
-    });
-    table.last_accepted = Some(accepted.clone());
-    Ok(accepted)
+        request,
+        last_accepted: accepted.clone(),
+    };
+    Ok(AttachDecision::Accept {
+        link: Box::new(session_link),
+        reply: accepted,
+    })
 }
 
-fn reject(
+/// Admit or reject an `attach_waiter` message.
+///
+/// A repeated `request_id` with an identical body returns the cached
+/// [`WaiterLink::AttachAccepted`]. The same key with a different body is a
+/// hard protocol conflict. A different request while a link is live is
+/// `already_attached`.
+///
+/// # Errors
+///
+/// Returns [`WaiterLinkError`] if the request is not a valid attach, the
+/// constructed reply fails validation, or `request_id` is reused with a
+/// different body.
+pub fn admit_attach(
+    table: &mut LinkTable,
+    request: WaiterLink,
+    now: OffsetDateTime,
+    arms: &[KnownArm],
+) -> Result<WaiterLink, WaiterLinkError> {
+    drop_expired(table, now);
+    match decide_attach(table, request, now, arms)? {
+        AttachDecision::Accept { link, reply } => {
+            commit_attach(table, *link);
+            Ok(reply)
+        }
+        AttachDecision::Replay { reply, .. } | AttachDecision::Reject { reply } => Ok(reply),
+    }
+}
+
+fn reject_message(
     request_id: &str,
     code: &'static str,
     now: OffsetDateTime,
