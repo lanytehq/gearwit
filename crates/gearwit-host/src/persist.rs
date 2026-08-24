@@ -316,6 +316,23 @@ pub trait Persist {
     ///
     /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
     fn persist_rearmed(&mut self, arm_id: &str) -> Result<(), WaiterLinkError>;
+
+    /// Durably record a reconciliation resolution for an attempt.
+    ///
+    /// Records the `ReconciliationResolved` transition durably so
+    /// that a fresh restart does not re-derive reconciliation-required
+    /// work for an already-resolved attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when persistence fails
+    /// or when the attempt has no prior `ReconciliationRequired` transition.
+    fn record_reconciliation(
+        &mut self,
+        attempt_id: &str,
+        signal_id: &str,
+        state: ReconciliationState,
+    ) -> Result<(), WaiterLinkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +641,41 @@ impl Persist for FakePersist {
 
     fn persist_rearmed(&mut self, arm_id: &str) -> Result<(), WaiterLinkError> {
         self.rearm_positions.insert(arm_id.to_owned(), true);
+        Ok(())
+    }
+
+    fn record_reconciliation(
+        &mut self,
+        attempt_id: &str,
+        signal_id: &str,
+        state: ReconciliationState,
+    ) -> Result<(), WaiterLinkError> {
+        // Validate: ReconciliationResolved requires a prior ReconciliationRequired.
+        let key = (signal_id.to_owned(), attempt_id.to_owned());
+        let prior = self.transitions.get(&key);
+        let has_required = prior.is_some_and(|ts| ts.contains(&Transition::ReconciliationRequired));
+        if !has_required {
+            return Err(WaiterLinkError::Semantic(
+                "no prior ReconciliationRequired transition for this attempt",
+            ));
+        }
+        // Record the resolution transition.
+        match state {
+            ReconciliationState::ProvenNotAccepted | ReconciliationState::Terminal => {
+                // Resolved: record ReconciliationResolved transition.
+                let entry = self.transitions.entry(key).or_default();
+                entry.push(Transition::ReconciliationResolved);
+            }
+            ReconciliationState::Accepted => {
+                // Accepted: record NativeAccepted (the dispatch was actually accepted).
+                let entry = self.transitions.entry(key).or_default();
+                entry.push(Transition::NativeAccepted);
+                entry.push(Transition::ReconciliationResolved);
+            }
+            ReconciliationState::Unknown => {
+                // Still unknown — do not resolve; this is not an error.
+            }
+        }
         Ok(())
     }
 

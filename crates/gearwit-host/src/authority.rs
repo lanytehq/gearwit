@@ -17,7 +17,9 @@ use crate::controller::{
     Controller, ControllerAttachment, ControllerCommand, DispatchDisposition, LifecycleObservation,
     ReconciliationDisposition, SignalAction,
 };
-use crate::persist::{ClaimError, ClaimOutcome, DurableClaim, Persist, Transition};
+use crate::persist::{
+    ClaimError, ClaimOutcome, DurableClaim, Persist, ReconciliationState, Transition,
+};
 use crate::{KnownArm, RecoverySnapshot};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -659,13 +661,56 @@ impl<P: Persist> DaemonAuthority<P> {
     // -- Reconciliation --------------------------------------------------
 
     /// Reconcile after an ambiguous dispatch.
-    #[must_use]
+    ///
+    /// Probes the controller for the true disposition, then durably
+    /// records the reconciliation resolution so a fresh restart does
+    /// not re-derive reconciliation-required work for this attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError`] when persistence of the reconciliation
+    /// resolution fails.
     pub fn reconcile(
-        &self,
+        &mut self,
         controller: &dyn Controller,
         attempt_id: &str,
-    ) -> ReconciliationDisposition {
-        controller.reconcile(attempt_id)
+    ) -> Result<ReconciliationDisposition, DispatchError> {
+        let disposition = controller.reconcile(attempt_id);
+
+        // Resolve the signal_id for the transition key.
+        // Look up the signal from any recorded claim or disposition.
+        let signal_id = self
+            .persist
+            .recover()
+            .ok()
+            .and_then(|snap| {
+                snap.attempt_map.iter().find_map(|(rid, aid)| {
+                    if aid == attempt_id {
+                        snap.claims
+                            .iter()
+                            .find(|c| c.request_id == *rid)
+                            .map(|c| c.signal_id.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| attempt_id.to_owned());
+
+        let state = match &disposition {
+            ReconciliationDisposition::Accepted => ReconciliationState::Accepted,
+            ReconciliationDisposition::ProvenNotAccepted => ReconciliationState::ProvenNotAccepted,
+            ReconciliationDisposition::Terminal => ReconciliationState::Terminal,
+            ReconciliationDisposition::Unknown => ReconciliationState::Unknown,
+        };
+
+        self.persist
+            .record_reconciliation(attempt_id, &signal_id, state)
+            .map_err(|e| {
+                DispatchError::PostSend(format!("failed to record reconciliation: {e:?}"))
+            })?;
+
+        Ok(disposition)
     }
 
     // -- Recovery --------------------------------------------------------
@@ -1604,13 +1649,145 @@ mod tests {
         );
     }
 
+    // -- c7: reconcile persistence ------------------------------------
+
+    fn controller_that_reconciles(d: ReconciliationDisposition) -> FakeController {
+        FakeController::new(vec![]).with_reconciliation(d)
+    }
+
+    /// Reconcile helper: admit → prepare → ambiguous conclude.
+    fn admit_prepare_ambiguous(auth: &mut DaemonAuthority<FakePersist>) -> String {
+        let req = std_req();
+        let _signal_id = req.signal_id.clone();
+        let admission = auth.admit_claim(&req).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let (prepared, _cmd) = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        auth.conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
+            .expect("conclude");
+        admission.attempt_id
+    }
+
     #[test]
-    fn reconcile_delegates_to_controller() {
-        let controller =
-            FakeController::new(vec![]).with_reconciliation(ReconciliationDisposition::Accepted);
-        assert_eq!(
-            controller.reconcile("attempt-1"),
-            ReconciliationDisposition::Accepted
+    fn reconcile_accepted_records_native_accepted_and_reconciliation_resolved() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+
+        let controller = controller_that_reconciles(ReconciliationDisposition::Accepted);
+        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
+        assert_eq!(result, ReconciliationDisposition::Accepted);
+
+        // Verify durable transitions: NativeAccepted + ReconciliationResolved
+        let snap = auth.persist().clone().recover().expect("recover");
+        let key = "sig-1:attempt-1";
+        let ts = snap.transitions.get(key).expect("transitions exist");
+        assert!(ts.contains(&Transition::NativeAccepted));
+        assert!(ts.contains(&Transition::ReconciliationResolved));
+    }
+
+    #[test]
+    fn reconcile_proven_not_accepted_records_reconciliation_resolved() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+
+        let controller = controller_that_reconciles(ReconciliationDisposition::ProvenNotAccepted);
+        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
+        assert_eq!(result, ReconciliationDisposition::ProvenNotAccepted);
+
+        let snap = auth.persist().clone().recover().expect("recover");
+        let key = "sig-1:attempt-1";
+        let ts = snap.transitions.get(key).expect("transitions exist");
+        assert!(ts.contains(&Transition::ReconciliationResolved));
+        // Not accepted, so no NativeAccepted
+        assert!(!ts.contains(&Transition::NativeAccepted));
+    }
+
+    #[test]
+    fn reconcile_terminal_records_reconciliation_resolved() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+
+        let controller = controller_that_reconciles(ReconciliationDisposition::Terminal);
+        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
+        assert_eq!(result, ReconciliationDisposition::Terminal);
+
+        let snap = auth.persist().clone().recover().expect("recover");
+        let key = "sig-1:attempt-1";
+        let ts = snap.transitions.get(key).expect("transitions exist");
+        assert!(ts.contains(&Transition::ReconciliationResolved));
+    }
+
+    #[test]
+    fn reconcile_unknown_does_not_resolve() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+
+        let controller = controller_that_reconciles(ReconciliationDisposition::Unknown);
+        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
+        assert_eq!(result, ReconciliationDisposition::Unknown);
+
+        let snap = auth.persist().clone().recover().expect("recover");
+        let key = "sig-1:attempt-1";
+        let ts = snap.transitions.get(key);
+        if let Some(ts) = ts {
+            assert!(!ts.contains(&Transition::ReconciliationResolved));
+            assert!(!ts.contains(&Transition::NativeAccepted));
+        }
+    }
+
+    #[test]
+    fn reconcile_without_prior_reconciliation_required_fails() {
+        let mut auth = sample_authority();
+        // Admit + prepare + accepted conclusion (not ambiguous)
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let att = admission.attachment.expect("attachment");
+        let (prepared, _cmd) = auth
+            .prepare_dispatch(&admission.claim, &att)
+            .expect("prepare");
+        auth.conclude_dispatch(
+            &prepared,
+            DispatchDisposition::Accepted {
+                correlation: "corr-1".to_owned(),
+            },
+            vec![],
+        )
+        .expect("conclude");
+
+        // No ReconciliationRequired transition exists — reconcile should fail.
+        let controller = controller_that_reconciles(ReconciliationDisposition::Accepted);
+        let err = auth
+            .reconcile(&controller, &admission.attempt_id)
+            .expect_err("reconcile without required should fail");
+        assert!(
+            matches!(err, DispatchError::PostSend(_)),
+            "expected PostSend error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciled_attempt_not_derivable_ambiguous_after_restart() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+
+        // Reconcile to proven-not-accepted
+        let controller = controller_that_reconciles(ReconciliationDisposition::ProvenNotAccepted);
+        auth.reconcile(&controller, &attempt_id).expect("reconcile");
+
+        // Propagate arm state for recovery
+        let arm_id = auth.arms.keys().next().unwrap().clone();
+        let arm_gen = auth.arms[&arm_id].generation;
+        auth.persist_mut().arm_states.push((arm_id, arm_gen));
+
+        // Restart: fresh authority from same backend
+        let mut auth2 = DaemonAuthority::new(auth.persist().clone(), auth.now);
+        auth2.register_arm(sample_arm());
+        let recovery = auth2.recover().expect("recover");
+
+        let ambiguous = recovery.derivable_ambiguous_attempts();
+        assert!(
+            !ambiguous.contains(&attempt_id),
+            "reconciled attempt must not be derivable as ambiguous"
         );
     }
 
