@@ -62,9 +62,12 @@ impl AckStore {
             .arm
             .as_ref()
             .ok_or(HandledCursorError::Semantic("unknown_arm"))?;
-        let start = validate_snapshots(&delivered, drain_snapshot)?;
+        if delivered.is_empty() {
+            return Err(HandledCursorError::Semantic("empty delivery"));
+        }
+        validate_leading_prefix(&delivered, drain_snapshot)?;
         let after_bound = drain_snapshot
-            .get(start.saturating_add(delivered.len())..)
+            .get(delivered.len()..)
             .unwrap_or(&[])
             .to_vec();
         if let Some((open_id, _)) = self
@@ -75,9 +78,20 @@ impl AckStore {
         {
             return Err(HandledCursorError::Semantic("signal conflict"));
         }
-        if let Some(existing) = self.signals.get(&signal_id) {
-            if existing.arm_id == arm.arm_id
-                && existing.generation == arm.generation
+        if let Some(existing) = self.signals.get_mut(&signal_id) {
+            let same_authority =
+                existing.arm_id == arm.arm_id && existing.generation == arm.generation;
+            if same_authority
+                && existing.delivered.is_empty()
+                && !existing.closed
+                && existing.handled.is_none()
+            {
+                existing.delivered = delivered;
+                existing.drain_snapshot = drain_snapshot.to_vec();
+                existing.after_bound = after_bound;
+                return Ok(());
+            }
+            if same_authority
                 && existing.delivered == delivered
                 && existing.drain_snapshot == drain_snapshot
             {
@@ -93,6 +107,50 @@ impl AckStore {
                 delivered,
                 drain_snapshot: drain_snapshot.to_vec(),
                 after_bound,
+                handled: None,
+                closed: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Register a claimed signal before any events are delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandledCursorError`] when another current-generation signal
+    /// is already open.
+    pub fn note_claimed(&mut self, signal_id: String) -> Result<(), HandledCursorError> {
+        let arm = self
+            .arm
+            .as_ref()
+            .ok_or(HandledCursorError::Semantic("unknown_arm"))?;
+        if let Some((open_id, _)) = self
+            .signals
+            .iter()
+            .find(|(_, batch)| batch.generation == arm.generation && !batch.closed)
+            && open_id != &signal_id
+        {
+            return Err(HandledCursorError::Semantic("signal conflict"));
+        }
+        if let Some(existing) = self.signals.get(&signal_id) {
+            if existing.arm_id == arm.arm_id
+                && existing.generation == arm.generation
+                && existing.delivered.is_empty()
+                && !existing.closed
+            {
+                return Ok(());
+            }
+            return Err(HandledCursorError::Semantic("signal conflict"));
+        }
+        self.signals.insert(
+            signal_id,
+            SignalBatch {
+                arm_id: arm.arm_id.clone(),
+                generation: arm.generation,
+                delivered: Vec::new(),
+                drain_snapshot: Vec::new(),
+                after_bound: Vec::new(),
                 handled: None,
                 closed: false,
             },
@@ -176,18 +234,15 @@ pub fn rearm_from_handled(
     Ok(cursor)
 }
 
-fn validate_snapshots(
+fn validate_leading_prefix(
     delivered: &[String],
     drain_snapshot: &[String],
-) -> Result<usize, HandledCursorError> {
+) -> Result<(), HandledCursorError> {
     let mut seen = std::collections::BTreeSet::new();
     for event_ref in drain_snapshot {
         if !seen.insert(event_ref.as_str()) {
             return Err(HandledCursorError::Semantic("duplicate drain ref"));
         }
-    }
-    if delivered.is_empty() {
-        return Ok(0);
     }
     seen.clear();
     for event_ref in delivered {
@@ -195,17 +250,10 @@ fn validate_snapshots(
             return Err(HandledCursorError::Semantic("duplicate event_ref"));
         }
     }
-    let windows = drain_snapshot
-        .windows(delivered.len())
-        .enumerate()
-        .filter(|(_, window)| *window == delivered)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    match windows.as_slice() {
-        [start] => Ok(*start),
-        [] => Err(HandledCursorError::Semantic("delivered not contiguous")),
-        _ => Err(HandledCursorError::Semantic("ambiguous bound")),
+    if drain_snapshot.len() < delivered.len() || drain_snapshot[..delivered.len()] != *delivered {
+        return Err(HandledCursorError::Semantic("delivered not leading prefix"));
     }
+    Ok(())
 }
 
 fn decide(store: &mut AckStore, request: &HandledCursor, now: OffsetDateTime) -> HandledCursor {
@@ -450,8 +498,8 @@ mod tests {
 
         let mut before = AckStore::with_arm(arm());
         before
-            .note_delivered("01J00000000000000000000021".to_owned(), Vec::new(), &[])
-            .expect("empty");
+            .note_claimed("01J00000000000000000000021".to_owned())
+            .expect("claimed");
         let reply = record_handled(
             &mut before,
             request("post03", "01J00000000000000000000053"),
@@ -664,8 +712,64 @@ mod tests {
             .expect_err("sparse");
         assert!(matches!(
             error,
-            gearwit_protocol::HandledCursorError::Semantic("delivered not contiguous")
+            gearwit_protocol::HandledCursorError::Semantic("delivered not leading prefix")
         ));
+    }
+
+    #[test]
+    fn leading_skip_is_rejected() {
+        let mut store = AckStore::with_arm(arm());
+        let error = store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post03".to_owned(), "post04".to_owned()],
+                &[
+                    "post02".to_owned(),
+                    "post03".to_owned(),
+                    "post04".to_owned(),
+                ],
+            )
+            .expect_err("skip");
+        assert!(matches!(
+            error,
+            gearwit_protocol::HandledCursorError::Semantic("delivered not leading prefix")
+        ));
+    }
+
+    #[test]
+    fn claimed_then_delivered_then_ack() {
+        let mut store = AckStore::with_arm(arm());
+        store
+            .note_claimed("01J00000000000000000000021".to_owned())
+            .expect("claimed");
+        let before = record_handled(
+            &mut store,
+            request("post03", "01J00000000000000000000053"),
+            now(),
+        )
+        .expect("before");
+        assert!(matches!(
+            before,
+            HandledCursor::Rejected { code, .. } if code == "ack_before_delivery"
+        ));
+        store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &[
+                    "post02".to_owned(),
+                    "post03".to_owned(),
+                    "post04".to_owned(),
+                ],
+            )
+            .expect("deliver");
+        let accepted = record_handled(
+            &mut store,
+            request("post03", "01J00000000000000000000050"),
+            now(),
+        )
+        .expect("ack");
+        assert!(matches!(accepted, HandledCursor::Accepted { .. }));
     }
 
     #[test]
