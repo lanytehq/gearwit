@@ -4,8 +4,8 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use gearwit_cli::{
-    AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_check, run_attach_session,
-    run_daemon_wait, run_wait_on,
+    AckHandledSpec, AttachSpec, ProcessCensus, WaitOnSpec, WhoCard, render_check, run_ack_handled,
+    run_attach_session, run_daemon_wait, run_wait_on,
 };
 use gearwit_domain::DeliveryRoute;
 use gearwit_host::GearwitPaths;
@@ -41,6 +41,7 @@ fn main() -> ExitCode {
                 print!("{}", render_check());
                 ExitCode::SUCCESS
             }
+            SelfCommand::AckHandled(args) => run_ack_handled_from_args(args),
         },
     }
 }
@@ -102,6 +103,37 @@ enum SelfCommand {
     WaitOn(WaitOnArgs),
     /// Print the last in-process wait receipt.
     Check,
+    /// Record a handled cursor on the local daemon. Transport only.
+    #[command(name = "ack-handled")]
+    AckHandled(AckHandledArgs),
+}
+
+#[derive(Debug, Parser)]
+struct AckHandledArgs {
+    /// Arm id.
+    #[arg(long)]
+    arm: String,
+    /// Arm generation.
+    #[arg(long)]
+    generation: u64,
+    /// Seat token.
+    #[arg(long)]
+    seat: String,
+    /// Stable signal id.
+    #[arg(long)]
+    signal: String,
+    /// Prefix endpoint `event_ref`.
+    #[arg(long)]
+    cursor: String,
+    /// Idempotency key. Minted when omitted; printed before send.
+    #[arg(long)]
+    request_id: Option<String>,
+    /// Observation time. Set before send when omitted.
+    #[arg(long)]
+    observed_at: Option<String>,
+    /// Override the default user socket.
+    #[arg(long)]
+    socket: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -190,6 +222,35 @@ fn spec_from_args(args: WaitOnArgs, follow: bool) -> WaitOnSpec {
         source: args.source,
         return_route: args.return_route.route(),
         follow,
+    }
+}
+
+fn run_ack_handled_from_args(args: AckHandledArgs) -> ExitCode {
+    let spec = AckHandledSpec {
+        arm_id: args.arm,
+        generation: args.generation,
+        seat_id: args.seat,
+        signal_id: args.signal,
+        cursor: args.cursor,
+        request_id: args.request_id,
+        observed_at: args.observed_at,
+    };
+    let socket = match args.socket {
+        Some(path) => path,
+        None => match GearwitPaths::user_default() {
+            Ok(paths) => paths.socket_path(),
+            Err(error) => {
+                eprintln!("gearwit: {error}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    match run_ack_handled(&socket, &spec) {
+        Ok(report) => ExitCode::from(report.exit),
+        Err(error) => {
+            eprintln!("gearwit: {error}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -282,6 +343,33 @@ mod tests {
                 "--attach"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn ack_handled_requires_explicit_authority() {
+        assert!(Cli::try_parse_from(["gearwit", "self", "ack-handled"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "gearwit",
+                "self",
+                "ack-handled",
+                "--arm",
+                "01J00000000000000000000010",
+                "--generation",
+                "1",
+                "--seat",
+                "example-devrev",
+                "--signal",
+                "01J00000000000000000000021",
+                "--cursor",
+                "post02",
+                "--request-id",
+                "01J00000000000000000000051",
+                "--observed-at",
+                "2026-01-15T12:05:20Z"
+            ])
+            .is_ok()
         );
     }
 

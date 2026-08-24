@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ack_handled;
 pub mod attach;
 pub mod check;
 pub mod child;
@@ -13,6 +14,9 @@ pub mod sanitize;
 pub mod wait_on;
 pub mod who;
 
+pub use ack_handled::{
+    AckHandledReport, AckHandledSpec, EXIT_ACCEPTED, EXIT_ERROR, EXIT_REJECTED, run_ack_handled,
+};
 pub use attach::{AttachSpec, render_attach_receipt, run_attach_session};
 pub use check::render_check;
 pub use daemon::run_daemon_wait;
