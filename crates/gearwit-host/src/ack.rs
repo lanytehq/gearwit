@@ -23,8 +23,10 @@ struct HistoryEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SignalBatch {
+    arm_id: String,
     generation: u64,
     delivered: Vec<String>,
+    drain_snapshot: Vec<String>,
     after_bound: Vec<String>,
     handled: Option<String>,
     closed: bool,
@@ -56,15 +58,29 @@ impl AckStore {
         delivered: Vec<String>,
         drain_snapshot: &[String],
     ) -> Result<(), HandledCursorError> {
-        let generation = self
+        let arm = self
             .arm
             .as_ref()
-            .ok_or(HandledCursorError::Semantic("unknown_arm"))?
-            .generation;
-        validate_snapshots(&delivered, drain_snapshot)?;
-        let after_bound = after_bound_refs(&delivered, drain_snapshot);
+            .ok_or(HandledCursorError::Semantic("unknown_arm"))?;
+        let start = validate_snapshots(&delivered, drain_snapshot)?;
+        let after_bound = drain_snapshot
+            .get(start.saturating_add(delivered.len())..)
+            .unwrap_or(&[])
+            .to_vec();
+        if let Some((open_id, _)) = self
+            .signals
+            .iter()
+            .find(|(_, batch)| batch.generation == arm.generation && !batch.closed)
+            && open_id != &signal_id
+        {
+            return Err(HandledCursorError::Semantic("signal conflict"));
+        }
         if let Some(existing) = self.signals.get(&signal_id) {
-            if existing.delivered == delivered && existing.after_bound == after_bound {
+            if existing.arm_id == arm.arm_id
+                && existing.generation == arm.generation
+                && existing.delivered == delivered
+                && existing.drain_snapshot == drain_snapshot
+            {
                 return Ok(());
             }
             return Err(HandledCursorError::Semantic("signal conflict"));
@@ -72,8 +88,10 @@ impl AckStore {
         self.signals.insert(
             signal_id,
             SignalBatch {
-                generation,
+                arm_id: arm.arm_id.clone(),
+                generation: arm.generation,
                 delivered,
+                drain_snapshot: drain_snapshot.to_vec(),
                 after_bound,
                 handled: None,
                 closed: false,
@@ -161,39 +179,33 @@ pub fn rearm_from_handled(
 fn validate_snapshots(
     delivered: &[String],
     drain_snapshot: &[String],
-) -> Result<(), HandledCursorError> {
-    if delivered.is_empty() {
-        return Ok(());
-    }
+) -> Result<usize, HandledCursorError> {
     let mut seen = std::collections::BTreeSet::new();
+    for event_ref in drain_snapshot {
+        if !seen.insert(event_ref.as_str()) {
+            return Err(HandledCursorError::Semantic("duplicate drain ref"));
+        }
+    }
+    if delivered.is_empty() {
+        return Ok(0);
+    }
+    seen.clear();
     for event_ref in delivered {
         if !seen.insert(event_ref.as_str()) {
             return Err(HandledCursorError::Semantic("duplicate event_ref"));
         }
     }
-    let mut drain_index = 0;
-    for event_ref in delivered {
-        let Some(found) = drain_snapshot[drain_index..]
-            .iter()
-            .position(|candidate| candidate == event_ref)
-        else {
-            return Err(HandledCursorError::Semantic("delivered not in drain"));
-        };
-        drain_index += found + 1;
+    let windows = drain_snapshot
+        .windows(delivered.len())
+        .enumerate()
+        .filter(|(_, window)| *window == delivered)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match windows.as_slice() {
+        [start] => Ok(*start),
+        [] => Err(HandledCursorError::Semantic("delivered not contiguous")),
+        _ => Err(HandledCursorError::Semantic("ambiguous bound")),
     }
-    Ok(())
-}
-
-fn after_bound_refs(delivered: &[String], drain_snapshot: &[String]) -> Vec<String> {
-    let Some(bound) = delivered.last() else {
-        return Vec::new();
-    };
-    drain_snapshot
-        .iter()
-        .skip_while(|event_ref| *event_ref != bound)
-        .skip(1)
-        .cloned()
-        .collect()
 }
 
 fn decide(store: &mut AckStore, request: &HandledCursor, now: OffsetDateTime) -> HandledCursor {
@@ -565,27 +577,44 @@ mod tests {
     #[test]
     fn rearm_does_not_advance_a_replaced_generation() {
         let mut store = store_with_batch();
-        store
-            .note_delivered(
-                "01J00000000000000000000022".to_owned(),
-                vec!["post02".to_owned(), "post03".to_owned()],
-                &["post02".to_owned(), "post03".to_owned()],
-            )
-            .expect("second signal");
         record_handled(
             &mut store,
             request("post03", "01J00000000000000000000050"),
             now(),
         )
         .expect("ack a");
+        let conflict = store.note_delivered(
+            "01J00000000000000000000022".to_owned(),
+            vec!["post02".to_owned(), "post03".to_owned()],
+            &["post02".to_owned(), "post03".to_owned()],
+        );
+        assert!(matches!(
+            conflict,
+            Err(gearwit_protocol::HandledCursorError::Semantic(
+                "signal conflict"
+            ))
+        ));
+        rearm_from_handled(&mut store, "01J00000000000000000000021").expect("rearm a");
+        store
+            .note_delivered(
+                "01J00000000000000000000022".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &["post02".to_owned(), "post03".to_owned()],
+            )
+            .expect("next gen");
         let mut other = request("post03", "01J00000000000000000000062");
-        if let HandledCursor::Request { signal_id, .. } = &mut other {
+        if let HandledCursor::Request {
+            signal_id,
+            generation,
+            ..
+        } = &mut other
+        {
             *signal_id = "01J00000000000000000000022".to_owned();
+            *generation = 2;
         }
         record_handled(&mut store, other, now()).expect("ack b");
-        rearm_from_handled(&mut store, "01J00000000000000000000021").expect("rearm a");
         let error =
-            rearm_from_handled(&mut store, "01J00000000000000000000022").expect_err("stale b");
+            rearm_from_handled(&mut store, "01J00000000000000000000021").expect_err("stale a");
         assert!(matches!(
             error,
             gearwit_protocol::HandledCursorError::Semantic("stale_generation")
@@ -617,5 +646,51 @@ mod tests {
             gearwit_protocol::HandledCursorError::Semantic("generation overflow")
         ));
         assert_eq!(store.arm().expect("arm").generation, u64::MAX);
+    }
+
+    #[test]
+    fn sparse_delivered_slice_is_rejected() {
+        let mut store = AckStore::with_arm(arm());
+        let error = store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned(), "post04".to_owned()],
+                &[
+                    "post02".to_owned(),
+                    "post03".to_owned(),
+                    "post04".to_owned(),
+                ],
+            )
+            .expect_err("sparse");
+        assert!(matches!(
+            error,
+            gearwit_protocol::HandledCursorError::Semantic("delivered not contiguous")
+        ));
+    }
+
+    #[test]
+    fn history_cap_preserves_accepted_replay() {
+        let mut store = store_with_batch();
+        let first = request("post03", "01J00000000000000000000050");
+        let accepted = record_handled(&mut store, first.clone(), now()).expect("first");
+        for index in 1..crate::admit::HISTORY_CAP {
+            let request_id = format!("01K{index:023}");
+            let reply =
+                record_handled(&mut store, request("post03", &request_id), now()).expect("fill");
+            assert!(matches!(reply, HandledCursor::Accepted { .. }));
+        }
+        let error = record_handled(
+            &mut store,
+            request("post03", "01K99999999999999999999999"),
+            now(),
+        )
+        .expect_err("full");
+        assert!(matches!(
+            error,
+            gearwit_protocol::HandledCursorError::Semantic("request history full")
+        ));
+        let replay = record_handled(&mut store, first, now()).expect("replay");
+        assert_eq!(replay, accepted);
+        assert_eq!(store.arm().expect("arm").generation, 1);
     }
 }
