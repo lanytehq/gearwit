@@ -133,6 +133,64 @@ h1 {
 .summary-strip p { font-size: 0.76rem; letter-spacing: 0.045em; text-transform: uppercase; }
 .summary-strip p { display: flex; justify-content: flex-end; align-items: center; color: #b9c6c1; }
 
+.doorbell-bench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.75fr);
+  border-bottom: 1px solid var(--ink);
+  background: var(--acid);
+}
+.bench-copy,
+.bench-controls { padding: clamp(1.25rem, 3vw, 2.5rem); }
+.bench-copy { border-right: 1px solid var(--ink); }
+.bench-copy h2 { max-width: 680px; }
+.bench-copy > p:last-child { max-width: 660px; margin: 1rem 0 0; line-height: 1.5; }
+.bench-controls { background: var(--paper); }
+.bench-controls label {
+  display: block;
+  margin-bottom: 0.45rem;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.bench-controls select {
+  width: 100%;
+  padding: 0.7rem 2.2rem 0.7rem 0.75rem;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  color: var(--ink);
+  background: var(--paper);
+  font: inherit;
+}
+.bench-controls select:focus-visible,
+.ring-button:focus-visible { outline: 3px solid var(--cool); outline-offset: 2px; }
+.route-readout { margin: 0.9rem 0; border-top: 1px solid var(--rule); }
+.route-readout > div {
+  display: grid;
+  grid-template-columns: 1fr auto minmax(7rem, auto);
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: 0.78rem;
+}
+.route-readout strong { text-align: right; }
+.ring-button {
+  width: 100%;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--ink);
+  color: var(--paper);
+  background: var(--ink);
+  cursor: pointer;
+  font-weight: 750;
+}
+.ring-button:hover:not(:disabled) { color: var(--ink); background: var(--acid); }
+.ring-button:disabled { color: #8d938f; background: #d6d3ca; cursor: not-allowed; }
+.ring-guidance,
+.ring-result { margin: 0.65rem 0 0; color: var(--muted); font-size: 0.76rem; line-height: 1.4; }
+.ring-result { min-height: 1.1rem; color: var(--ink); font-weight: 700; }
+
 .workspace { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(320px, 0.85fr); }
 .attention-pane,
 .roster-pane { padding: clamp(1.25rem, 3vw, 2.5rem); }
@@ -233,6 +291,8 @@ h2 { margin: 0; font-family: Georgia, serif; font-size: clamp(2rem, 4vw, 3.4rem)
   .summary-strip { grid-template-columns: repeat(3, 1fr); }
   .summary-strip p { display: none; }
   .workspace { display: block; }
+  .doorbell-bench { grid-template-columns: 1fr; }
+  .bench-copy { border-right: 0; border-bottom: 1px solid var(--ink); }
   .attention-pane { border-right: 0; border-bottom: 1px solid var(--ink); }
 }
 

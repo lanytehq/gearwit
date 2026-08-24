@@ -38,6 +38,25 @@
         <p id="snapshot-time">Development snapshot</p>
       </section>
 
+      <section class="doorbell-bench" aria-labelledby="doorbell-title">
+        <div class="bench-copy">
+          <p class="section-index">Return-path lab / Fixture only</p>
+          <h2 id="doorbell-title">Ring what is actually attached.</h2>
+          <p>
+            Choose a seat to inspect its available return path. Controller rings stay disabled
+            until an attachment is proven; foreground return remains agent-worn gear.
+          </p>
+        </div>
+        <div class="bench-controls">
+          <label for="doorbell-seat">Seat</label>
+          <select id="doorbell-seat"></select>
+          <div id="route-readout" class="route-readout" aria-live="polite"></div>
+          <button id="ring-test" class="ring-button" type="button">Ring test doorbell</button>
+          <p id="ring-guidance" class="ring-guidance"></p>
+          <p id="ring-result" class="ring-result" role="status"></p>
+        </div>
+      </section>
+
       <div class="workspace">
         <section id="attention" class="attention-pane" aria-labelledby="attention-title">
           <div class="section-heading">

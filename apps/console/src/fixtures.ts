@@ -45,6 +45,7 @@ export const seats: Seat[] = [
       value: { label: "Coverage ended", phase: "coverage_ended" },
       evidence: "self_declared",
     },
+    controller: { kind: "known", value: "attached", evidence: "controller_proven" },
   },
   {
     id: "seat-2",
@@ -57,6 +58,7 @@ export const seats: Seat[] = [
       value: { label: "Completion doorbell", phase: "armed" },
       evidence: "self_declared",
     },
+    controller: { kind: "unknown", evidence: "unknown" },
   },
   {
     id: "seat-3",
@@ -65,5 +67,6 @@ export const seats: Seat[] = [
     harness: { kind: "known", value: "Possible OpenCode", evidence: "census_inferred" },
     activity: { kind: "unknown", evidence: "unknown" },
     wait: { kind: "unknown", evidence: "unknown" },
+    controller: { kind: "unknown", evidence: "unknown" },
   },
 ];

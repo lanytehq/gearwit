@@ -17,6 +17,8 @@ export interface WaitState {
   phase: "armed" | "coverage_ended";
 }
 
+export type ControllerAttachment = "attached" | "detached";
+
 export interface AttentionEvent {
   id: string;
   level: AttentionLevel;
@@ -35,6 +37,7 @@ export interface Seat {
   harness: ObservedFact<string>;
   activity: ObservedFact<string>;
   wait: ObservedFact<WaitState>;
+  controller: ObservedFact<ControllerAttachment>;
 }
 
 export const evidenceLabel: Record<EvidenceClass, string> = {
@@ -61,7 +64,7 @@ export function filterEvents(
 
 export function countUnknownFacts(seats: readonly Seat[]): number {
   return seats.reduce((count, seat) => {
-    return count + [seat.harness, seat.activity, seat.wait].filter(
+    return count + [seat.harness, seat.activity, seat.wait, seat.controller].filter(
       (fact) => fact.kind === "unknown",
     ).length;
   }, 0);
@@ -71,4 +74,20 @@ export function countArmedWaits(seats: readonly Seat[]): number {
   return seats.filter(
     (seat) => seat.wait.kind === "known" && seat.wait.value.phase === "armed",
   ).length;
+}
+
+export function canRingController(seat: Seat): boolean {
+  return (
+    seat.controller.kind === "known" &&
+    seat.controller.value === "attached" &&
+    seat.controller.evidence === "controller_proven"
+  );
+}
+
+export function prependEventOnce(
+  events: readonly AttentionEvent[],
+  event: AttentionEvent,
+): AttentionEvent[] {
+  if (events.some((candidate) => candidate.id === event.id)) return [...events];
+  return [event, ...events];
 }
