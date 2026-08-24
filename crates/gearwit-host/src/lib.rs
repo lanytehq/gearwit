@@ -157,8 +157,11 @@ mod tests {
         let instant = now();
         let mut table = LinkTable::default();
         admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("first");
+        let current = table.current().expect("current");
         let old = LinkSession {
-            link_id: table.current().expect("current").link_id.clone(),
+            link_id: current.link_id.clone(),
+            arm_id: current.arm_id.clone(),
+            generation: current.generation,
         };
         table.drop_current();
         admit_attach(

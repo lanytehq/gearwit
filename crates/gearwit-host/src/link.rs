@@ -156,6 +156,8 @@ pub fn serve_attach(
             write_waiter_link(&mut writer, &reply)?;
             let session = LinkSession {
                 link_id: link.link_id.clone(),
+                arm_id: link.arm_id.clone(),
+                generation: link.generation,
             };
             commit_attach(table, *link);
             (reply, Some(session))

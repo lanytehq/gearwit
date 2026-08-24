@@ -46,6 +46,10 @@ pub struct AdmittedLink {
 pub struct LinkSession {
     /// Admitted link id.
     pub link_id: String,
+    /// Arm id at admission.
+    pub arm_id: String,
+    /// Generation at admission.
+    pub generation: u64,
 }
 
 /// At most one live link.
@@ -67,13 +71,13 @@ impl LinkTable {
     }
 }
 
-/// Revoke `session` only when it still owns the live link.
+/// Revoke `session` only when it still owns the live `(link_id, arm_id, generation)`.
 pub fn drop_session(table: &mut LinkTable, session: &LinkSession) {
-    if table
-        .current
-        .as_ref()
-        .is_some_and(|current| current.link_id == session.link_id)
-    {
+    if table.current.as_ref().is_some_and(|current| {
+        current.link_id == session.link_id
+            && current.arm_id == session.arm_id
+            && current.generation == session.generation
+    }) {
         table.current = None;
     }
 }
@@ -155,6 +159,8 @@ pub(crate) fn decide_attach(
                 reply: current.last_accepted.clone(),
                 session: LinkSession {
                     link_id: current.link_id.clone(),
+                    arm_id: current.arm_id.clone(),
+                    generation: current.generation,
                 },
             });
         }
