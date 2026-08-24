@@ -2,8 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use clap::{Parser, Subcommand};
-use gearwit_cli::{ProcessCensus, WaitOnSpec, WhoCard, run_wait_on};
+use clap::{Parser, Subcommand, ValueEnum};
+use gearwit_cli::{ProcessCensus, WaitOnSpec, WhoCard, render_check, run_wait_on};
+use gearwit_domain::DeliveryRoute;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -21,8 +22,14 @@ fn main() -> ExitCode {
                     after: args.after,
                     timeout: args.timeout,
                     team: args.team,
+                    source: args.source,
+                    return_route: args.return_route.route(),
                 });
                 ExitCode::from(u8::try_from(code).unwrap_or(2))
+            }
+            SelfCommand::Check => {
+                print!("{}", render_check());
+                ExitCode::SUCCESS
             }
         },
     }
@@ -66,6 +73,8 @@ enum SelfCommand {
     /// Completing this process is `waiter_completed`, not `turn_started`.
     #[command(name = "wait-on", visible_alias = "sit")]
     WaitOn(WaitOnArgs),
+    /// Print the last in-process wait receipt.
+    Check,
 }
 
 #[derive(Debug, Parser)]
@@ -81,4 +90,33 @@ struct WaitOnArgs {
     /// Mattermost team slug when the channel name is ambiguous.
     #[arg(long)]
     team: Option<String>,
+    /// Interrupt source. Only `chanvoy` is implemented in this slice.
+    #[arg(long, default_value = "chanvoy")]
+    source: String,
+    /// Declared return route. Not proof of a model turn.
+    #[arg(long = "return", value_enum, default_value_t = ReturnArg::Foreground)]
+    return_route: ReturnArg,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ReturnArg {
+    /// Return into a harness-owned foreground tool call.
+    #[default]
+    Foreground,
+    /// Complete a harness-owned background tool (Grok doorbell).
+    #[value(name = "background-tool")]
+    BackgroundTool,
+    /// Notify an operator; do not claim a model turn.
+    #[value(name = "notify-operator")]
+    NotifyOperator,
+}
+
+impl ReturnArg {
+    fn route(self) -> DeliveryRoute {
+        match self {
+            Self::Foreground => DeliveryRoute::ReturnForeground,
+            Self::BackgroundTool => DeliveryRoute::CompleteBackgroundTool,
+            Self::NotifyOperator => DeliveryRoute::NotifyOperator,
+        }
+    }
 }

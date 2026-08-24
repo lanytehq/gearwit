@@ -19,7 +19,8 @@ Initial boundaries:
 - `gearwit-host`: daemon plus internal registry, router, policy, adapter, and
   persistence modules.
 - `gearwit-cli`: thin client and explicit in-process degraded wait path.
-  First slice: `gearwit self who` and in-process `gearwit self wait-on`.
+  First slice: `gearwit self who`, in-process `gearwit self wait-on`, and
+  `gearwit self check`.
 
 Split host modules into crates only when their dependencies or release
 boundaries diverge.

@@ -57,10 +57,12 @@ becoming a second source of truth.
 ```bash
 make check
 cargo run -p gearwit-cli -- self who
-cargo run -p gearwit-cli -- self wait-on CHANNEL --after ID --timeout 20m
+cargo run -p gearwit-cli -- self wait-on CHANNEL --after ID --timeout 20m \
+  --source chanvoy --return background-tool
+cargo run -p gearwit-cli -- self check
 ```
 
 `self who` is a census-safe local card with per-field evidence. `self wait-on`
-wraps `chanvoy wait` in-process. Completing the waiter is not proof that a
-harness turn started. These faces are not a public wire protocol. No daemon is
-implemented yet.
+wraps `chanvoy wait` in-process. `--return` is a declared route, not proof that
+a harness turn started. `self check` reprints the last local receipt. These
+faces are not a public wire protocol. No daemon is implemented yet.

@@ -8,8 +8,8 @@ use std::process::{Command, ExitStatus};
 
 use crate::sanitize::{MAX_ID, MAX_TIMEOUT, paste_field, paste_token};
 use gearwit_domain::{
-    CoverageEndReason, InterruptPhase, LifecycleFact, LifecycleReceipt, PhaseObservation,
-    ReceiptError, ReceiptLog, ReceiptSource, WaiterCompletion,
+    CoverageEndReason, DeliveryRoute, InterruptPhase, LifecycleFact, LifecycleReceipt,
+    PhaseObservation, ReceiptError, ReceiptLog, ReceiptSource, WaiterCompletion,
 };
 
 /// Arguments for an in-process wait.
@@ -23,6 +23,10 @@ pub struct WaitOnSpec {
     pub timeout: String,
     /// Optional Mattermost team slug.
     pub team: Option<String>,
+    /// Interrupt source token (`chanvoy` first).
+    pub source: String,
+    /// Declared return route. Not proof that a model turn started.
+    pub return_route: DeliveryRoute,
 }
 
 /// How the waiter process ended. Not a harness-turn claim.
@@ -288,19 +292,23 @@ coverage_ended: unknown
     format!(
         "\
 gearwit self wait-on
+source: {source}
 channel: {channel}
 after: {after}
 timeout: {timeout}
+return: {return_route}  (self_declared)
 durability: in_process
 chanvoy_exit: {chanvoy_exit}
 {phases}
 ",
+        source = paste_field(&spec.source, MAX_ID),
         channel = paste_field(&spec.channel, MAX_ID),
         after = spec
             .after
             .as_deref()
             .map_or_else(|| "unknown".to_owned(), |after| paste_field(after, MAX_ID)),
         timeout = paste_field(&spec.timeout, MAX_TIMEOUT),
+        return_route = spec.return_route.as_str(),
         chanvoy_exit = outcome
             .chanvoy_exit
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
@@ -347,7 +355,11 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
 #[must_use]
 pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
     let outcome = execute_wait_on(spec, &ChanvoyRunner);
-    eprint!("{}", render_wait_receipt(spec, &outcome));
+    let receipt = render_wait_receipt(spec, &outcome);
+    eprint!("{receipt}");
+    if let Err(error) = crate::check::store_last_receipt(&receipt) {
+        eprintln!("gearwit: could not store last receipt: {error}");
+    }
     if outcome.waiter == WaiterState::NotStarted && outcome.chanvoy_exit.is_none() {
         eprintln!("gearwit: waiter did not start");
     }
@@ -370,6 +382,8 @@ mod tests {
             after: Some("cursor1".to_owned()),
             timeout: "20m".to_owned(),
             team: None,
+            source: "chanvoy".to_owned(),
+            return_route: gearwit_domain::DeliveryRoute::ReturnForeground,
         }
     }
 
@@ -425,6 +439,8 @@ mod tests {
             process_exit: 0,
         };
         let text = render_wait_receipt(&spec(), &outcome);
+        assert!(text.contains("source: chanvoy"));
+        assert!(text.contains("return: return_foreground  (self_declared)"));
         assert!(text.contains("wait_armed: observed  (waiter_process)"));
         assert!(text.contains("signal_matched: unknown"));
         assert!(text.contains("waiter_completed: matched  (waiter_process)"));
