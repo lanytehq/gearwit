@@ -107,33 +107,34 @@ enum SelfCommand {
 #[derive(Debug, Parser)]
 struct WaitOnArgs {
     /// Channel name (`november-team`) or `team/channel`.
-    channel: String,
+    #[arg(required_unless_present = "attach", conflicts_with = "attach")]
+    channel: Option<String>,
     /// Exclusive cursor; required so drain uses the same arm baseline.
-    #[arg(long)]
-    after: String,
+    #[arg(long, required_unless_present = "attach", conflicts_with = "attach")]
+    after: Option<String>,
     /// Deadman duration (`20m`, `60s`).
-    #[arg(long, default_value = "20m")]
+    #[arg(long, default_value = "20m", conflicts_with = "attach")]
     timeout: String,
     /// Mattermost team slug when the channel name is ambiguous.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "attach")]
     team: Option<String>,
     /// Interrupt source. Only `chanvoy` is implemented in this slice.
-    #[arg(long, default_value = "chanvoy")]
+    #[arg(long, default_value = "chanvoy", conflicts_with = "attach")]
     source: String,
     /// Declared return route. Not proof of a model turn.
     #[arg(long = "return", value_enum, default_value_t = ReturnArg::Foreground)]
     return_route: ReturnArg,
-    /// Attach to gearwitd over the local waiter-link instead of wrapping Chanvoy.
+    /// Attach to local gearwitd. Does not wrap Chanvoy.
     #[arg(long)]
     attach: bool,
     /// Arm id. Required with `--attach`.
-    #[arg(long)]
+    #[arg(long, required_if_eq("attach", "true"), conflicts_with = "channel")]
     arm: Option<String>,
     /// Seat token. Required with `--attach`.
-    #[arg(long)]
+    #[arg(long, required_if_eq("attach", "true"), conflicts_with = "channel")]
     seat: Option<String>,
     /// Arm generation. Required with `--attach`.
-    #[arg(long)]
+    #[arg(long, required_if_eq("attach", "true"), conflicts_with = "channel")]
     generation: Option<u64>,
 }
 
@@ -182,8 +183,8 @@ fn daemon_spec_from_args(args: DaemonWaitOnArgs) -> WaitOnSpec {
 
 fn spec_from_args(args: WaitOnArgs, follow: bool) -> WaitOnSpec {
     WaitOnSpec {
-        channel: args.channel,
-        after: Some(args.after),
+        channel: args.channel.expect("channel"),
+        after: Some(args.after.expect("after")),
         timeout: args.timeout,
         team: args.team,
         source: args.source,
@@ -193,22 +194,14 @@ fn spec_from_args(args: WaitOnArgs, follow: bool) -> WaitOnSpec {
 }
 
 fn run_attach_from_args(args: &WaitOnArgs) -> ExitCode {
-    let Some(arm_id) = args.arm.clone() else {
-        eprintln!("gearwit: --attach requires --arm");
+    if args.return_route == ReturnArg::NotifyOperator {
+        eprintln!("gearwit: attach cannot use notify-operator");
         return ExitCode::from(2);
-    };
-    let Some(seat_id) = args.seat.clone() else {
-        eprintln!("gearwit: --attach requires --seat");
-        return ExitCode::from(2);
-    };
-    let Some(generation) = args.generation else {
-        eprintln!("gearwit: --attach requires --generation");
-        return ExitCode::from(2);
-    };
+    }
     let spec = AttachSpec {
-        arm_id,
-        generation,
-        seat_id,
+        arm_id: args.arm.clone().expect("arm"),
+        generation: args.generation.expect("generation"),
+        seat_id: args.seat.clone().expect("seat"),
         route: args.return_route.route().as_str().to_owned(),
     };
     let paths = match GearwitPaths::user_default() {
@@ -237,5 +230,78 @@ impl ReturnArg {
             Self::BackgroundTool => DeliveryRoute::CompleteBackgroundTool,
             Self::NotifyOperator => DeliveryRoute::NotifyOperator,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, ReturnArg, WaitOnArgs};
+    use clap::Parser;
+
+    #[test]
+    fn wrap_mode_requires_channel_and_after() {
+        assert!(Cli::try_parse_from(["gearwit", "self", "wait-on"]).is_err());
+        assert!(Cli::try_parse_from(["gearwit", "self", "wait-on", "november-team"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "gearwit",
+                "self",
+                "wait-on",
+                "november-team",
+                "--after",
+                "post1"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn attach_mode_is_exclusive_of_channel_and_after() {
+        assert!(
+            Cli::try_parse_from([
+                "gearwit",
+                "self",
+                "wait-on",
+                "--attach",
+                "--arm",
+                "01J00000000000000000000010",
+                "--seat",
+                "example-devrev",
+                "--generation",
+                "1",
+                "--return",
+                "background-tool"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "gearwit",
+                "self",
+                "wait-on",
+                "november-team",
+                "--after",
+                "post1",
+                "--attach"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attach_rejects_notify_operator_before_io() {
+        let args = WaitOnArgs {
+            channel: None,
+            after: None,
+            timeout: "20m".to_owned(),
+            team: None,
+            source: "chanvoy".to_owned(),
+            return_route: ReturnArg::NotifyOperator,
+            attach: true,
+            arm: Some("01J00000000000000000000010".to_owned()),
+            seat: Some("example-devrev".to_owned()),
+            generation: Some(1),
+        };
+        super::run_attach_from_args(&args);
     }
 }

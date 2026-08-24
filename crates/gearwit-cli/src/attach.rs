@@ -1,10 +1,15 @@
-//! `self wait-on --attach`: block on gearwitd `deliver_events`.
+//! `self wait-on attach`: block on gearwitd `deliver_events`.
 //!
 //! Completing this process is `waiter_completed` / `delivery_result`, not
 //! `turn_started`. This process does not own Chanvoy.
 
+use std::fmt::Write as _;
+use std::io::{self, Write};
 use std::path::Path;
+use std::time::Duration;
 
+use crate::check::store_last_receipt;
+use crate::sanitize::{MAX_BODY, MAX_ID, paste_body, paste_field};
 use gearwit_host::{read_waiter_link, waiter_frame_config, write_waiter_link};
 use gearwit_protocol::{SCHEMA, WaiterLink};
 use ipcprims::frame::{FrameReader, FrameWriter};
@@ -25,33 +30,76 @@ pub struct AttachSpec {
     pub route: String,
 }
 
-/// Connect, attach, wait for one `deliver_events`, send `return_completed`.
+struct Accepted {
+    request_id: String,
+    link_id: String,
+    arm_id: String,
+    generation: u64,
+    route: String,
+    lease_until: OffsetDateTime,
+}
+
+/// Connect, attach, wait for one `deliver_events`, print events, then ack.
 ///
 /// # Errors
 ///
 /// Returns a short message on connect, protocol, or I/O failure.
 pub fn run_attach_session(socket: &Path, spec: &AttachSpec) -> Result<WaiterLink, String> {
+    run_attach_session_to(socket, spec, io::stderr())
+}
+
+/// Same as [`run_attach_session`] with an injected output sink.
+///
+/// # Errors
+///
+/// Returns a short message on connect, protocol, or I/O failure.
+pub fn run_attach_session_to(
+    socket: &Path,
+    spec: &AttachSpec,
+    mut out: impl Write,
+) -> Result<WaiterLink, String> {
     let stream = UnixDomainSocket::connect(socket).map_err(|error| error.to_string())?;
     let writer_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = FrameReader::with_config(stream, waiter_frame_config());
     let mut writer = FrameWriter::with_config(writer_stream, waiter_frame_config());
     let request = attach_request(spec);
     write_waiter_link(&mut writer, &request).map_err(|error| error.to_string())?;
-    let accepted = read_waiter_link(&mut reader).map_err(|error| error.to_string())?;
-    match &accepted {
-        WaiterLink::AttachAccepted { .. } => {}
-        WaiterLink::AttachRejected { code, .. } => {
-            return Err(format!("attach rejected: {code}"));
-        }
-        _ => return Err("expected attach reply".to_owned()),
-    }
+    let reply = read_waiter_link(&mut reader).map_err(|error| error.to_string())?;
+    let accepted = correlate_accept(&request, &reply)?;
+    reader
+        .get_mut()
+        .set_read_timeout(Some(remaining_lease(
+            accepted.lease_until,
+            OffsetDateTime::now_utc(),
+        )))
+        .map_err(|error| error.to_string())?;
     let delivery = read_waiter_link(&mut reader).map_err(|error| error.to_string())?;
+    correlate_delivery(&accepted, &delivery)?;
+    let receipt = render_attach_receipt(&delivery);
+    match out.write_all(receipt.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => {
+            let _ = store_last_receipt(&receipt);
+            send_result(&mut writer, &delivery, "return_completed")?;
+            Ok(delivery)
+        }
+        Err(error) => {
+            let _ = send_result(&mut writer, &delivery, "return_failed");
+            Err(error.to_string())
+        }
+    }
+}
+
+fn send_result(
+    writer: &mut FrameWriter<ipcprims::transport::IpcStream>,
+    delivery: &WaiterLink,
+    outcome: &str,
+) -> Result<(), String> {
     let WaiterLink::DeliverEvents {
         delivery_id,
         link_id,
         signal_id,
         ..
-    } = &delivery
+    } = delivery
     else {
         return Err("expected deliver_events".to_owned());
     };
@@ -60,11 +108,96 @@ pub fn run_attach_session(socket: &Path, spec: &AttachSpec) -> Result<WaiterLink
         delivery_id: delivery_id.clone(),
         link_id: link_id.clone(),
         signal_id: signal_id.clone(),
-        outcome: "return_completed".to_owned(),
+        outcome: outcome.to_owned(),
         observed_at: format_time(OffsetDateTime::now_utc()),
     };
-    write_waiter_link(&mut writer, &result).map_err(|error| error.to_string())?;
-    Ok(delivery)
+    write_waiter_link(writer, &result).map_err(|error| error.to_string())
+}
+
+fn correlate_accept(request: &WaiterLink, reply: &WaiterLink) -> Result<Accepted, String> {
+    let WaiterLink::AttachWaiter {
+        request_id,
+        arm_id,
+        generation,
+        route,
+        ..
+    } = request
+    else {
+        return Err("expected attach_waiter".to_owned());
+    };
+    match reply {
+        WaiterLink::AttachRejected {
+            request_id: rejected_id,
+            code,
+            ..
+        } => {
+            if rejected_id != request_id {
+                return Err("attach reject request_id mismatch".to_owned());
+            }
+            Err(format!("attach rejected: {code}"))
+        }
+        WaiterLink::AttachAccepted {
+            request_id: accepted_id,
+            link_id,
+            arm_id: accepted_arm,
+            generation: accepted_generation,
+            route: accepted_route,
+            lease_until,
+            ..
+        } => {
+            if accepted_id != request_id
+                || accepted_arm != arm_id
+                || accepted_generation != generation
+                || accepted_route != route
+            {
+                return Err("attach accept mismatch".to_owned());
+            }
+            let lease_until = OffsetDateTime::parse(lease_until, &Rfc3339)
+                .map_err(|_| "invalid lease_until".to_owned())?;
+            Ok(Accepted {
+                request_id: request_id.clone(),
+                link_id: link_id.clone(),
+                arm_id: arm_id.clone(),
+                generation: *generation,
+                route: route.clone(),
+                lease_until,
+            })
+        }
+        _ => Err("expected attach reply".to_owned()),
+    }
+}
+
+fn correlate_delivery(accepted: &Accepted, delivery: &WaiterLink) -> Result<(), String> {
+    let WaiterLink::DeliverEvents {
+        link_id,
+        arm_id,
+        generation,
+        route,
+        ..
+    } = delivery
+    else {
+        return Err("expected deliver_events".to_owned());
+    };
+    if link_id != &accepted.link_id
+        || arm_id != &accepted.arm_id
+        || *generation != accepted.generation
+        || route != &accepted.route
+    {
+        return Err("delivery authority mismatch".to_owned());
+    }
+    let _ = &accepted.request_id;
+    Ok(())
+}
+
+fn remaining_lease(lease_until: OffsetDateTime, now: OffsetDateTime) -> Duration {
+    if lease_until <= now {
+        return Duration::from_millis(1);
+    }
+    let nanos = (lease_until - now).whole_nanoseconds();
+    match u64::try_from(nanos.max(0)) {
+        Ok(0) | Err(_) => Duration::from_millis(1),
+        Ok(value) => Duration::from_nanos(value),
+    }
 }
 
 fn attach_request(spec: &AttachSpec) -> WaiterLink {
@@ -95,33 +228,139 @@ pub fn render_attach_receipt(delivery: &WaiterLink) -> String {
             newest_event_ref,
             events,
             ..
-        } => format!(
-            "waiter_completed: true\nwait_outcome: matched\nturn_started: unknown\ndelivery_id: {delivery_id}\nnewest_observed: {newest_event_ref}\nevent_count: {}\n",
-            events.len()
-        ),
+        } => {
+            let mut out = format!(
+                "waiter_completed: true\nwait_outcome: matched\nturn_started: unknown\ndelivery_id: {}\nnewest_observed: {}\nevent_count: {}\nuntrusted_provider_data:\n",
+                paste_field(delivery_id, MAX_ID),
+                paste_field(newest_event_ref, MAX_ID),
+                events.len()
+            );
+            for event in events {
+                let _ = write!(
+                    &mut out,
+                    "event_ref: {}\nbody: {}\n",
+                    paste_field(&event.event_ref, MAX_ID),
+                    paste_body(&event.body, MAX_BODY)
+                );
+            }
+            out
+        }
         _ => "waiter_completed: true\nwait_outcome: error\nturn_started: unknown\n".to_owned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachSpec, render_attach_receipt, run_attach_session};
+    use super::{
+        AttachSpec, correlate_accept, correlate_delivery, remaining_lease, render_attach_receipt,
+        run_attach_session_to,
+    };
     use gearwit_host::{
         DeliveryLedger, GearwitPaths, KnownArm, LinkTable, prepare_delivery, read_waiter_link,
         record_delivery_result, send_delivery, serve_attach,
     };
-    use gearwit_protocol::ProviderEvent;
+    use gearwit_protocol::{ProviderEvent, SCHEMA, WaiterLink};
+    use std::io::{self, Write};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
     use time::OffsetDateTime;
 
-    fn now() -> OffsetDateTime {
-        OffsetDateTime::parse(
-            "2026-01-15T12:05:00Z",
-            &time::format_description::well_known::Rfc3339,
-        )
-        .expect("now")
+    fn fixture_request() -> WaiterLink {
+        WaiterLink::AttachWaiter {
+            schema: SCHEMA.to_owned(),
+            request_id: "01J00000000000000000000040".to_owned(),
+            waiter_id: "01J00000000000000000000041".to_owned(),
+            arm_id: "01J00000000000000000000010".to_owned(),
+            generation: 1,
+            seat_id: "example-devrev".to_owned(),
+            route: "complete_background_tool".to_owned(),
+            observed_at: "2026-01-15T12:04:59Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn accept_and_delivery_must_match_request_authority() {
+        let request = fixture_request();
+        let mut accepted = WaiterLink::AttachAccepted {
+            schema: SCHEMA.to_owned(),
+            request_id: "01J00000000000000000000040".to_owned(),
+            link_id: "01J00000000000000000000042".to_owned(),
+            arm_id: "01J00000000000000000000010".to_owned(),
+            generation: 1,
+            route: "complete_background_tool".to_owned(),
+            accepted_at: "2026-01-15T12:05:00Z".to_owned(),
+            lease_until: "2026-01-15T12:15:00Z".to_owned(),
+        };
+        let ok = correlate_accept(&request, &accepted).expect("accept");
+        if let WaiterLink::AttachAccepted {
+            request_id, arm_id, ..
+        } = &mut accepted
+        {
+            *request_id = "01J00000000000000000000099".to_owned();
+            *arm_id = "01J00000000000000000000011".to_owned();
+        }
+        assert!(correlate_accept(&request, &accepted).is_err());
+        let delivery = WaiterLink::DeliverEvents {
+            schema: SCHEMA.to_owned(),
+            delivery_id: "01J00000000000000000000043".to_owned(),
+            link_id: "01J00000000000000000000042".to_owned(),
+            arm_id: "01J00000000000000000000010".to_owned(),
+            generation: 1,
+            signal_id: "01J00000000000000000000021".to_owned(),
+            route: "complete_background_tool".to_owned(),
+            events: vec![ProviderEvent {
+                provider: "mattermost".to_owned(),
+                event_ref: "post02".to_owned(),
+                actor: None,
+                observed_at: "2026-01-15T12:05:00Z".to_owned(),
+                body: "first bounded event".to_owned(),
+            }],
+            newest_event_ref: "post02".to_owned(),
+            attempted_at: "2026-01-15T12:05:02Z".to_owned(),
+        };
+        correlate_delivery(&ok, &delivery).expect("delivery");
+        let mut other = delivery.clone();
+        if let WaiterLink::DeliverEvents { link_id, .. } = &mut other {
+            *link_id = "01J00000000000000000000099".to_owned();
+        }
+        assert!(correlate_delivery(&ok, &other).is_err());
+    }
+
+    #[test]
+    fn remaining_lease_is_not_the_five_second_admission_timeout() {
+        let now = OffsetDateTime::now_utc();
+        let lease = now + time::Duration::milliseconds(40);
+        let wait = remaining_lease(lease, now);
+        assert!(wait > Duration::from_millis(5));
+        assert!(wait <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn receipt_includes_untrusted_bodies_and_not_turn() {
+        let delivery = WaiterLink::DeliverEvents {
+            schema: SCHEMA.to_owned(),
+            delivery_id: "01J00000000000000000000043".to_owned(),
+            link_id: "01J00000000000000000000042".to_owned(),
+            arm_id: "01J00000000000000000000010".to_owned(),
+            generation: 1,
+            signal_id: "01J00000000000000000000021".to_owned(),
+            route: "complete_background_tool".to_owned(),
+            events: vec![ProviderEvent {
+                provider: "mattermost".to_owned(),
+                event_ref: "post02".to_owned(),
+                actor: None,
+                observed_at: "2026-01-15T12:05:00Z".to_owned(),
+                body: "first bounded event".to_owned(),
+            }],
+            newest_event_ref: "post02".to_owned(),
+            attempted_at: "2026-01-15T12:05:02Z".to_owned(),
+        };
+        let receipt = render_attach_receipt(&delivery);
+        assert!(receipt.contains("untrusted_provider_data:"));
+        assert!(receipt.contains("body: first bounded event"));
+        assert!(receipt.contains("turn_started: unknown"));
+        assert!(receipt.find("untrusted_provider_data:").unwrap() < receipt.find("body:").unwrap());
     }
 
     #[test]
@@ -132,7 +371,7 @@ mod tests {
         let paths = GearwitPaths::from_root(root.clone()).expect("paths");
         let listener = paths.bind().expect("bind");
         let socket = paths.socket_path();
-        let instant = now();
+        let instant = OffsetDateTime::now_utc();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let stream = listener.accept().expect("accept");
@@ -173,12 +412,83 @@ mod tests {
             seat_id: "example-devrev".to_owned(),
             route: "complete_background_tool".to_owned(),
         };
-        let delivery = run_attach_session(&socket, &spec).expect("client");
-        let receipt = render_attach_receipt(&delivery);
-        assert!(receipt.contains("waiter_completed: true"));
+        let mut sink = Vec::new();
+        let delivery = run_attach_session_to(&socket, &spec, &mut sink).expect("client");
+        let receipt = String::from_utf8(sink).expect("utf8");
+        assert!(receipt.contains("body: first bounded event"));
         assert!(receipt.contains("turn_started: unknown"));
-        assert!(receipt.contains("wait_outcome: matched"));
+        assert!(render_attach_receipt(&delivery).contains("waiter_completed: true"));
         assert!(rx.recv_timeout(Duration::from_secs(2)).expect("server"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct FailWriter;
+
+    impl Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("sink failed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_failure_sends_return_failed() {
+        let root =
+            std::env::temp_dir().join(format!("gearwit-attach-{}-{}", std::process::id(), 2));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = OffsetDateTime::now_utc();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut table = LinkTable::default();
+            let arm = KnownArm {
+                arm_id: "01J00000000000000000000010".to_owned(),
+                generation: 1,
+                seat_id: "example-devrev".to_owned(),
+                route: "complete_background_tool".to_owned(),
+                coverage_until: instant + time::Duration::minutes(20),
+            };
+            let mut served = serve_attach(stream, &mut table, instant, &[arm]).expect("attach");
+            let link = table.current().expect("link").clone();
+            let mut ledger = DeliveryLedger::default();
+            let delivery = prepare_delivery(
+                &mut ledger,
+                &link,
+                "01J00000000000000000000021".to_owned(),
+                vec![ProviderEvent {
+                    provider: "mattermost".to_owned(),
+                    event_ref: "post02".to_owned(),
+                    actor: None,
+                    observed_at: "2026-01-15T12:05:00Z".to_owned(),
+                    body: "first bounded event".to_owned(),
+                }],
+                instant,
+            )
+            .expect("prepare");
+            send_delivery(&mut served.writer, &delivery).expect("send");
+            let result = read_waiter_link(&mut served.reader).expect("result");
+            record_delivery_result(&mut ledger, &result).expect("record");
+            let WaiterLink::DeliveryResult { outcome, .. } = result else {
+                panic!("result");
+            };
+            tx.send(outcome).expect("done");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let spec = AttachSpec {
+            arm_id: "01J00000000000000000000010".to_owned(),
+            generation: 1,
+            seat_id: "example-devrev".to_owned(),
+            route: "complete_background_tool".to_owned(),
+        };
+        let err = run_attach_session_to(&socket, &spec, FailWriter).expect_err("fail");
+        assert!(!err.is_empty());
+        let outcome = rx.recv_timeout(Duration::from_secs(2)).expect("server");
+        assert_eq!(outcome, "return_failed");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
