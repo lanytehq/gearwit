@@ -85,19 +85,27 @@ impl MintedAttachment {
 
 /// Result of preparing a dispatch under authority.
 ///
-/// Carries the `SignalAction` for native I/O. The authority lock is
-/// released after this is returned; the caller performs native I/O
-/// and then calls `conclude_dispatch` to re-enter authority.
-#[derive(Clone, Debug)]
+/// Opaque, non-Clone, single-use token. The authority lock is released
+/// after this is returned; the caller performs native I/O and then
+/// passes this by value back into `conclude_dispatch`. Duplicate
+/// conclusion is a durable authority invariant, not only move semantics.
+#[derive(Debug)]
 pub struct PreparedDispatch {
-    /// Attempt id for correlation.
-    pub attempt_id: String,
-    /// Signal id.
-    pub signal_id: String,
-    /// Action for native I/O.
+    attempt_id: String,
+    signal_id: String,
+    /// Action for native I/O — the only public field.
     pub action: SignalAction,
-    /// The minted attachment providing authority to dispatch.
-    pub attachment: MintedAttachment,
+    /// Opaque consumed marker — authority sets this on first conclusion.
+    consumed: bool,
+}
+
+impl PreparedDispatch {
+    /// The signal action for native I/O the caller must execute.
+    /// Only method accessible to callers outside the authority.
+    #[must_use]
+    pub fn action(&self) -> &SignalAction {
+        &self.action
+    }
 }
 
 /// Result of concluding a dispatch after native I/O and observations.
@@ -221,7 +229,9 @@ impl<P: Persist + Default> Default for DaemonAuthority<P> {
     }
 }
 
-/// Input for claim admission — all caller-supplied data.
+/// Input for claim admission — external identifiers and events only.
+/// Seat, capability route, and lease are derived from the registered
+/// `KnownArm` and host policy; callers do not supply them.
 #[derive(Clone, Debug)]
 pub struct ClaimRequest {
     /// Arm to resolve generation for.
@@ -232,12 +242,6 @@ pub struct ClaimRequest {
     pub signal_id: String,
     /// Bounded event batch.
     pub events: Vec<ProviderEvent>,
-    /// Seat token.
-    pub seat_id: String,
-    /// Capability route.
-    pub route: String,
-    /// Lease duration in minutes.
-    pub lease_minutes: i64,
 }
 
 impl<P: Persist> DaemonAuthority<P> {
@@ -336,13 +340,15 @@ impl<P: Persist> DaemonAuthority<P> {
         let minted_attachment = if is_replay {
             None
         } else {
-            let lease_until = self.now + time::Duration::minutes(req.lease_minutes);
+            // Derive lease from arm coverage_until (host policy),
+            // seat and route from registered arm.
+            let lease_until = arm.coverage_until;
             let attachment = MintedAttachment {
                 attempt_id: attempt_id.clone(),
                 arm_id: arm.arm_id.clone(),
                 generation: arm.generation,
-                seat_id: req.seat_id.clone(),
-                route: req.route.clone(),
+                seat_id: arm.seat_id.clone(),
+                route: arm.route.clone(),
                 lease_until,
                 verifier_ref: record.verifier_ref.clone(),
                 revoked: false,
@@ -416,8 +422,49 @@ impl<P: Persist> DaemonAuthority<P> {
             attempt_id: attachment.attempt_id.clone(),
             signal_id: claim.signal_id.clone(),
             action,
-            attachment: attachment.clone(),
+            consumed: false,
         })
+    }
+
+    /// Record lifecycle observations as durable transitions.
+    fn record_observations(
+        &mut self,
+        signal_id: &str,
+        attempt_id: &str,
+        observations: &[LifecycleObservation],
+    ) -> Result<(), DispatchError> {
+        for obs in observations {
+            match obs {
+                LifecycleObservation::TurnStarted(_) => {
+                    self.persist
+                        .record_transition(signal_id, attempt_id, Transition::ExactTurnStart)
+                        .map_err(|e| {
+                            DispatchError::PostSend(format!(
+                                "ExactTurnStart transition failed: {e:?}"
+                            ))
+                        })?;
+                }
+                LifecycleObservation::TurnTerminal(..) => {
+                    self.persist
+                        .record_transition(signal_id, attempt_id, Transition::ExactTurnTerminal)
+                        .map_err(|e| {
+                            DispatchError::PostSend(format!(
+                                "ExactTurnTerminal transition failed: {e:?}"
+                            ))
+                        })?;
+                }
+                LifecycleObservation::ControllerLost => {
+                    self.persist
+                        .record_transition(signal_id, attempt_id, Transition::ControllerLost)
+                        .map_err(|e| {
+                            DispatchError::PostSend(format!(
+                                "ControllerLost transition failed: {e:?}"
+                            ))
+                        })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Re-enter authority after native I/O: record the dispatch
@@ -432,13 +479,22 @@ impl<P: Persist> DaemonAuthority<P> {
     ///
     /// Returns `DispatchError::PostSend` when the disposition or
     /// observations cannot be persisted after native I/O.
+    /// Returns `DispatchError::PreSend` when the prepared token has
+    /// already been consumed — duplicate conclusion is a durable
+    /// authority invariant.
     pub fn conclude_dispatch(
         &mut self,
-        prepared: &PreparedDispatch,
+        mut prepared: PreparedDispatch,
         disposition: DispatchDisposition,
         observations: Vec<LifecycleObservation>,
     ) -> Result<DispatchConclusion, DispatchError> {
-        // 1. Record disposition
+        // 0. Reject already-consumed token (durable invariant)
+        if prepared.consumed {
+            return Err(DispatchError::PreSend(
+                "prepared token already consumed".to_owned(),
+            ));
+        }
+        prepared.consumed = true;
         self.persist
             .record_disposition(&prepared.attempt_id, &disposition)
             .map_err(|e| DispatchError::PostSend(format!("disposition write failed: {e:?}")))?;
@@ -485,53 +541,8 @@ impl<P: Persist> DaemonAuthority<P> {
                         DispatchError::PostSend(format!("NativeAccepted transition failed: {e:?}"))
                     })?;
 
-                // Record observations
-                for obs in &observations {
-                    match obs {
-                        LifecycleObservation::TurnStarted(_) => {
-                            self.persist
-                                .record_transition(
-                                    &prepared.signal_id,
-                                    &prepared.attempt_id,
-                                    Transition::ExactTurnStart,
-                                )
-                                .map_err(|e| {
-                                    DispatchError::PostSend(format!(
-                                        "ExactTurnStart transition failed: {e:?}"
-                                    ))
-                                })?;
-                        }
-                        LifecycleObservation::TurnTerminal(..) => {
-                            self.persist
-                                .record_transition(
-                                    &prepared.signal_id,
-                                    &prepared.attempt_id,
-                                    Transition::ExactTurnTerminal,
-                                )
-                                .map_err(|e| {
-                                    DispatchError::PostSend(format!(
-                                        "ExactTurnTerminal transition failed: {e:?}"
-                                    ))
-                                })?;
-                        }
-                        LifecycleObservation::ControllerLost => {
-                            // ControllerLost must persist for recovery awareness.
-                            // If it fails, the durable outcome is not lost but
-                            // recovery will see DispatchPrepared without conclusion.
-                            self.persist
-                                .record_transition(
-                                    &prepared.signal_id,
-                                    &prepared.attempt_id,
-                                    Transition::ControllerLost,
-                                )
-                                .map_err(|e| {
-                                    DispatchError::PostSend(format!(
-                                        "ControllerLost transition failed: {e:?}"
-                                    ))
-                                })?;
-                        }
-                    }
-                }
+                // Record observations via helper
+                self.record_observations(&prepared.signal_id, &prepared.attempt_id, &observations)?;
             }
         }
 
@@ -908,51 +919,24 @@ mod tests {
         auth
     }
 
-    fn claim_req(
-        arm_id: &str,
-        rid: &str,
-        sid: &str,
-        events: Vec<ProviderEvent>,
-        seat: &str,
-        route: &str,
-        lm: i64,
-    ) -> ClaimRequest {
+    fn claim_req(arm_id: &str, rid: &str, sid: &str, events: Vec<ProviderEvent>) -> ClaimRequest {
         ClaimRequest {
             arm_id: arm_id.to_owned(),
             request_id: rid.to_owned(),
             signal_id: sid.to_owned(),
             events,
-            seat_id: seat.to_owned(),
-            route: route.to_owned(),
-            lease_minutes: lm,
         }
     }
 
     fn std_req() -> ClaimRequest {
-        claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            vec![sample_event("hello")],
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        )
+        claim_req("arm-01", "req-1", "sig-1", vec![sample_event("hello")])
     }
 
     #[test]
     fn first_claim_admits_and_mints_attachment() {
         let mut auth = sample_authority();
         let ev = vec![sample_event("hello")];
-        let req = claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            ev,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req = claim_req("arm-01", "req-1", "sig-1", ev);
         let result = auth.admit_claim(&req).expect("admit");
         assert!(matches!(result.outcome, ClaimOutcome::Admitted));
         assert!(result.attachment.is_some());
@@ -970,15 +954,7 @@ mod tests {
     fn unknown_arm_rejects_claim() {
         let mut auth = sample_authority();
         let ev = vec![sample_event("hello")];
-        let req = claim_req(
-            "nonexistent",
-            "req-1",
-            "sig-1",
-            ev,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req = claim_req("nonexistent", "req-1", "sig-1", ev);
         let err = auth.admit_claim(&req).expect_err("unknown arm");
         assert!(matches!(err, AdmissionError::UnknownArm));
     }
@@ -987,26 +963,10 @@ mod tests {
     fn occupied_arm_rejects_second_claim() {
         let mut auth = sample_authority();
         let ev1 = vec![sample_event("hello")];
-        let req1 = claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            ev1,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req1 = claim_req("arm-01", "req-1", "sig-1", ev1);
         auth.admit_claim(&req1).expect("first");
         let ev2 = vec![sample_event("world")];
-        let req2 = claim_req(
-            "arm-01",
-            "req-2",
-            "sig-2",
-            ev2,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
         let err = auth.admit_claim(&req2).expect_err("occupied");
         assert!(matches!(err, AdmissionError::Occupied));
     }
@@ -1015,27 +975,11 @@ mod tests {
     fn exact_replay_returns_replay_without_attachment() {
         let mut auth = sample_authority();
         let ev = vec![sample_event("hello")];
-        let req = claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            ev.clone(),
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req = claim_req("arm-01", "req-1", "sig-1", ev.clone());
         let first = auth.admit_claim(&req).expect("first");
         assert!(first.attachment.is_some());
         assert!(matches!(first.outcome, ClaimOutcome::Admitted));
-        let req2 = claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            ev,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req2 = claim_req("arm-01", "req-1", "sig-1", ev);
         let replay = auth.admit_claim(&req2).expect("replay");
         assert!(matches!(replay.outcome, ClaimOutcome::Replay));
         assert!(
@@ -1049,15 +993,7 @@ mod tests {
     fn generation_advance_under_authority_produces_new_generation_claim() {
         let mut auth = sample_authority();
         let ev = vec![sample_event("hello")];
-        let req = claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            ev,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req = claim_req("arm-01", "req-1", "sig-1", ev);
         let first = auth.admit_claim(&req).expect("first");
         assert_eq!(first.claim.generation, 1);
 
@@ -1068,15 +1004,7 @@ mod tests {
         assert_eq!(new_gen, 2);
 
         let ev2 = vec![sample_event("world")];
-        let req2 = claim_req(
-            "arm-01",
-            "req-2",
-            "sig-2",
-            ev2,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
         let second = auth.admit_claim(&req2).expect("generation advanced");
         assert_eq!(second.claim.generation, 2);
         assert!(second.attachment.is_some());
@@ -1106,15 +1034,7 @@ mod tests {
 
         // Verify a new claim at gen 2 produces a fresh attachment.
         let ev2 = vec![sample_event("world")];
-        let req2 = claim_req(
-            "arm-01",
-            "req-2",
-            "sig-2",
-            ev2,
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
         let fresh = auth.admit_claim(&req2).expect("fresh claim at gen 2");
         assert_eq!(fresh.claim.generation, 2);
         assert!(fresh.attachment.is_some());
@@ -1132,15 +1052,7 @@ mod tests {
         };
         let mut auth = DaemonAuthority::new(backend.clone(), now);
         auth.register_arm(sample_arm());
-        let req = claim_req(
-            "arm-01",
-            "req-1",
-            "sig-1",
-            vec![sample_event("hello")],
-            "example-devrev",
-            "complete_background_tool",
-            20,
-        );
+        let req = claim_req("arm-01", "req-1", "sig-1", vec![sample_event("hello")]);
         let err = auth.admit_claim(&req).expect_err("storage failure");
         assert!(matches!(err, AdmissionError::Storage(_)));
 
@@ -1336,9 +1248,10 @@ mod tests {
         let prepared = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
+        let attempt_id = prepared.attempt_id.clone();
         let conclusion = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1352,9 +1265,7 @@ mod tests {
         assert!(!conclusion.controller_lost());
         assert_eq!(conclusion.observations.len(), 2);
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Terminal);
-        let ts = auth
-            .persist()
-            .get_transitions("sig-1", &prepared.attempt_id);
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
         assert!(ts.contains(&Transition::DispatchPrepared));
         assert!(ts.contains(&Transition::NativeAccepted));
         assert!(ts.contains(&Transition::ExactTurnStart));
@@ -1369,14 +1280,13 @@ mod tests {
         let prepared = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
+        let attempt_id = prepared.attempt_id.clone();
         let conclusion = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
+            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
             .expect("conclude");
         assert!(conclusion.reconciliation_required());
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Ambiguous);
-        let ts = auth
-            .persist()
-            .get_transitions("sig-1", &prepared.attempt_id);
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
         assert!(ts.contains(&Transition::ReconciliationRequired));
     }
 
@@ -1388,9 +1298,10 @@ mod tests {
         let prepared = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
+        let attempt_id = prepared.attempt_id.clone();
         let conclusion = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1399,9 +1310,7 @@ mod tests {
             .expect("conclude");
         assert!(conclusion.controller_lost());
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::ControllerLost);
-        let ts = auth
-            .persist()
-            .get_transitions("sig-1", &prepared.attempt_id);
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
         assert!(ts.contains(&Transition::ControllerLost));
     }
 
@@ -1414,7 +1323,7 @@ mod tests {
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let conclusion = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
+            .conclude_dispatch(prepared, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert!(!conclusion.reconciliation_required());
         assert!(conclusion.observations.is_empty());
@@ -1431,7 +1340,7 @@ mod tests {
             .expect("prepare");
         let conclusion = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1453,7 +1362,7 @@ mod tests {
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
+            .conclude_dispatch(prepared, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert_eq!(dc.durable_outcome(), DurableOutcome::Rejected);
 
@@ -1466,7 +1375,7 @@ mod tests {
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1484,7 +1393,7 @@ mod tests {
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1502,7 +1411,7 @@ mod tests {
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1523,7 +1432,7 @@ mod tests {
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1541,7 +1450,7 @@ mod tests {
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
+            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
             .expect("conclude");
         assert!(dc.reconciliation_required());
         assert_eq!(dc.durable_outcome(), DurableOutcome::Ambiguous);
@@ -1576,7 +1485,7 @@ mod tests {
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1607,7 +1516,7 @@ mod tests {
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1640,7 +1549,7 @@ mod tests {
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let conclusion = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
+            .conclude_dispatch(prepared, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Rejected);
 
@@ -1686,7 +1595,7 @@ mod tests {
             .expect("prepare");
         auth1
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
