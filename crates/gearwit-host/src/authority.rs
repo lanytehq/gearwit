@@ -495,9 +495,21 @@ impl<P: Persist> DaemonAuthority<P> {
             ));
         }
         prepared.consumed = true;
+
+        // 1. Atomically record disposition + first required transition
+        let first_transition = match &disposition {
+            DispatchDisposition::Accepted { .. } => Some(Transition::NativeAccepted),
+            DispatchDisposition::Ambiguous => Some(Transition::ReconciliationRequired),
+            DispatchDisposition::Rejected => None,
+        };
         self.persist
-            .record_disposition(&prepared.attempt_id, &disposition)
-            .map_err(|e| DispatchError::PostSend(format!("disposition write failed: {e:?}")))?;
+            .record_conclusion(
+                &prepared.attempt_id,
+                &prepared.signal_id,
+                &disposition,
+                first_transition,
+            )
+            .map_err(|e| DispatchError::PostSend(format!("conclusion write failed: {e:?}")))?;
 
         // 2. Record lifecycle transitions based on disposition
         match &disposition {
@@ -510,18 +522,6 @@ impl<P: Persist> DaemonAuthority<P> {
                 });
             }
             DispatchDisposition::Ambiguous => {
-                self.persist
-                    .record_transition(
-                        &prepared.signal_id,
-                        &prepared.attempt_id,
-                        Transition::ReconciliationRequired,
-                    )
-                    .map_err(|e| {
-                        DispatchError::PostSend(format!(
-                            "ReconciliationRequired transition failed: {e:?}"
-                        ))
-                    })?;
-
                 return Ok(DispatchConclusion {
                     disposition,
                     observations: Vec::new(),
@@ -530,17 +530,6 @@ impl<P: Persist> DaemonAuthority<P> {
                 });
             }
             DispatchDisposition::Accepted { .. } => {
-                // NativeAccepted
-                self.persist
-                    .record_transition(
-                        &prepared.signal_id,
-                        &prepared.attempt_id,
-                        Transition::NativeAccepted,
-                    )
-                    .map_err(|e| {
-                        DispatchError::PostSend(format!("NativeAccepted transition failed: {e:?}"))
-                    })?;
-
                 // Record observations via helper
                 self.record_observations(&prepared.signal_id, &prepared.attempt_id, &observations)?;
             }

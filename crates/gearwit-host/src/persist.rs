@@ -245,6 +245,27 @@ pub trait Persist {
     /// Returns [`ClaimError::StorageFailure`] when the backend is
     /// unavailable or corrupt.
     fn recover(&mut self) -> Result<RecoverySnapshot, ClaimError>;
+
+    /// Atomically record a dispatch conclusion: disposition plus the
+    /// first required post-send transition in one semantic commit.
+    ///
+    /// For `Accepted`, this is disposition + `NativeAccepted`.
+    /// For `Ambiguous`, this is disposition + `ReconciliationRequired`.
+    /// For `Rejected`, this is disposition only (no transition needed).
+    /// Subsequent observation transitions are recorded separately via
+    /// `record_transition`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] if any part of the atomic
+    /// write fails.
+    fn record_conclusion(
+        &mut self,
+        attempt_id: &str,
+        signal_id: &str,
+        disposition: &crate::controller::DispatchDisposition,
+        first_transition: Option<Transition>,
+    ) -> Result<(), WaiterLinkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +467,22 @@ impl Persist for FakePersist {
         }
         self.dispositions
             .insert(attempt_id.to_owned(), disposition.clone());
+        Ok(())
+    }
+
+    fn record_conclusion(
+        &mut self,
+        attempt_id: &str,
+        signal_id: &str,
+        disposition: &crate::controller::DispatchDisposition,
+        first_transition: Option<Transition>,
+    ) -> Result<(), WaiterLinkError> {
+        // First write disposition — if this fails, the whole conclusion fails.
+        self.record_disposition(attempt_id, disposition)?;
+        // Then write the first transition if required.
+        if let Some(transition) = first_transition {
+            self.record_transition(signal_id, attempt_id, transition)?;
+        }
         Ok(())
     }
 
