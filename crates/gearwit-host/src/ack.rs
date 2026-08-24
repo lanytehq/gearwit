@@ -404,6 +404,7 @@ fn format_time(instant: OffsetDateTime) -> String {
 mod tests {
     use super::{AckStore, apply_handled_request, rearm_from_handled, record_handled};
     use crate::admit::KnownArm;
+    use crate::controller::ManagedCapability;
     use gearwit_protocol::{HANDLED_SCHEMA, HandledCursor, parse_handled_cursor};
     use time::format_description::well_known::Rfc3339;
     use time::{Duration, OffsetDateTime};
@@ -418,6 +419,7 @@ mod tests {
             generation: 1,
             seat_id: "example-devrev".to_owned(),
             route: "complete_background_tool".to_owned(),
+            capability: ManagedCapability::ManagedTurnStart,
             coverage_until: now() + Duration::minutes(20),
         }
     }

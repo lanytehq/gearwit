@@ -18,8 +18,8 @@ use crate::wait_on::{
 use gearwit_domain::DeliveryRoute;
 use gearwit_host::{
     AckRearm, AckStore, AdmittedLink, DeliveryAttempt, DeliveryLedger, GearwitPaths, KnownArm,
-    LinkError, LinkSession, LinkTable, ServeAttach, commit_prepared_attach, drop_session,
-    prepare_attach, prepare_delivery, read_incoming, read_waiter_link, record_ack,
+    LinkError, LinkSession, LinkTable, ManagedCapability, ServeAttach, commit_prepared_attach,
+    drop_session, prepare_attach, prepare_delivery, read_incoming, read_waiter_link, record_ack,
     record_delivery_result, redeliver_pending, send_delivery, split_stream, write_handled,
     write_prepared_attach,
 };
@@ -1016,6 +1016,7 @@ fn bind_runtime() -> Result<(gearwit_host::BoundListener, std::path::PathBuf, Kn
         generation: 1,
         seat_id: seat_id(),
         route: DeliveryRoute::CompleteBackgroundTool.as_str().to_owned(),
+        capability: ManagedCapability::ManagedTurnStart,
         coverage_until: now + time::Duration::minutes(20),
     };
     eprintln!(
@@ -1222,7 +1223,7 @@ mod tests {
     use crate::wait_on::{DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitResult};
     use gearwit_host::{
         AckRearm, AckStore, DeliveryAttempt, GearwitPaths, KnownArm, LinkSession, LinkTable,
-        admit_attach,
+        ManagedCapability, admit_attach,
     };
     use gearwit_protocol::{ProviderEvent, SCHEMA, WaiterLink, parse_waiter_link};
     use std::path::PathBuf;
@@ -1244,6 +1245,7 @@ mod tests {
             generation: 1,
             seat_id: "example-devrev".to_owned(),
             route: "complete_background_tool".to_owned(),
+            capability: ManagedCapability::ManagedTurnStart,
             coverage_until: now() + TimeDuration::minutes(20),
         }
     }

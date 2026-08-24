@@ -1,40 +1,41 @@
 //! Daemon authority: single-writer exclusive &mut self boundary for
-//! claim admission, dispatch orchestration, and recovery.
+//! claim admission, dispatch orchestration, split-phase reconciliation,
+//! and recovery.
 //!
 //! `DaemonAuthority<P>` owns the live arm/generation registry, the
 //! long-lived `Persist` store, claim/attempt state, and attachment
 //! verifier/lease/revocation state. Callers supply only claim requests
 //! and events; they never supply arm, generation, attempt id, store,
-//! or attachment.
-//!
-//! Generation mutations — including handled-cursor re-arm — occur
-//! behind the same exclusive `&mut self` boundary.
+//! or attachment. Every authority-bearing mutation is durable: state in
+//! RAM changes only after the persistence port confirms the write.
 //!
 //! Crucible v0 contracts are preserved; this module does not alter
 //! merged schemas.
 
+use crate::admit::KnownArm;
 use crate::controller::{
-    Controller, ControllerAttachment, ControllerCommand, DispatchDisposition, LifecycleObservation,
-    ReconciliationDisposition, SignalAction,
+    ControllerAttachment, ControllerCommand, DispatchDisposition, LifecycleObservation,
+    ManagedCapability, ReconciliationDisposition, SignalAction,
 };
 use crate::persist::{
-    ClaimError, ClaimOutcome, DurableClaim, Persist, ReconciliationState, Transition,
+    ClaimError, ClaimOutcome, DurableClaim, Persist, PersistedArm, PersistedAttachment,
+    ReconciliationState, RecoverySnapshot, Transition,
 };
-use crate::{KnownArm, RecoverySnapshot};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
 // -- Minted attachment --------------------------------------------------
 
 /// Host-minted controller attachment bound to exact seat, arm,
-/// generation, managed-turn capability, route, attempt, controller/
-/// verifier reference, revocation state, and unexpired lease.
+/// generation, capability, route, attempt, controller/verifier
+/// reference, revocation state, and unexpired lease.
 ///
 /// Fields are private — callers cannot mutate dimensions
-/// independently. Lease, seat, and route are derived from
-/// authority policy at mint time via `ClaimRequest`. The
-/// attachment is validated by dispatch preparation against the
-/// complete stored authority record, not only the verifier ref.
+/// independently and cannot construct attachments. Lease, seat, route,
+/// and capability are derived from authority policy at mint time via
+/// `ClaimRequest` + registered `KnownArm`. The attachment is validated
+/// by dispatch preparation against the complete stored authority
+/// record, not only the verifier ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MintedAttachment {
     attempt_id: String,
@@ -42,9 +43,26 @@ pub struct MintedAttachment {
     generation: u64,
     seat_id: String,
     route: String,
+    capability: ManagedCapability,
     lease_until: OffsetDateTime,
     verifier_ref: String,
     revoked: bool,
+}
+
+impl From<&PersistedAttachment> for MintedAttachment {
+    fn from(a: &PersistedAttachment) -> Self {
+        Self {
+            attempt_id: a.attempt_id.clone(),
+            arm_id: a.arm_id.clone(),
+            generation: a.generation,
+            seat_id: a.seat_id.clone(),
+            route: a.route.clone(),
+            capability: a.capability,
+            lease_until: a.lease_until,
+            verifier_ref: a.verifier_ref.clone(),
+            revoked: a.revoked,
+        }
+    }
 }
 
 impl MintedAttachment {
@@ -66,10 +84,40 @@ impl MintedAttachment {
         self.generation
     }
 
+    /// The seat token.
+    #[must_use]
+    pub fn seat_id(&self) -> &str {
+        &self.seat_id
+    }
+
+    /// The capability route.
+    #[must_use]
+    pub fn route(&self) -> &str {
+        &self.route
+    }
+
+    /// The closed capability granted.
+    #[must_use]
+    pub fn capability(&self) -> ManagedCapability {
+        self.capability
+    }
+
+    /// The lease end.
+    #[must_use]
+    pub fn lease_until(&self) -> OffsetDateTime {
+        self.lease_until
+    }
+
     /// The opaque verifier reference for recovery.
     #[must_use]
     pub fn verifier_ref(&self) -> &str {
         &self.verifier_ref
+    }
+
+    /// Whether this attachment is revoked.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked
     }
 
     /// Whether this attachment is still valid (not revoked, not expired).
@@ -77,28 +125,42 @@ impl MintedAttachment {
     pub fn is_valid(&self, now: OffsetDateTime) -> bool {
         !self.revoked && self.lease_until > now
     }
-
-    /// Revoke this attachment.
-    pub fn revoke(&mut self) {
-        self.revoked = true;
-    }
 }
 
 // -- Dispatch state machine layers --------------------------------------
 
 /// Result of preparing a dispatch under authority.
 ///
-/// Opaque, non-Clone, single-use token. All fields are private — callers
-/// cannot inspect or mutate any dimension. The authority emits a separate
-/// `ControllerCommand` for phase 2; this token is only consumed in phase 4
-/// by `conclude_dispatch`.
+/// Opaque, non-Clone, single-use token consumed by value in phase 4 by
+/// `conclude_dispatch`. The authority emits a separate sealed
+/// `ControllerCommand` for phase 2; this token cannot be inspected or
+/// replayed.
 #[derive(Debug)]
 pub struct PreparedDispatch {
     attempt_id: String,
     signal_id: String,
 }
 
-impl PreparedDispatch {}
+/// Opaque, non-Clone handle to an admitted claim.
+///
+/// Minted at admission under authority; consumed by value at
+/// `prepare_dispatch`. Fields are private — the authority rehydrates
+/// and verifies the full claim identity (signal, request, body batch)
+/// from its own stored state at prepare time, never from
+/// caller-carried data.
+#[derive(Debug)]
+pub struct AdmissionReceipt {
+    attempt_id: String,
+    claim: DurableClaim,
+}
+
+impl AdmissionReceipt {
+    /// The opaque attempt id.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+}
 
 /// Result of concluding a dispatch after native I/O and observations.
 ///
@@ -183,10 +245,28 @@ pub enum DurableOutcome {
     ControllerLost,
 }
 
+/// Opaque reconciliation work produced by the authority before the
+/// provider probe. Fields are private; `commit_reconciliation`
+/// consumes it by value after the provider probe completes outside
+/// the authority.
+#[derive(Debug)]
+pub struct ReconciliationWork {
+    attempt_id: String,
+    signal_id: String,
+}
+
+impl ReconciliationWork {
+    /// The attempt id, for the provider probe.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+}
+
 // -- DaemonAuthority ----------------------------------------------------
 
 /// Single-writer daemon authority for claim admission, dispatch
-/// orchestration, and recovery.
+/// orchestration, split-phase reconciliation, and recovery.
 ///
 /// Type parameter `P` is the persistence backend. The authority owns
 /// the live arm registry, the store, and all claim/attempt state.
@@ -197,9 +277,11 @@ pub struct DaemonAuthority<P: Persist> {
     arms: BTreeMap<String, KnownArm>,
     /// Minted attachments keyed by `attempt_id`.
     attachments: BTreeMap<String, MintedAttachment>,
+    /// Admitted durable claims keyed by `attempt_id` (rehydration source).
+    admitted_claims: BTreeMap<String, DurableClaim>,
     /// Current time source (injectable for tests).
     now: OffsetDateTime,
-    /// Monotonic attempt counter.
+    /// Monotonic attempt counter — the authority mints attempt ids.
     attempt_seq: u64,
     /// Handled cursor position per `arm_id`.
     handled_cursors: BTreeMap<String, String>,
@@ -213,6 +295,7 @@ impl<P: Persist + Default> Default for DaemonAuthority<P> {
             persist: P::default(),
             arms: BTreeMap::new(),
             attachments: BTreeMap::new(),
+            admitted_claims: BTreeMap::new(),
             now: OffsetDateTime::now_utc(),
             attempt_seq: 0,
             handled_cursors: BTreeMap::new(),
@@ -233,7 +316,7 @@ pub struct ClaimRequest {
     /// Stable signal id.
     pub signal_id: String,
     /// Bounded event batch.
-    pub events: Vec<ProviderEvent>,
+    pub events: Vec<gearwit_protocol::ProviderEvent>,
 }
 
 impl<P: Persist> DaemonAuthority<P> {
@@ -245,6 +328,7 @@ impl<P: Persist> DaemonAuthority<P> {
             persist,
             arms: BTreeMap::new(),
             attachments: BTreeMap::new(),
+            admitted_claims: BTreeMap::new(),
             now,
             attempt_seq: 0,
             handled_cursors: BTreeMap::new(),
@@ -252,31 +336,68 @@ impl<P: Persist> DaemonAuthority<P> {
         }
     }
 
-    /// Register a known arm.
-    pub fn register_arm(&mut self, arm: KnownArm) {
+    /// Register a known arm. Full arm policy is durably persisted before
+    /// the live registry is updated; on storage failure the live state is
+    /// unchanged (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdmissionError::Storage` when the arm policy cannot be
+    /// persisted.
+    pub fn register_arm(&mut self, arm: KnownArm) -> Result<(), AdmissionError> {
+        self.persist
+            .persist_arm_state(&PersistedArm {
+                arm_id: arm.arm_id.clone(),
+                generation: arm.generation,
+                seat_id: arm.seat_id.clone(),
+                route: arm.route.clone(),
+                capability: arm.capability,
+                coverage_until: arm.coverage_until,
+            })
+            .map_err(|e| AdmissionError::Storage(format!("persist_arm_state failed: {e:?}")))?;
         self.arms.insert(arm.arm_id.clone(), arm);
+        Ok(())
     }
 
     /// Advance generation for an arm — the production re-arm path.
     ///
-    /// Bumps the arm's generation by 1, invalidating all previously minted
-    /// attachments that carry the old generation. Persists the new state.
-    /// Returns the new generation.
+    /// Persists the full arm policy at the new generation before the
+    /// live generation changes; on storage failure or overflow the live
+    /// generation is unchanged (fail closed). Returns the new generation.
     ///
     /// # Errors
     ///
-    /// Returns `AdmissionError::UnknownArm` when the arm is not registered.
+    /// Returns `AdmissionError::UnknownArm` when the arm is not
+    /// registered, `AdmissionError::GenerationOverflow` on checked
+    /// increment overflow, and `AdmissionError::Storage` when the new
+    /// policy cannot be persisted.
     pub fn advance_generation(&mut self, arm_id: &str) -> Result<u64, AdmissionError> {
         let arm = self
             .arms
+            .get(arm_id)
+            .cloned()
+            .ok_or(AdmissionError::UnknownArm)?;
+        let new_generation = arm
+            .generation
+            .checked_add(1)
+            .ok_or(AdmissionError::GenerationOverflow)?;
+        self.persist
+            .persist_arm_state(&PersistedArm {
+                arm_id: arm.arm_id.clone(),
+                generation: new_generation,
+                seat_id: arm.seat_id.clone(),
+                route: arm.route.clone(),
+                capability: arm.capability,
+                coverage_until: arm.coverage_until,
+            })
+            .map_err(|e| AdmissionError::Storage(format!("persist_arm_state failed: {e:?}")))?;
+        // RAM mutation only after the durable write succeeded.
+        let live = self
+            .arms
             .get_mut(arm_id)
             .ok_or(AdmissionError::UnknownArm)?;
-        arm.generation += 1;
-        let arm_gen = arm.generation;
-        self.persist
-            .persist_arm_state(arm_id, arm_gen)
-            .map_err(|e| AdmissionError::Storage(format!("persist_arm_state failed: {e:?}")))?;
-        Ok(arm_gen)
+        live.generation = new_generation;
+        Ok(new_generation)
     }
 
     /// Current time (injectable for tests).
@@ -290,25 +411,102 @@ impl<P: Persist> DaemonAuthority<P> {
         self.now = now;
     }
 
-    // -- Claim admission --------------------------------------------------
-
-    /// Atomically resolve arm generation, durably admit the claim
-    /// (including `ClaimRecorded` transition as one atomic operation),
-    /// and mint a controller attachment — all under the exclusive
-    /// `&mut self` authority boundary.
+    /// Record a handled cursor for an arm. Persisted before the live
+    /// cursor changes; fail closed on storage failure.
     ///
     /// # Errors
     ///
-    /// Returns `AdmissionError` when the arm is unknown, generation is
-    /// stale, claim is occupied, storage fails, or `ClaimRecorded` cannot
-    /// be persisted.
+    /// Returns `AdmissionError::Storage` when persistence fails.
+    pub fn record_handled_cursor(
+        &mut self,
+        arm_id: &str,
+        cursor: &str,
+    ) -> Result<(), AdmissionError> {
+        self.persist
+            .persist_handled_cursor(arm_id, cursor)
+            .map_err(|e| {
+                AdmissionError::Storage(format!("persist_handled_cursor failed: {e:?}"))
+            })?;
+        self.handled_cursors
+            .insert(arm_id.to_owned(), cursor.to_owned());
+        Ok(())
+    }
+
+    /// Mark an arm as re-armed. Persisted before the live flag changes;
+    /// fail closed on storage failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdmissionError::Storage` when persistence fails.
+    pub fn set_rearmed(&mut self, arm_id: &str) -> Result<(), AdmissionError> {
+        self.persist
+            .persist_rearmed(arm_id)
+            .map_err(|e| AdmissionError::Storage(format!("persist_rearmed failed: {e:?}")))?;
+        self.rearm_positions.insert(arm_id.to_owned(), true);
+        Ok(())
+    }
+
+    /// Revoke an attachment by `attempt_id`. Persisted before the live
+    /// flag changes; fail closed on storage failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DispatchError::PreSend` when persistence fails.
+    /// Returns `Ok(false)` when no attachment is found for the attempt.
+    pub fn revoke_attachment(&mut self, attempt_id: &str) -> Result<bool, DispatchError> {
+        if !self.attachments.contains_key(attempt_id) {
+            return Ok(false);
+        }
+        self.persist
+            .persist_attachment_revoked(attempt_id)
+            .map_err(|e| {
+                DispatchError::PreSend(format!("persist_attachment_revoked failed: {e:?}"))
+            })?;
+        let att = self
+            .attachments
+            .get_mut(attempt_id)
+            .ok_or_else(|| DispatchError::PreSend("attachment vanished mid-revoke".to_owned()))?;
+        att.revoked = true;
+        Ok(true)
+    }
+
+    /// Access the inner persistence for tests.
+    #[must_use]
+    pub fn persist(&self) -> &P {
+        &self.persist
+    }
+
+    /// Mutable access to persistence for tests.
+    pub fn persist_mut(&mut self) -> &mut P {
+        &mut self.persist
+    }
+
+    /// Look up a minted attachment by `attempt_id`.
+    #[must_use]
+    pub fn get_attachment(&self, attempt_id: &str) -> Option<&MintedAttachment> {
+        self.attachments.get(attempt_id)
+    }
+
+    // -- Claim admission --------------------------------------------------
+
+    /// Atomically resolve arm generation, durably admit the claim
+    /// (including the authority-minted attempt id, attachment, exact
+    /// attempt→signal binding, verifier ref, and `ClaimRecorded`
+    /// transition as one atomic operation), and return an opaque
+    /// admission receipt — all under the exclusive `&mut self`
+    /// authority boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdmissionError` when the arm is unknown, the claim is
+    /// occupied, storage fails, or the attempt counter overflows.
     pub fn admit_claim(&mut self, req: &ClaimRequest) -> Result<AdmissionResult, AdmissionError> {
         // 1. Resolve arm under authority
         let arm = self
             .arms
             .get(&req.arm_id)
-            .ok_or(AdmissionError::UnknownArm)?
-            .clone();
+            .cloned()
+            .ok_or(AdmissionError::UnknownArm)?;
 
         // 2. Build durable claim
         let event_refs: Vec<String> = req.events.iter().map(|e| e.event_ref.clone()).collect();
@@ -322,123 +520,212 @@ impl<P: Persist> DaemonAuthority<P> {
             claimed_at: self.now,
         };
 
-        // 3. Atomically admit claim + ClaimRecorded + attempt + verifier
-        let record = self.persist.admit_claim(&claim).map_err(|e| match e {
-            ClaimError::OccupiedDifferent | ClaimError::StaleGeneration => AdmissionError::Occupied,
-            ClaimError::Conflict => AdmissionError::Conflict,
-            ClaimError::StorageFailure(msg) => AdmissionError::Storage(msg),
-        })?;
-
-        let attempt_id = record.attempt_id.clone();
-        let is_replay = matches!(record.outcome, ClaimOutcome::Replay);
-
-        // 4. Mint attachment (only for new claims — replay gets no
-        //    dispatch-capable attachment per cxotech ruling).
-        let minted_attachment = if is_replay {
-            None
-        } else {
-            // Derive lease from arm coverage_until (host policy),
-            // seat and route from registered arm.
-            let lease_until = arm.coverage_until;
-            let attachment = MintedAttachment {
-                attempt_id: attempt_id.clone(),
-                arm_id: arm.arm_id.clone(),
-                generation: arm.generation,
-                seat_id: arm.seat_id.clone(),
-                route: arm.route.clone(),
-                lease_until,
-                verifier_ref: record.verifier_ref.clone(),
-                revoked: false,
-            };
-            self.attachments
-                .insert(attempt_id.clone(), attachment.clone());
-            // Sync attempt_seq past the backend-minted id
-            self.attempt_seq = self.attempt_seq.max(
-                attempt_id
-                    .strip_prefix("attempt-")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(self.attempt_seq),
-            );
-            Some(attachment)
+        // 3. Authority mints attempt identity and attachment; the backend
+        //    records everything atomically (or replays).
+        let seq = self
+            .attempt_seq
+            .checked_add(1)
+            .ok_or(AdmissionError::GenerationOverflow)?;
+        let attempt_id = format!("attempt-{seq}");
+        let verifier_ref = format!("vrf:{attempt_id}:{}", ulid::Ulid::new());
+        let pending_attachment = PersistedAttachment {
+            attempt_id: attempt_id.clone(),
+            arm_id: arm.arm_id.clone(),
+            generation: arm.generation,
+            seat_id: arm.seat_id.clone(),
+            route: arm.route.clone(),
+            capability: arm.capability,
+            lease_until: arm.coverage_until,
+            verifier_ref: verifier_ref.clone(),
+            revoked: false,
         };
 
-        // 5. Return result
-        let claim_ref = ClaimedSignal {
-            arm_id: claim.arm_id.clone(),
-            generation: claim.generation,
-            signal_id: claim.signal_id.clone(),
-            request_id: claim.request_id.clone(),
-            event_refs: claim.event_refs.clone(),
-            events: claim.events.clone(),
-        };
+        let record = self
+            .persist
+            .admit_claim(&claim, Some(&pending_attachment))
+            .map_err(|e| match e {
+                ClaimError::OccupiedDifferent | ClaimError::StaleGeneration => {
+                    AdmissionError::Occupied
+                }
+                ClaimError::Conflict => AdmissionError::Conflict,
+                ClaimError::StorageFailure(msg) => AdmissionError::Storage(msg),
+            })?;
 
+        // 4. Replay: no dispatch state, no receipt; restore the burned
+        //    attempt counter slot to the recorded value.
+        if matches!(record.outcome, ClaimOutcome::Replay) {
+            if let Some(seq) = record
+                .attempt_id
+                .strip_prefix("attempt-")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                self.attempt_seq = seq;
+            }
+            return Ok(AdmissionResult {
+                outcome: record.outcome,
+                attempt_id: record.attempt_id,
+                receipt: None,
+            });
+        }
+
+        // 5. Authoritative admission: commit the minted counter slot and
+        //    install live state only after the durable admission succeeded.
+        self.attempt_seq = seq;
+        self.attachments.insert(
+            pending_attachment.attempt_id.clone(),
+            MintedAttachment::from(&pending_attachment),
+        );
+        self.admitted_claims
+            .insert(pending_attachment.attempt_id.clone(), claim.clone());
+
+        let receipt = AdmissionReceipt {
+            attempt_id: pending_attachment.attempt_id.clone(),
+            claim: claim.clone(),
+        };
         Ok(AdmissionResult {
             outcome: record.outcome,
-            claim: claim_ref,
-            attachment: minted_attachment,
-            attempt_id,
+            attempt_id: record.attempt_id,
+            receipt: Some(receipt),
         })
     }
 
     // -- Dispatch preparation --------------------------------------------
 
-    /// Prepare a dispatch: validate the minted attachment, durably
-    /// record `DispatchPrepared`, and return both an opaque
-    /// `PreparedDispatch` (for phase 4 conclusion) and a
-    /// `ControllerCommand` (authority-produced bounded work for
-    /// phase 2 native I/O). The authority lock is released after
-    /// this call.
+    /// Prepare a dispatch: rehydrate the admitted claim and minted
+    /// attachment from stored authority state, validate every
+    /// dimension against the live arm policy, durably record
+    /// `DispatchPrepared` + the prepared marker atomically, and return
+    /// a sealed `ControllerCommand` (authority-produced bounded work
+    /// for phase 2 native I/O) plus the opaque `PreparedDispatch`
+    /// token for phase 4. The authority lock is released after this
+    /// call.
     ///
     /// # Errors
     ///
-    /// Returns `DispatchError::PreSend` when the attachment is invalid
-    /// or preparation cannot be persisted. The controller is never
-    /// called in this case.
+    /// Returns `DispatchError::PreSend` when rehydration, validation,
+    /// or persistence fails. The controller is never called in this
+    /// case.
+    // By-value consumption is deliberate: the receipt is a single-use
+    // admission ticket; a second prepare with the same receipt is
+    // impossible by construction.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn prepare_dispatch(
         &mut self,
-        claim: &ClaimedSignal,
-        attachment: &MintedAttachment,
+        receipt: AdmissionReceipt,
     ) -> Result<(PreparedDispatch, ControllerCommand), DispatchError> {
-        // 1. Validate attachment against authority state
-        self.validate_attachment(attachment, claim)?;
+        // 1. Rehydrate stored claim and stored attachment under authority;
+        //    never trust caller-carried dimensions.
+        let stored_claim = self
+            .admitted_claims
+            .get(&receipt.attempt_id)
+            .ok_or_else(|| {
+                DispatchError::PreSend("no admitted claim for this attempt".to_owned())
+            })?;
+        let stored_attachment = self.attachments.get(&receipt.attempt_id).ok_or_else(|| {
+            DispatchError::PreSend("attachment not minted by this authority".to_owned())
+        })?;
 
-        // 2. Record DispatchPrepared durably
-        self.persist
-            .record_transition(
-                &claim.signal_id,
-                &attachment.attempt_id,
-                Transition::DispatchPrepared,
-            )
-            .map_err(|e| DispatchError::PreSend(format!("DispatchPrepared failed: {e:?}")))?;
+        // 2. Verify receipt identity against the in-memory authority
+        //    record — exact signal/request/body identity.
+        if !receipt.claim.content_eq(stored_claim) {
+            return Err(DispatchError::PreSend(
+                "claim identity does not match stored claim".to_owned(),
+            ));
+        }
 
-        // 3. Record the prepared attempt as durably pending
+        // 2b. Verify against the durable backend record — the stored
+        //     state of record for rehydration. A backend divergence
+        //     fails closed.
+        let durable = self
+            .persist
+            .claim_for_attempt(&receipt.attempt_id)
+            .map_err(|e| DispatchError::PreSend(format!("durable claim lookup failed: {e:?}")))?
+            .ok_or_else(|| {
+                DispatchError::PreSend("no durable claim for this attempt".to_owned())
+            })?;
+        if !receipt.claim.content_eq(&durable) {
+            return Err(DispatchError::PreSend(
+                "claim identity does not match stored claim".to_owned(),
+            ));
+        }
+        if durable.events.is_empty() {
+            return Err(DispatchError::PreSend("empty event batch".to_owned()));
+        }
+
+        // 3. Validate the closed capability independently: the recorded
+        //    route must parse back to the recorded capability.
+        if ManagedCapability::parse(&stored_attachment.route) != Some(stored_attachment.capability)
+        {
+            return Err(DispatchError::PreSend(
+                "route does not parse to the granted capability".to_owned(),
+            ));
+        }
+
+        // 4. Validate against the registered arm policy.
+        let arm = self.arms.get(&receipt.claim.arm_id).ok_or_else(|| {
+            DispatchError::PreSend("arm not registered by this authority".to_owned())
+        })?;
+        if stored_attachment.generation != arm.generation {
+            return Err(DispatchError::PreSend(
+                "attachment generation is stale — arm has been re-armed".to_owned(),
+            ));
+        }
+        if stored_attachment.seat_id != arm.seat_id {
+            return Err(DispatchError::PreSend(
+                "seat_id mismatch with arm".to_owned(),
+            ));
+        }
+        if stored_attachment.route != arm.route {
+            return Err(DispatchError::PreSend("route mismatch with arm".to_owned()));
+        }
+        if stored_attachment.capability != arm.capability {
+            return Err(DispatchError::PreSend(
+                "capability mismatch with arm".to_owned(),
+            ));
+        }
+
+        // 5. Lease and revocation against authority state.
+        if stored_attachment.revoked {
+            return Err(DispatchError::PreSend("attachment is revoked".to_owned()));
+        }
+        if stored_attachment.lease_until <= self.now {
+            return Err(DispatchError::PreSend(
+                "attachment lease expired".to_owned(),
+            ));
+        }
+
+        // 6. Atomic durable prepare: DispatchPrepared + prepared marker,
+        //    bound-checked against the exact persisted attempt→signal
+        //    binding.
         self.persist
-            .record_prepared(&attachment.attempt_id)
+            .record_prepared(&durable.signal_id, &stored_attachment.attempt_id)
             .map_err(|e| DispatchError::PreSend(format!("record_prepared failed: {e:?}")))?;
 
-        // 4. Build authority-produced controller command for phase 2
-        let cmd = ControllerCommand {
-            attachment: ControllerAttachment {
-                attempt_id: attachment.attempt_id.clone(),
-                arm_id: attachment.arm_id.clone(),
-                generation: attachment.generation,
-                seat_id: attachment.seat_id.clone(),
-                route: attachment.route.clone(),
-                lease_until: attachment.lease_until,
-            },
-            action: SignalAction {
-                signal_id: claim.signal_id.clone(),
-                provider: "mattermost".to_owned(),
-                event_count: claim.events.len(),
-            },
-            attempt_id: attachment.attempt_id.clone(),
-        };
+        // 7. Build the sealed authority-produced controller command,
+        //    rehydrated from the durable stored claim.
+        let cmd = ControllerCommand::new(
+            ControllerAttachment::new(
+                stored_attachment.attempt_id.clone(),
+                stored_attachment.arm_id.clone(),
+                stored_attachment.generation,
+                stored_attachment.seat_id.clone(),
+                stored_attachment.route.clone(),
+                stored_attachment.capability,
+                stored_attachment.lease_until,
+            ),
+            SignalAction::new(
+                durable.signal_id.clone(),
+                durable.events[0].provider.clone(),
+                durable.events.len(),
+            ),
+            stored_attachment.attempt_id.clone(),
+        );
 
-        // 5. Return opaque token for phase 4 + bounded controller command for phase 2
+        // 8. Return the opaque phase-4 token + sealed phase-2 command.
         Ok((
             PreparedDispatch {
-                attempt_id: attachment.attempt_id.clone(),
-                signal_id: claim.signal_id.clone(),
+                attempt_id: stored_attachment.attempt_id.clone(),
+                signal_id: durable.signal_id.clone(),
             },
             cmd,
         ))
@@ -485,28 +772,32 @@ impl<P: Persist> DaemonAuthority<P> {
         Ok(())
     }
 
-    /// Re-enter authority after native I/O: record the dispatch
-    /// disposition and polled observations.
+    /// Re-enter authority after native I/O: atomically record the
+    /// dispatch disposition, its first required transition, and the
+    /// durable consumption marker. The prepared token is consumed by
+    /// value — a second conclusion with the same token is impossible.
     ///
     /// Post-send failures return `DispatchError::PostSend` — a typed
     /// result distinct from `PreSend`, indicating the dispatch may
     /// have been accepted. Recovery derives reconciliation-required
-    /// from `DispatchPrepared` without a durable conclusion.
+    /// survivors from `DispatchPrepared` without a durable conclusion.
     ///
     /// # Errors
     ///
-    /// Returns `DispatchError::PostSend` when the disposition or
-    /// observations cannot be persisted after native I/O.
-    /// Returns `DispatchError::PreSend` when the prepared token has
-    /// already been concluded — duplicate conclusion is a durable
-    /// authority invariant checked against persisted state.
+    /// Returns `DispatchError::PostSend` when the atomic conclusion
+    /// cannot be persisted. Returns `DispatchError::PreSend` when the
+    /// attempt has already been consumed — duplicate conclusion is a
+    /// durable authority invariant checked against persisted state.
+    // By-value consumption is deliberate: the prepared token is
+    // single-use and durably consumed by the atomic conclusion.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn conclude_dispatch(
         &mut self,
-        prepared: &PreparedDispatch,
+        prepared: PreparedDispatch,
         disposition: DispatchDisposition,
         observations: Vec<LifecycleObservation>,
     ) -> Result<DispatchConclusion, DispatchError> {
-        // 0. Reject already-concluded attempts (durable invariant)
+        // 0. Reject already-consumed attempts (durable invariant)
         if self
             .persist
             .has_concluded(&prepared.attempt_id)
@@ -517,7 +808,8 @@ impl<P: Persist> DaemonAuthority<P> {
             ));
         }
 
-        // 1. Atomically record disposition + first required transition
+        // 1. One atomic conclusion: disposition + first transition +
+        //    durable consumption marker. Nothing is observable on failure.
         let first_transition = match &disposition {
             DispatchDisposition::Accepted { .. } => Some(Transition::NativeAccepted),
             DispatchDisposition::Ambiguous => Some(Transition::ReconciliationRequired),
@@ -532,12 +824,9 @@ impl<P: Persist> DaemonAuthority<P> {
             )
             .map_err(|e| DispatchError::PostSend(format!("conclusion write failed: {e:?}")))?;
 
-        // 2. Mark this attempt as durably concluded
-        self.persist
-            .record_concluded(&prepared.attempt_id)
-            .map_err(|e| DispatchError::PostSend(format!("record_concluded failed: {e:?}")))?;
-
-        // 2. Record lifecycle transitions based on disposition
+        // 2. Record lifecycle evidence based on disposition. A failure
+        //    here surfaces as missing evidence in recovery; the attempt
+        //    is already durably consumed (single consumption).
         match &disposition {
             DispatchDisposition::Rejected => {
                 return Ok(DispatchConclusion {
@@ -556,7 +845,7 @@ impl<P: Persist> DaemonAuthority<P> {
                 });
             }
             DispatchDisposition::Accepted { .. } => {
-                // Record observations via helper
+                // Record observations via helper (PostSend on failure)
                 self.record_observations(&prepared.signal_id, &prepared.attempt_id, &observations)?;
             }
         }
@@ -574,153 +863,91 @@ impl<P: Persist> DaemonAuthority<P> {
         })
     }
 
-    // -- Attachment validation -------------------------------------------
+    // -- Split-phase reconciliation --------------------------------------
 
-    /// Validate the complete stored attachment record against the caller-supplied
-    /// attachment. Every dimension is compared: `arm_id`, generation, `attempt_id`,
-    /// `seat_id`, route, `verifier_ref`, lease expiry, and revocation.
-    fn validate_attachment(
-        &self,
-        attachment: &MintedAttachment,
-        claim: &ClaimedSignal,
-    ) -> Result<(), DispatchError> {
-        // Verify attachment was minted by this authority
-        let stored = self
-            .attachments
-            .get(&attachment.attempt_id)
-            .ok_or(DispatchError::PreSend(
-                "attachment not minted by this authority".to_owned(),
-            ))?;
-        // Validate every dimension against stored record
-        if attachment.arm_id != stored.arm_id {
-            return Err(DispatchError::PreSend("arm_id mismatch".to_owned()));
-        }
-        if attachment.generation != stored.generation {
-            return Err(DispatchError::PreSend("generation mismatch".to_owned()));
-        }
-        if attachment.verifier_ref != stored.verifier_ref {
-            return Err(DispatchError::PreSend(
-                "verifier_ref mismatch — attachment may be forged".to_owned(),
-            ));
-        }
-        if attachment.seat_id != stored.seat_id {
-            return Err(DispatchError::PreSend("seat_id mismatch".to_owned()));
-        }
-        if attachment.route != stored.route {
-            return Err(DispatchError::PreSend("route mismatch".to_owned()));
-        }
-        if attachment.lease_until != stored.lease_until {
-            return Err(DispatchError::PreSend(
-                "lease_until mismatch — attachment may have been extended".to_owned(),
-            ));
-        }
-        if attachment.attempt_id != stored.attempt_id {
-            return Err(DispatchError::PreSend("attempt_id mismatch".to_owned()));
-        }
-        // Check revocation and lease against stored record
-        if stored.revoked {
-            return Err(DispatchError::PreSend("attachment is revoked".to_owned()));
-        }
-        if stored.lease_until <= self.now {
-            return Err(DispatchError::PreSend(
-                "attachment lease expired".to_owned(),
-            ));
-        }
-        // Validate against claim
-        if attachment.arm_id != claim.arm_id {
-            return Err(DispatchError::PreSend(
-                "arm_id mismatch with claim".to_owned(),
-            ));
-        }
-        if attachment.generation != claim.generation {
-            return Err(DispatchError::PreSend(
-                "generation mismatch with claim".to_owned(),
-            ));
-        }
-        // Validate seat/route match the registered arm
-        if let Some(arm) = self.arms.get(&claim.arm_id) {
-            if stored.seat_id != arm.seat_id {
-                return Err(DispatchError::PreSend(
-                    "seat_id mismatch with arm".to_owned(),
-                ));
-            }
-            if stored.route != arm.route {
-                return Err(DispatchError::PreSend("route mismatch with arm".to_owned()));
-            }
-            // Validate generation against live arm — stale attachments
-            // from before a re-arm must be rejected.
-            if stored.generation != arm.generation {
-                return Err(DispatchError::PreSend(
-                    "attachment generation is stale — arm has been re-armed".to_owned(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    // -- Reconciliation --------------------------------------------------
-
-    /// Reconcile after an ambiguous dispatch.
-    ///
-    /// Probes the controller for the true disposition, then durably
-    /// records the reconciliation resolution so a fresh restart does
-    /// not re-derive reconciliation-required work for this attempt.
+    /// Authority phase 1: produce reconciliation work after validating
+    /// the attempt exists (exact persisted attempt→signal binding) and
+    /// is not already resolved. No provider I/O happens while the
+    /// authority is borrowed — the caller probes the controller between
+    /// this call and `commit_reconciliation`.
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError`] when persistence of the reconciliation
-    /// resolution fails.
-    pub fn reconcile(
+    /// Returns `DispatchError::PostSend` when the attempt has no
+    /// persisted binding or is already resolved. Fail closed: no
+    /// fallback identity.
+    pub fn prepare_reconciliation(
         &mut self,
-        controller: &dyn Controller,
         attempt_id: &str,
-    ) -> Result<ReconciliationDisposition, DispatchError> {
-        let disposition = controller.reconcile(attempt_id);
-
-        // Resolve the signal_id for the transition key.
-        // Look up the signal from any recorded claim or disposition.
+    ) -> Result<ReconciliationWork, DispatchError> {
         let signal_id = self
             .persist
-            .recover()
-            .ok()
-            .and_then(|snap| {
-                snap.attempt_map.iter().find_map(|(rid, aid)| {
-                    if aid == attempt_id {
-                        snap.claims
-                            .iter()
-                            .find(|c| c.request_id == *rid)
-                            .map(|c| c.signal_id.clone())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or_else(|| attempt_id.to_owned());
+            .attempt_signal(attempt_id)
+            .map_err(|e| DispatchError::PostSend(format!("attempt→signal lookup failed: {e:?}")))?
+            .ok_or_else(|| {
+                DispatchError::PostSend(
+                    "no persisted attempt→signal binding for this attempt".to_owned(),
+                )
+            })?;
+        if self
+            .persist
+            .reconciliation_recorded(attempt_id)
+            .map_err(|e| DispatchError::PostSend(format!("reconciliation lookup failed: {e:?}")))?
+            .is_some_and(|state| !matches!(state, ReconciliationState::Unknown))
+        {
+            return Err(DispatchError::PostSend(
+                "attempt already reconciled".to_owned(),
+            ));
+        }
+        Ok(ReconciliationWork {
+            attempt_id: attempt_id.to_owned(),
+            signal_id,
+        })
+    }
 
-        let state = match &disposition {
+    /// Authority phase 3: durably commit the provider probe's
+    /// resolution. The resolution enum is persisted keyed to the
+    /// attempt; the exact attempt→signal binding is verified against
+    /// persisted state (fail closed, no fallback).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DispatchError::PostSend` when the resolution cannot be
+    /// persisted, conflicts with a prior resolution, or the attempt has
+    /// no prior `ReconciliationRequired` transition.
+    // By-value consumption is deliberate: the reconciliation work
+    // handle is single-use between the two authority phases.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn commit_reconciliation(
+        &mut self,
+        work: ReconciliationWork,
+        disposition: ReconciliationDisposition,
+    ) -> Result<ReconciliationDisposition, DispatchError> {
+        let state = match disposition {
             ReconciliationDisposition::Accepted => ReconciliationState::Accepted,
             ReconciliationDisposition::ProvenNotAccepted => ReconciliationState::ProvenNotAccepted,
             ReconciliationDisposition::Terminal => ReconciliationState::Terminal,
             ReconciliationDisposition::Unknown => ReconciliationState::Unknown,
         };
-
         self.persist
-            .record_reconciliation(attempt_id, &signal_id, state)
+            .record_reconciliation(&work.attempt_id, &work.signal_id, state)
             .map_err(|e| {
                 DispatchError::PostSend(format!("failed to record reconciliation: {e:?}"))
             })?;
-
         Ok(disposition)
     }
 
     // -- Recovery --------------------------------------------------------
 
-    /// Recover authoritative state after daemon restart.
+    /// Recover authoritative state after daemon restart, from the
+    /// backend alone.
     ///
-    /// Returns the persistence snapshot enriched with live arms,
-    /// attachment verifier state, derivable ambiguous work, handled
-    /// cursors, and re-arm positions — all reconstructed from
-    /// persisted data, not current in-memory state.
+    /// Reconstructs and installs the full semantic packet: arms
+    /// (complete policy — seat, route, capability, coverage), minted
+    /// attachments (seat, route, capability, exact persisted lease,
+    /// verifier ref, revocation), admitted claims, handled cursors,
+    /// re-arm positions, and the attempt counter. No caller
+    /// pre-registration or skeleton state is required.
     ///
     /// # Errors
     ///
@@ -729,143 +956,78 @@ impl<P: Persist> DaemonAuthority<P> {
     pub fn recover(&mut self) -> Result<AuthorityRecovery, ClaimError> {
         let snapshot = self.persist.recover()?;
 
-        // Reconstruct arms from persisted arm states.
-        // For arms already registered, update generation.
-        // For arms only in persisted data, create a skeleton entry.
-        for (arm_id, generation) in &snapshot.arm_states {
-            if let Some(arm) = self.arms.get_mut(arm_id) {
-                arm.generation = *generation;
-            } else {
-                // Create skeleton — caller must re-register with full arm
-                // definition, but the persisted generation survives.
-                self.arms.insert(
-                    arm_id.clone(),
-                    KnownArm {
-                        arm_id: arm_id.clone(),
-                        generation: *generation,
-                        seat_id: String::new(),
-                        route: String::new(),
-                        coverage_until: self.now,
-                    },
-                );
-            }
-        }
-
-        // Clone snapshot fields before moving snapshot itself
-        let handled_cursors = snapshot.handled_cursors.clone();
-        let rearm_positions = snapshot.rearm_positions.clone();
-        let claims = snapshot.claims.clone();
-        let attempt_map = snapshot.attempt_map.clone();
-        let verifier_refs = snapshot.verifier_refs.clone();
-        let attempt_seq = snapshot.attempt_seq;
-
-        // Restore in-memory authority state from persisted data
-        self.attempt_seq = attempt_seq;
-        self.handled_cursors = handled_cursors.clone();
-        self.rearm_positions = rearm_positions.clone();
-
-        // Reconstruct attachments from attempt_map + persisted verifier refs
-        let attachments: BTreeMap<String, MintedAttachment> = attempt_map
+        let arms: BTreeMap<String, KnownArm> = snapshot
+            .arms
             .iter()
-            .filter_map(|(request_id, attempt_id)| {
-                let verifier_ref = verifier_refs.get(request_id)?.clone();
-                let claim = claims.iter().find(|c| &c.request_id == request_id)?;
-                Some((
-                    attempt_id.clone(),
-                    MintedAttachment {
-                        attempt_id: attempt_id.clone(),
-                        arm_id: claim.arm_id.clone(),
-                        generation: claim.generation,
-                        seat_id: String::new(),
-                        route: String::new(),
-                        lease_until: OffsetDateTime::now_utc(),
-                        verifier_ref,
-                        revoked: false,
+            .map(|a| {
+                (
+                    a.arm_id.clone(),
+                    KnownArm {
+                        arm_id: a.arm_id.clone(),
+                        generation: a.generation,
+                        seat_id: a.seat_id.clone(),
+                        route: a.route.clone(),
+                        capability: a.capability,
+                        coverage_until: a.coverage_until,
                     },
-                ))
+                )
             })
             .collect();
 
+        let attachments: BTreeMap<String, MintedAttachment> = snapshot
+            .attachments
+            .iter()
+            .map(|a| (a.attempt_id.clone(), MintedAttachment::from(a)))
+            .collect();
+
+        let admitted_claims: BTreeMap<String, DurableClaim> = snapshot
+            .claims
+            .iter()
+            .filter_map(|c| {
+                snapshot
+                    .attempt_map
+                    .iter()
+                    .find(|(rid, _)| *rid == &c.request_id)
+                    .map(|(_, attempt_id)| (attempt_id.clone(), c.clone()))
+            })
+            .collect();
+
+        self.arms = arms.clone();
+        self.attachments = attachments.clone();
+        self.admitted_claims = admitted_claims;
+        self.handled_cursors = snapshot.handled_cursors.clone();
+        self.rearm_positions = snapshot.rearm_positions.clone();
+        self.attempt_seq = snapshot.attempt_seq;
+
         Ok(AuthorityRecovery {
             snapshot,
-            arms: self.arms.clone(),
+            arms,
             attachments,
-            handled_cursors,
-            rearm_positions,
+            handled_cursors: self.handled_cursors.clone(),
+            rearm_positions: self.rearm_positions.clone(),
         })
-    }
-
-    /// Record a handled cursor for an arm.
-    pub fn record_handled_cursor(&mut self, arm_id: &str, cursor: &str) {
-        self.handled_cursors
-            .insert(arm_id.to_owned(), cursor.to_owned());
-    }
-
-    /// Mark an arm as re-armed.
-    pub fn set_rearmed(&mut self, arm_id: &str) {
-        self.rearm_positions.insert(arm_id.to_owned(), true);
-    }
-
-    /// Access the inner persistence for tests.
-    #[must_use]
-    pub fn persist(&self) -> &P {
-        &self.persist
-    }
-
-    /// Mutable access to persistence for tests.
-    pub fn persist_mut(&mut self) -> &mut P {
-        &mut self.persist
-    }
-
-    /// Look up a minted attachment by `attempt_id`.
-    #[must_use]
-    pub fn get_attachment(&self, attempt_id: &str) -> Option<&MintedAttachment> {
-        self.attachments.get(attempt_id)
-    }
-
-    /// Revoke an attachment by `attempt_id`. Returns `true` if found and revoked.
-    pub fn revoke_attachment(&mut self, attempt_id: &str) -> bool {
-        if let Some(att) = self.attachments.get_mut(attempt_id) {
-            att.revoke();
-            true
-        } else {
-            false
-        }
     }
 }
 
 // -- Supporting types ---------------------------------------------------
 
-use gearwit_protocol::ProviderEvent;
-
-/// In-memory signal claim reference.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClaimedSignal {
-    /// Arm id.
-    pub arm_id: String,
-    /// Generation resolved and stamped at claim time.
-    pub generation: u64,
-    /// Stable signal id.
-    pub signal_id: String,
-    /// Stable request id.
-    pub request_id: String,
-    /// Oldest-first event refs.
-    pub event_refs: Vec<String>,
-    /// Bounded events.
-    pub events: Vec<ProviderEvent>,
-}
-
 /// Result of claim admission.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AdmissionResult {
     /// Admission outcome.
     pub outcome: ClaimOutcome,
-    /// In-memory claim reference.
-    pub claim: ClaimedSignal,
-    /// Minted attachment (None on exact replay).
-    pub attachment: Option<MintedAttachment>,
     /// Attempt id.
     pub attempt_id: String,
+    /// Opaque admission receipt (None on exact replay).
+    receipt: Option<AdmissionReceipt>,
+}
+
+impl AdmissionResult {
+    /// Take the opaque admission receipt, if this admission minted one.
+    #[must_use]
+    pub fn into_receipt(self) -> Option<AdmissionReceipt> {
+        self.receipt
+    }
 }
 
 /// Why claim admission failed.
@@ -879,6 +1041,8 @@ pub enum AdmissionError {
     Conflict,
     /// Storage unavailable.
     Storage(String),
+    /// The attempt counter or arm generation overflowed.
+    GenerationOverflow,
 }
 
 /// Dispatch error, split into pre-send (safe retry) and post-send
@@ -896,7 +1060,7 @@ pub enum DispatchError {
 pub struct AuthorityRecovery {
     /// Raw persistence snapshot.
     pub snapshot: RecoverySnapshot,
-    /// Live arms at shutdown.
+    /// Live arms reconstructed from persisted policy.
     pub arms: BTreeMap<String, KnownArm>,
     /// Minted attachment state (verifier refs only — no bearer material).
     pub attachments: BTreeMap<String, MintedAttachment>,
@@ -907,70 +1071,104 @@ pub struct AuthorityRecovery {
 }
 
 impl AuthorityRecovery {
-    /// Derive ambiguous dispatches:
-    /// 1. `DispatchPrepared` without any conclusion (no disposition,
-    ///    no `NativeAccepted`, no `ReconciliationRequired`, no `ControllerLost`).
-    /// 2. A disposition exists but `NativeAccepted` is missing (partial
-    ///    post-send write — disposition succeeded, transition failed).
+    /// Derive ambiguous dispatches that survived restart:
+    ///
+    /// 1. `ReconciliationRequired` without a final resolution
+    ///    (`Accepted`, `ProvenNotAccepted`, `Terminal`) — a properly
+    ///    recorded ambiguous conclusion stays derivable until resolved.
+    /// 2. `DispatchPrepared` with no durable conclusion and no
+    ///    `ControllerLost` — the dispatch may or may not have been
+    ///    sent.
     #[must_use]
     pub fn derivable_ambiguous_attempts(&self) -> Vec<String> {
         let mut ambiguous = Vec::new();
+        let mut seen = BTreeSet::new();
         for (key, transitions) in &self.snapshot.transitions {
             let Some(attempt_id) = key.split(':').nth(1) else {
                 continue;
             };
-
-            // Case 1: DispatchPrepared without any known conclusion
-            // and no stored disposition (no disposition = never concluded).
-            if transitions.contains(&Transition::DispatchPrepared)
-                && !transitions.contains(&Transition::NativeAccepted)
-                && !transitions.contains(&Transition::ReconciliationRequired)
-                && !transitions.contains(&Transition::ControllerLost)
-                && !self.snapshot.dispositions.contains_key(attempt_id)
-            {
+            if !seen.insert(attempt_id.to_owned()) {
+                continue;
+            }
+            if !transitions.contains(&Transition::DispatchPrepared) {
+                continue;
+            }
+            // Resolved reconciliations are not ambiguous.
+            if matches!(
+                self.snapshot.reconciliations.get(attempt_id),
+                Some(
+                    ReconciliationState::Accepted
+                        | ReconciliationState::ProvenNotAccepted
+                        | ReconciliationState::Terminal
+                )
+            ) {
+                continue;
+            }
+            // Unresolved ReconciliationRequired stays derivable.
+            if transitions.contains(&Transition::ReconciliationRequired) {
                 ambiguous.push(attempt_id.to_owned());
                 continue;
             }
-
-            // Case 2: Accepted disposition exists but NativeAccepted missing
-            // (partial post-send write: disposition recorded, transition failed).
-            // Rejected dispositions are clean terminals — not ambiguous.
-            if transitions.contains(&Transition::DispatchPrepared)
-                && !transitions.contains(&Transition::NativeAccepted)
-                && !transitions.contains(&Transition::ReconciliationRequired)
-                && self
-                    .snapshot
-                    .dispositions
-                    .get(attempt_id)
-                    .is_some_and(|d| matches!(d, DispatchDisposition::Accepted { .. }))
-            {
-                ambiguous.push(attempt_id.to_owned());
+            if transitions.contains(&Transition::ControllerLost) {
                 continue;
             }
-
-            // Case 3: Ambiguous disposition recorded but ReconciliationRequired
-            // missing (partial record_conclusion for Ambiguous disposition).
-            if transitions.contains(&Transition::DispatchPrepared)
-                && !transitions.contains(&Transition::ReconciliationRequired)
-                && self
-                    .snapshot
-                    .dispositions
-                    .get(attempt_id)
-                    .is_some_and(|d| matches!(d, DispatchDisposition::Ambiguous))
-            {
-                ambiguous.push(attempt_id.to_owned());
+            // Cleanly consumed attempts (rejected / accepted-and-proven)
+            // are not ambiguous.
+            if self.snapshot.concluded_set.get(attempt_id) == Some(&true) {
+                continue;
             }
+            ambiguous.push(attempt_id.to_owned());
         }
         ambiguous
+    }
+
+    /// Derive accepted dispatches whose lifecycle evidence is
+    /// incomplete: durably consumed with `NativeAccepted` but no exact
+    /// turn observation recorded. Such attempts need operator
+    /// attention after an observation write failed post-send.
+    #[must_use]
+    pub fn missing_evidence_attempts(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (key, transitions) in &self.snapshot.transitions {
+            let Some(attempt_id) = key.split(':').nth(1) else {
+                continue;
+            };
+            if !seen.insert(attempt_id.to_owned()) {
+                continue;
+            }
+            if !transitions.contains(&Transition::NativeAccepted) {
+                continue;
+            }
+            if transitions.contains(&Transition::ReconciliationRequired)
+                || self.snapshot.concluded_set.get(attempt_id) != Some(&true)
+            {
+                continue;
+            }
+            // Accepted but no evidence of an exact turn having been
+            // observed — the observation write was never durable.
+            if !transitions.contains(&Transition::ExactTurnStart)
+                && !transitions.contains(&Transition::ExactTurnTerminal)
+                && !transitions.contains(&Transition::ControllerLost)
+            {
+                missing.push(attempt_id.to_owned());
+            }
+        }
+        missing
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{FakeController, ReconciliationDisposition};
+    use crate::controller::{Controller, FakeController};
     use crate::persist::FakePersist;
     use gearwit_protocol::ProviderEvent;
+    use time::Duration as TimeDuration;
+
+    fn now() -> OffsetDateTime {
+        time::macros::datetime!(2026-01-15 12:00:00 UTC)
+    }
 
     fn sample_event(body: &str) -> ProviderEvent {
         ProviderEvent {
@@ -987,22 +1185,28 @@ mod tests {
             arm_id: "arm-01".to_owned(),
             generation: 1,
             seat_id: "example-devrev".to_owned(),
-            route: "complete_background_tool".to_owned(),
-            coverage_until: time::macros::datetime!(2026-02-15 12:00:00 UTC),
+            route: ManagedCapability::MANAGED_TURN_START_ROUTE.to_owned(),
+            capability: ManagedCapability::ManagedTurnStart,
+            coverage_until: now() + TimeDuration::hours(24),
+        }
+    }
+
+    fn sample_arm_with_coverage(coverage_until: OffsetDateTime) -> KnownArm {
+        KnownArm {
+            coverage_until,
+            ..sample_arm()
         }
     }
 
     fn sample_authority() -> DaemonAuthority<FakePersist> {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
-        let mut auth = DaemonAuthority::new(FakePersist::default(), now);
-        auth.register_arm(sample_arm());
+        let mut auth = DaemonAuthority::new(FakePersist::default(), now());
+        auth.register_arm(sample_arm()).expect("register");
         auth
     }
 
     fn sample_authority_with_persist(persist: FakePersist) -> DaemonAuthority<FakePersist> {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
-        let mut auth = DaemonAuthority::new(persist, now);
-        auth.register_arm(sample_arm());
+        let mut auth = DaemonAuthority::new(persist, now());
+        auth.register_arm(sample_arm()).expect("register");
         auth
     }
 
@@ -1019,29 +1223,83 @@ mod tests {
         claim_req("arm-01", "req-1", "sig-1", vec![sample_event("hello")])
     }
 
+    /// Fresh authority over a clone of the backend — the production
+    /// restart shape. No arm registration, no map copying.
+    fn restarted(persist: &FakePersist) -> DaemonAuthority<FakePersist> {
+        DaemonAuthority::new(persist.clone(), now())
+    }
+
+    /// Admit the standard claim and return the attempt id + receipt.
+    fn admitted(auth: &mut DaemonAuthority<FakePersist>) -> (String, AdmissionReceipt) {
+        let admission = auth.admit_claim(&std_req()).expect("admit");
+        let attempt_id = admission.attempt_id.clone();
+        let receipt = admission.into_receipt().expect("receipt");
+        (attempt_id, receipt)
+    }
+
+    /// Admit + prepare; return attempt id, prepared token, and command.
+    fn admitted_prepared(
+        auth: &mut DaemonAuthority<FakePersist>,
+    ) -> (String, PreparedDispatch, ControllerCommand) {
+        let (attempt_id, receipt) = admitted(auth);
+        let (prepared, cmd) = auth.prepare_dispatch(receipt).expect("prepare");
+        (attempt_id, prepared, cmd)
+    }
+
+    // -- Admission ---------------------------------------------------------
+
     #[test]
     fn first_claim_admits_and_mints_attachment() {
         let mut auth = sample_authority();
-        let ev = vec![sample_event("hello")];
-        let req = claim_req("arm-01", "req-1", "sig-1", ev);
-        let result = auth.admit_claim(&req).expect("admit");
-        assert!(matches!(result.outcome, ClaimOutcome::Admitted));
-        assert!(result.attachment.is_some());
-        let att = result.attachment.as_ref().unwrap();
-        assert_eq!(att.arm_id, "arm-01");
-        assert_eq!(att.generation, 1);
-        assert_eq!(att.seat_id, "example-devrev");
-        assert_eq!(att.route, "complete_background_tool");
-        assert!(!att.verifier_ref.is_empty());
-        let ts = auth.persist().get_transitions("sig-1", &result.attempt_id);
+        let (attempt_id, _receipt) = admitted(&mut auth);
+        let att = auth.get_attachment(&attempt_id).expect("attachment");
+        assert_eq!(att.arm_id(), "arm-01");
+        assert_eq!(att.generation(), 1);
+        assert_eq!(att.seat_id(), "example-devrev");
+        assert_eq!(att.route(), ManagedCapability::MANAGED_TURN_START_ROUTE);
+        assert_eq!(att.capability(), ManagedCapability::ManagedTurnStart);
+        assert!(!att.verifier_ref().is_empty());
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
         assert!(ts.contains(&Transition::ClaimRecorded));
+    }
+
+    #[test]
+    fn admission_is_atomic_and_retry_admits_not_replays() {
+        let mut auth = sample_authority_with_persist(FakePersist {
+            next_claim_error: Some("write failed".to_owned()),
+            ..Default::default()
+        });
+        let req = std_req();
+        let err = auth.admit_claim(&req).expect_err("storage failure");
+        assert!(matches!(err, AdmissionError::Storage(_)));
+        // No partial state in any persisted family.
+        assert!(auth.persist().claims.is_empty());
+        assert!(auth.persist().claim_attempts.is_empty());
+        assert!(auth.persist().verifier_refs.is_empty());
+        assert!(auth.persist().transitions.is_empty());
+        assert!(auth.persist().persisted_attachments.is_empty());
+        assert!(auth.persist().attempt_signals.is_empty());
+
+        // Retry on the same backend must produce Admitted, not Replay.
+        auth.persist_mut().next_claim_error = None;
+        let admission = auth.admit_claim(&req).expect("retry on same backend");
+        assert_eq!(admission.outcome, ClaimOutcome::Admitted);
+        let recorded_attempt = admission.attempt_id.clone();
+        assert!(admission.into_receipt().is_some());
+        let ts = auth.persist().get_transitions("sig-1", &recorded_attempt);
+        assert_eq!(ts, &[Transition::ClaimRecorded]);
+
+        // Exact replay: Replay, same attempt id, no receipt.
+        let replay = auth.admit_claim(&req).expect("exact replay");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert_eq!(replay.attempt_id, recorded_attempt);
+        assert!(replay.into_receipt().is_none());
     }
 
     #[test]
     fn unknown_arm_rejects_claim() {
         let mut auth = sample_authority();
-        let ev = vec![sample_event("hello")];
-        let req = claim_req("nonexistent", "req-1", "sig-1", ev);
+        let req = claim_req("nonexistent", "req-1", "sig-1", vec![sample_event("hello")]);
         let err = auth.admit_claim(&req).expect_err("unknown arm");
         assert!(matches!(err, AdmissionError::UnknownArm));
     }
@@ -1049,295 +1307,295 @@ mod tests {
     #[test]
     fn occupied_arm_rejects_second_claim() {
         let mut auth = sample_authority();
-        let ev1 = vec![sample_event("hello")];
-        let req1 = claim_req("arm-01", "req-1", "sig-1", ev1);
-        auth.admit_claim(&req1).expect("first");
-        let ev2 = vec![sample_event("world")];
-        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
+        admitted(&mut auth);
+        let req2 = claim_req("arm-01", "req-2", "sig-2", vec![sample_event("world")]);
         let err = auth.admit_claim(&req2).expect_err("occupied");
         assert!(matches!(err, AdmissionError::Occupied));
     }
 
     #[test]
-    fn exact_replay_returns_replay_without_attachment() {
+    fn exact_replay_returns_replay_without_receipt() {
         let mut auth = sample_authority();
-        let ev = vec![sample_event("hello")];
-        let req = claim_req("arm-01", "req-1", "sig-1", ev.clone());
-        let first = auth.admit_claim(&req).expect("first");
-        assert!(first.attachment.is_some());
-        assert!(matches!(first.outcome, ClaimOutcome::Admitted));
-        let req2 = claim_req("arm-01", "req-1", "sig-1", ev);
-        let replay = auth.admit_claim(&req2).expect("replay");
-        assert!(matches!(replay.outcome, ClaimOutcome::Replay));
-        assert!(
-            replay.attachment.is_none(),
-            "replay must not mint attachment"
-        );
-        assert_eq!(replay.claim, first.claim);
+        let (first_attempt, _) = admitted(&mut auth);
+        let replay = auth.admit_claim(&std_req()).expect("replay");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert_eq!(replay.attempt_id, first_attempt);
+        assert!(replay.into_receipt().is_none(), "replay mints no receipt");
     }
 
     #[test]
-    fn generation_advance_under_authority_produces_new_generation_claim() {
+    fn generation_advance_produces_new_generation_claim() {
         let mut auth = sample_authority();
-        let ev = vec![sample_event("hello")];
-        let req = claim_req("arm-01", "req-1", "sig-1", ev);
-        let first = auth.admit_claim(&req).expect("first");
-        assert_eq!(first.claim.generation, 1);
-
-        // Advance generation through production re-arm path (not direct field mutation).
-        let new_gen = auth
-            .advance_generation("arm-01")
-            .expect("advance generation");
+        let (_, _rcpt1) = admitted(&mut auth);
+        let new_gen = auth.advance_generation("arm-01").expect("advance");
         assert_eq!(new_gen, 2);
+        let req2 = claim_req("arm-01", "req-2", "sig-2", vec![sample_event("world")]);
+        let admission = auth.admit_claim(&req2).expect("admit gen 2");
+        assert_eq!(admission.attempt_id, "attempt-2");
+        let att = auth.get_attachment("attempt-2").expect("attachment");
+        assert_eq!(att.generation(), 2);
+    }
 
-        let ev2 = vec![sample_event("world")];
-        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
-        let second = auth.admit_claim(&req2).expect("generation advanced");
-        assert_eq!(second.claim.generation, 2);
-        assert!(second.attachment.is_some());
-        assert_eq!(second.attachment.unwrap().generation, 2);
+    #[test]
+    fn advance_generation_overflow_fails_closed() {
+        let mut auth = DaemonAuthority::new(FakePersist::default(), now());
+        auth.register_arm(KnownArm {
+            generation: u64::MAX,
+            ..sample_arm()
+        })
+        .expect("register");
+        let err = auth.advance_generation("arm-01").expect_err("overflow");
+        assert!(
+            matches!(err, AdmissionError::GenerationOverflow),
+            "got {err:?}"
+        );
+        let arm = auth.persist().persisted_arms.get("arm-01").expect("arm");
+        assert_eq!(arm.generation, u64::MAX, "persisted generation unchanged");
+    }
+
+    #[test]
+    fn advance_generation_storage_failure_leaves_live_generation_unchanged() {
+        let mut auth = sample_authority();
+        auth.persist_mut().next_arm_persist_error = Some("disk full".to_owned());
+        let err = auth.advance_generation("arm-01").expect_err("storage");
+        assert!(matches!(err, AdmissionError::Storage(_)));
+        let live = auth.arms.get("arm-01").expect("arm");
+        assert_eq!(live.generation, 1, "live generation unchanged on failure");
+        let persisted = auth.persist().persisted_arms.get("arm-01").expect("arm");
+        assert_eq!(persisted.generation, 1);
+        // Clearing the fault lets the re-arm through.
+        auth.persist_mut().next_arm_persist_error = None;
+        assert_eq!(auth.advance_generation("arm-01").expect("advance"), 2);
     }
 
     #[test]
     fn stale_generation_rejects_prepare_after_rearm() {
-        // Daemon-level harness: advance generation through production
-        // re-arm path, then prove a stale gen-1 attachment is rejected
-        // during attempted prepare (not after two completes).
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit gen 1");
-        let stale_attachment = admission.attachment.expect("gen-1 attachment");
-
-        // Re-arm: advance generation through production path.
+        let (_attempt, receipt) = admitted(&mut auth);
         auth.advance_generation("arm-01").expect("advance");
-
-        // Attempt to prepare with the stale gen-1 attachment — must be rejected.
         let err = auth
-            .prepare_dispatch(&admission.claim, &stale_attachment)
+            .prepare_dispatch(receipt)
             .expect_err("stale generation must reject prepare");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("generation")),
-            "expected generation mismatch, got {err:?}"
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("stale")),
+            "expected stale-generation rejection, got {err:?}"
         );
-
-        // Verify a new claim at gen 2 produces a fresh attachment.
-        let ev2 = vec![sample_event("world")];
-        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
-        let fresh = auth.admit_claim(&req2).expect("fresh claim at gen 2");
-        assert_eq!(fresh.claim.generation, 2);
-        assert!(fresh.attachment.is_some());
     }
 
     #[test]
-    fn claim_recorded_failure_prevents_slot_publication() {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+    fn prepare_rehydrates_claim_identity_from_stored_state() {
+        let mut auth = sample_authority();
+        let (attempt_id, receipt) = admitted(&mut auth);
+        // Tamper with the durable claim body behind the authority's back.
+        auth.persist_mut()
+            .claims
+            .get_mut("req-1")
+            .expect("claim")
+            .events[0]
+            .body = "tampered".to_owned();
+        let err = auth
+            .prepare_dispatch(receipt)
+            .expect_err("tampered body must be rejected");
+        assert!(
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("does not match stored claim")),
+            "got {err:?}"
+        );
+        assert!(
+            !auth.persist().prepared_set.contains_key(&attempt_id),
+            "no prepare marker after rejection"
+        );
+    }
 
-        // Inject atomic admission failure — claim, attempt, verifier,
-        // and ClaimRecorded must not persist.
-        let backend = FakePersist {
-            next_claim_error: Some("write failed".to_owned()),
-            ..Default::default()
+    #[test]
+    fn prepare_verifies_persisted_attempt_signal_binding() {
+        let mut auth = sample_authority();
+        let (attempt_id, receipt) = admitted(&mut auth);
+        auth.persist_mut()
+            .attempt_signals
+            .insert(attempt_id.clone(), "sig-retarget".to_owned());
+        let err = auth
+            .prepare_dispatch(receipt)
+            .expect_err("binding retarget must be rejected");
+        assert!(
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("record_prepared")),
+            "got {err:?}"
+        );
+        assert!(!auth.persist().prepared_set.contains_key(&attempt_id));
+        assert!(
+            auth.persist()
+                .get_transitions("sig-1", &attempt_id)
+                .iter()
+                .all(|t| *t != Transition::DispatchPrepared)
+        );
+    }
+
+    #[test]
+    fn closed_capability_is_validated_independently() {
+        let mut auth = DaemonAuthority::new(FakePersist::default(), now());
+        auth.register_arm(KnownArm {
+            route: "not_a_capability".to_owned(),
+            ..sample_arm()
+        })
+        .expect("register");
+        let (_attempt, receipt) = admitted(&mut auth);
+        let err = auth
+            .prepare_dispatch(receipt)
+            .expect_err("unparseable route must be rejected");
+        assert!(
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("capability")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_records_transition_and_marker_atomically() {
+        let mut auth = sample_authority();
+        let (attempt_id, receipt) = admitted(&mut auth);
+        auth.prepare_dispatch(receipt).expect("prepare");
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
+        assert!(ts.contains(&Transition::DispatchPrepared));
+        assert!(auth.persist().prepared_set.get(&attempt_id) == Some(&true));
+    }
+
+    #[test]
+    fn duplicate_prepare_is_rejected_durably() {
+        let mut auth = sample_authority();
+        let (attempt_id, receipt) = admitted(&mut auth);
+        auth.prepare_dispatch(receipt).expect("prepare");
+        // Build a second receipt for the same attempt (module-level
+        // adversarial construction; callers cannot do this).
+        let claim = DurableClaim {
+            request_id: "req-1".to_owned(),
+            arm_id: "arm-01".to_owned(),
+            generation: 1,
+            signal_id: "sig-1".to_owned(),
+            event_refs: vec!["event-hello".to_owned()],
+            events: vec![sample_event("hello")],
+            claimed_at: now(),
         };
-        let mut auth = DaemonAuthority::new(backend.clone(), now);
-        auth.register_arm(sample_arm());
-        let req = claim_req("arm-01", "req-1", "sig-1", vec![sample_event("hello")]);
-        let err = auth.admit_claim(&req).expect_err("storage failure");
-        assert!(matches!(err, AdmissionError::Storage(_)));
-
-        // Prove the failed backend has no partial state in all four families.
+        let second_receipt = AdmissionReceipt {
+            attempt_id: attempt_id.clone(),
+            claim,
+        };
+        let err = auth
+            .prepare_dispatch(second_receipt)
+            .expect_err("duplicate prepare");
         assert!(
-            auth.persist().claims.is_empty(),
-            "no claims after failed admission"
-        );
-        assert!(
-            auth.persist().claim_attempts.is_empty(),
-            "no attempt map after failed admission"
-        );
-        assert!(
-            auth.persist().verifier_refs.is_empty(),
-            "no verifier refs after failed admission"
-        );
-        assert!(
-            auth.persist().transitions.is_empty(),
-            "no transitions after failed admission"
-        );
-
-        // Retry on the same backend: must produce Admitted (not Replay).
-        auth.persist_mut().next_claim_error = None;
-        let admission = auth.admit_claim(&req).expect("retry on same backend");
-        assert_eq!(
-            admission.outcome,
-            ClaimOutcome::Admitted,
-            "retry must admit, not replay"
-        );
-        let recorded_attempt = admission.attempt_id.clone();
-        assert!(admission.attachment.is_some(), "must mint attachment");
-
-        // Exact replay: same request, same backend — must return Replay.
-        let replay = auth.admit_claim(&req).expect("exact replay");
-        assert_eq!(
-            replay.outcome,
-            ClaimOutcome::Replay,
-            "exact replay must return Replay"
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("record_prepared")),
+            "got {err:?}"
         );
         assert_eq!(
-            replay.attempt_id, recorded_attempt,
-            "replay must return recorded attempt id"
-        );
-        assert!(
-            replay.attachment.is_none(),
-            "replay must not mint a fresh attachment"
-        );
-
-        // Prove exactly one ClaimRecorded transition was recorded.
-        let transitions = auth.persist().get_transitions("sig-1", &recorded_attempt);
-        assert_eq!(
-            transitions.len(),
+            auth.persist()
+                .get_transitions("sig-1", &attempt_id)
+                .iter()
+                .filter(|t| **t == Transition::DispatchPrepared)
+                .count(),
             1,
-            "exactly one ClaimRecorded expected, got {transitions:?}"
+            "exactly one DispatchPrepared"
         );
-        assert_eq!(transitions[0], Transition::ClaimRecorded);
     }
 
     #[test]
-    fn prepare_dispatch_validates_attachment() {
+    fn prepare_atomic_failure_leaves_no_partial_state() {
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (_prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let forged = MintedAttachment {
-            generation: 99,
-            arm_id: att.arm_id.clone(),
-            attempt_id: att.attempt_id.clone(),
-            seat_id: att.seat_id.clone(),
-            route: att.route.clone(),
-            lease_until: att.lease_until,
-            verifier_ref: att.verifier_ref.clone(),
-            revoked: false,
-        };
+        let (attempt_id, receipt) = admitted(&mut auth);
+        auth.persist_mut().next_prepare_error = Some("prepare failed".to_owned());
         let err = auth
-            .prepare_dispatch(&admission.claim, &forged)
-            .expect_err("forged");
+            .prepare_dispatch(receipt)
+            .expect_err("atomic prepare failure");
         assert!(matches!(err, DispatchError::PreSend(_)));
+        assert!(!auth.persist().prepared_set.contains_key(&attempt_id));
+        assert!(
+            !auth
+                .persist()
+                .get_transitions("sig-1", &attempt_id)
+                .contains(&Transition::DispatchPrepared)
+        );
     }
 
     #[test]
-    fn attachment_not_minted_by_authority_fails() {
+    fn revoked_attachment_fails_prepare_and_survives_restart() {
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let mut auth2 = sample_authority();
-        let err = auth2
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("foreign authority");
-        assert!(matches!(err, DispatchError::PreSend(_)));
-    }
-
-    #[test]
-    fn revoked_attachment_fails_prepare() {
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        auth.revoke_attachment(&att.attempt_id);
+        let (attempt_id, receipt) = admitted(&mut auth);
+        assert!(auth.revoke_attachment(&attempt_id).expect("revoke"));
         let err = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("revoked");
+            .prepare_dispatch(receipt)
+            .expect_err("revoked attachment must not prepare");
+        assert!(matches!(&err, DispatchError::PreSend(msg) if msg.contains("revoked")));
+
+        // Fresh restart: revocation is reconstructed exactly.
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
+        let att = recovery.attachments.get(&attempt_id).expect("attachment");
+        assert!(att.is_revoked(), "revocation must survive restart");
+        assert!(!att.is_valid(now()));
+        assert!(
+            auth2
+                .get_attachment(&attempt_id)
+                .expect("installed")
+                .is_revoked()
+        );
+    }
+
+    #[test]
+    fn revocation_storage_failure_leaves_live_attachment_valid() {
+        let mut auth = sample_authority();
+        let (attempt_id, _receipt) = admitted(&mut auth);
+        auth.persist_mut().next_revoke_error = Some("revoke failed".to_owned());
+        let err = auth
+            .revoke_attachment(&attempt_id)
+            .expect_err("revocation persistence failure");
         assert!(matches!(err, DispatchError::PreSend(_)));
+        assert!(
+            !auth
+                .get_attachment(&attempt_id)
+                .expect("attachment")
+                .is_revoked(),
+            "live attachment must remain unrevoked after durable failure"
+        );
+        // And the persisted record is unchanged too.
+        assert!(
+            !auth
+                .persist()
+                .persisted_attachments
+                .get(&attempt_id)
+                .expect("attachment")
+                .revoked
+        );
+        // A clean revoke then works.
+        assert!(auth.revoke_attachment(&attempt_id).expect("revoke"));
+        assert!(
+            auth.get_attachment(&attempt_id)
+                .expect("attachment")
+                .is_revoked()
+        );
     }
 
     #[test]
     fn expired_lease_fails_prepare() {
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let mut att = admission.attachment.expect("attachment");
-        att.lease_until = time::macros::datetime!(2020-01-01 00:00:00 UTC);
+        let mut auth = DaemonAuthority::new(FakePersist::default(), now());
+        let short = sample_arm_with_coverage(now() + TimeDuration::hours(1));
+        auth.register_arm(short).expect("register");
+        let (_attempt, receipt) = admitted(&mut auth);
+        auth.set_now(now() + TimeDuration::hours(2));
         let err = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("expired");
-        assert!(matches!(err, DispatchError::PreSend(_)));
-    }
-
-    #[test]
-    fn lease_extension_mutation_fails_prepare() {
-        // Extending the lease beyond the stored record must be rejected.
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let mut att = admission.attachment.expect("attachment");
-        // Extend lease by one hour — mismatches stored record.
-        att.lease_until =
-            time::macros::datetime!(2026-01-15 12:00:00 UTC) + time::Duration::hours(10);
-        let err = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("lease extension");
+            .prepare_dispatch(receipt)
+            .expect_err("expired lease must fail");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("lease_until")),
-            "expected lease_until mismatch, got {err:?}"
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("lease")),
+            "got {err:?}"
         );
     }
 
-    #[test]
-    fn attempt_id_substitution_fails_prepare() {
-        // Mutating the attempt_id in the attachment must be rejected.
-        // This causes the authority lookup to fail because no attachment
-        // is stored under the substituted id.
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let mut att = admission.attachment.expect("attachment");
-        att.attempt_id = "attempt-999".to_owned();
-        let err = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("attempt_id substitution");
-        assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("not minted")),
-            "expected 'not minted by this authority', got {err:?}"
-        );
-    }
-
-    #[test]
-    fn arm_id_substitution_fails_prepare() {
-        // Mutating the arm_id in the attachment must be rejected.
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let mut att = admission.attachment.expect("attachment");
-        att.arm_id = "arm-02".to_owned();
-        let err = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("arm_id substitution");
-        assert!(
-            matches!(&err, DispatchError::PreSend(_)),
-            "expected PreSend error for arm_id mismatch, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verifier_ref_forgery_fails_prepare() {
-        // Changing the verifier_ref must be rejected — attachment is forged.
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let mut att = admission.attachment.expect("attachment");
-        att.verifier_ref = "vrf:forged".to_owned();
-        let err = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("verifier ref forgery");
-        assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("forged")),
-            "expected forgery rejection, got {err:?}"
-        );
-    }
+    // -- Conclusion --------------------------------------------------------
 
     #[test]
     fn conclude_accepted_with_observations() {
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let attempt_id = admission.attempt_id.clone();
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let conclusion = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1349,26 +1607,25 @@ mod tests {
             .expect("conclude");
         assert!(!conclusion.reconciliation_required());
         assert!(!conclusion.controller_lost());
-        assert_eq!(conclusion.observations.len(), 2);
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Terminal);
         let ts = auth.persist().get_transitions("sig-1", &attempt_id);
-        assert!(ts.contains(&Transition::DispatchPrepared));
-        assert!(ts.contains(&Transition::NativeAccepted));
-        assert!(ts.contains(&Transition::ExactTurnStart));
-        assert!(ts.contains(&Transition::ExactTurnTerminal));
+        for expected in [
+            Transition::DispatchPrepared,
+            Transition::NativeAccepted,
+            Transition::ExactTurnStart,
+            Transition::ExactTurnTerminal,
+        ] {
+            assert!(ts.contains(&expected), "missing {expected:?}");
+        }
+        assert!(auth.persist().concluded_set.contains_key(&attempt_id));
     }
 
     #[test]
     fn conclude_ambiguous_records_reconciliation_required() {
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let attempt_id = prepared.attempt_id.clone();
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let conclusion = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
+            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
             .expect("conclude");
         assert!(conclusion.reconciliation_required());
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Ambiguous);
@@ -1379,15 +1636,10 @@ mod tests {
     #[test]
     fn conclude_controller_lost_persists_transition() {
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let attempt_id = admission.attempt_id.clone();
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let conclusion = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1396,110 +1648,136 @@ mod tests {
             .expect("conclude");
         assert!(conclusion.controller_lost());
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::ControllerLost);
-        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
-        assert!(ts.contains(&Transition::ControllerLost));
+        assert!(
+            auth.persist()
+                .get_transitions("sig-1", &attempt_id)
+                .contains(&Transition::ControllerLost)
+        );
     }
 
     #[test]
-    fn conclude_rejected_no_observations() {
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let conclusion = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
-            .expect("conclude");
-        assert!(!conclusion.reconciliation_required());
-        assert!(conclusion.observations.is_empty());
-        assert_eq!(conclusion.durable_outcome(), DurableOutcome::Rejected);
+    fn conclusion_is_atomic_nothing_recorded_on_failure() {
+        for injection in ["disposition", "commit"] {
+            let mut persist = FakePersist::default();
+            if injection == "disposition" {
+                persist.next_disposition_error = Some("disposition failed".to_owned());
+            } else {
+                persist.next_conclusion_error = Some("commit failed".to_owned());
+            }
+            let mut auth = sample_authority_with_persist(persist);
+            let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
+            let err = auth
+                .conclude_dispatch(
+                    prepared,
+                    DispatchDisposition::Accepted {
+                        correlation: "corr-1".to_owned(),
+                    },
+                    vec![],
+                )
+                .expect_err("atomic conclusion failure");
+            assert!(
+                matches!(err, DispatchError::PostSend(_)),
+                "injection={injection}, got {err:?}"
+            );
+            // Nothing observable anywhere.
+            assert!(
+                auth.persist().get_disposition(&attempt_id).is_none(),
+                "injection={injection}"
+            );
+            assert!(
+                !auth.persist().concluded_set.contains_key(&attempt_id),
+                "injection={injection}"
+            );
+            assert!(
+                !auth
+                    .persist()
+                    .get_transitions("sig-1", &attempt_id)
+                    .contains(&Transition::NativeAccepted),
+                "injection={injection}"
+            );
+            // Fresh restart: the attempt is derivable as ambiguous and
+            // stays unconsumed.
+            let mut auth2 = restarted(auth.persist());
+            let recovery = auth2.recover().expect("recover");
+            assert!(
+                recovery
+                    .derivable_ambiguous_attempts()
+                    .contains(&attempt_id),
+                "injection={injection}: attempt must survive restart as ambiguous"
+            );
+        }
     }
 
     #[test]
-    fn conclude_accepted_with_started_returns_started_outcome() {
+    fn duplicate_conclusion_blocked_durably() {
         let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let conclusion = auth
-            .conclude_dispatch(
-                &prepared,
-                DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
-                },
-                vec![LifecycleObservation::TurnStarted("T1".to_owned())],
-            )
-            .expect("conclude");
-        assert!(!conclusion.reconciliation_required());
-        assert!(!conclusion.controller_lost());
-        assert_eq!(conclusion.durable_outcome(), DurableOutcome::Started);
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
+        auth.conclude_dispatch(
+            prepared,
+            DispatchDisposition::Accepted {
+                correlation: "c".to_owned(),
+            },
+            vec![],
+        )
+        .expect("conclude");
+        // A second conclusion token for the same attempt (module-level
+        // adversarial construction) is rejected by the durable marker.
+        let second = PreparedDispatch {
+            attempt_id: attempt_id.clone(),
+            signal_id: "sig-1".to_owned(),
+        };
+        let err = auth
+            .conclude_dispatch(second, DispatchDisposition::Rejected, vec![])
+            .expect_err("duplicate conclusion");
+        assert!(
+            matches!(&err, DispatchError::PreSend(msg) if msg.contains("already been concluded")),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn durable_outcome_exhaustivity_covers_all_six_variants() {
-        // Rejected
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let dc = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
+        // Each of the six outcomes takes one independent fresh authority.
+        let mut rejected = sample_authority();
+        let (_a, p, _c) = admitted_prepared(&mut rejected);
+        let dc = rejected
+            .conclude_dispatch(p, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert_eq!(dc.durable_outcome(), DurableOutcome::Rejected);
 
-        // Accepted (no observations)
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let dc = auth
+        let mut accepted = sample_authority();
+        let (_a, p, _c) = admitted_prepared(&mut accepted);
+        let dc = accepted
             .conclude_dispatch(
-                &prepared,
+                p,
                 DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
+                    correlation: "c".to_owned(),
                 },
                 vec![],
             )
             .expect("conclude");
         assert_eq!(dc.durable_outcome(), DurableOutcome::Accepted);
 
-        // Started (TurnStarted only)
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let dc = auth
+        let mut started = sample_authority();
+        let (_a, p, _c) = admitted_prepared(&mut started);
+        let dc = started
             .conclude_dispatch(
-                &prepared,
+                p,
                 DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
+                    correlation: "c".to_owned(),
                 },
                 vec![LifecycleObservation::TurnStarted("T1".to_owned())],
             )
             .expect("conclude");
         assert_eq!(dc.durable_outcome(), DurableOutcome::Started);
 
-        // Terminal (TurnStarted + TurnTerminal)
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let dc = auth
+        let mut terminal = sample_authority();
+        let (_a, p, _c) = admitted_prepared(&mut terminal);
+        let dc = terminal
             .conclude_dispatch(
-                &prepared,
+                p,
                 DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
+                    correlation: "c".to_owned(),
                 },
                 vec![
                     LifecycleObservation::TurnStarted("T1".to_owned()),
@@ -1509,18 +1787,13 @@ mod tests {
             .expect("conclude");
         assert_eq!(dc.durable_outcome(), DurableOutcome::Terminal);
 
-        // ControllerLost (has ControllerLost observation)
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let dc = auth
+        let mut lost = sample_authority();
+        let (_a, p, _c) = admitted_prepared(&mut lost);
+        let dc = lost
             .conclude_dispatch(
-                &prepared,
+                p,
                 DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
+                    correlation: "c".to_owned(),
                 },
                 vec![LifecycleObservation::ControllerLost],
             )
@@ -1528,367 +1801,66 @@ mod tests {
         assert!(dc.controller_lost());
         assert_eq!(dc.durable_outcome(), DurableOutcome::ControllerLost);
 
-        // Ambiguous
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let dc = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
+        let mut ambiguous = sample_authority();
+        let (_a, p, _c) = admitted_prepared(&mut ambiguous);
+        let dc = ambiguous
+            .conclude_dispatch(p, DispatchDisposition::Ambiguous, vec![])
             .expect("conclude");
         assert!(dc.reconciliation_required());
         assert_eq!(dc.durable_outcome(), DurableOutcome::Ambiguous);
     }
 
-    #[test]
-    fn recovery_derives_ambiguous_from_dispatch_prepared_without_conclusion() {
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (_prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let recovery = auth.recover().expect("recover");
-        let ambiguous = recovery.derivable_ambiguous_attempts();
-        assert!(
-            ambiguous.contains(&admission.attempt_id),
-            "DispatchPrepared without conclusion must be derivable as ambiguous"
-        );
-    }
+    // -- Post-send observation boundaries + fresh restart ----------------
 
     #[test]
-    fn post_send_disposition_failure_returns_post_send_error() {
-        let mut auth = sample_authority_with_persist(FakePersist {
-            next_disposition_error: Some("disk full".to_owned()),
-            ..Default::default()
-        });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let err = auth
-            .conclude_dispatch(
-                &prepared,
-                DispatchDisposition::Accepted {
-                    correlation: "corr-1".to_owned(),
-                },
-                vec![],
-            )
-            .expect_err("disposition write failure");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn partial_post_send_write_is_derivable_as_ambiguous() {
-        // Disposition succeeds but NativeAccepted transition fails:
-        // a partial post-send write that must surface as ambiguous.
-        // transition_allow_count=1 lets DispatchPrepared through;
-        // NativeAccepted (call 2) triggers next_transition_error.
-        let mut auth = sample_authority_with_persist(FakePersist {
-            next_transition_error: Some("transition write failed".to_owned()),
-            transition_allow_count: 1,
-            ..Default::default()
-        });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let err = auth
-            .conclude_dispatch(
-                &prepared,
-                DispatchDisposition::Accepted {
-                    correlation: "corr-1".to_owned(),
-                },
-                vec![],
-            )
-            .expect_err("NativeAccepted transition failure");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend error, got {err:?}"
-        );
-
-        // Propagate live arm state then recover
-        let arm_id = auth.arms.keys().next().unwrap().clone();
-        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
-        auth.persist_mut().arm_states.push((arm_id, arm_gen));
-        let recovery = auth.recover().expect("recover");
-        let ambiguous = recovery.derivable_ambiguous_attempts();
-        assert!(
-            ambiguous.contains(&admission.attempt_id),
-            "partial post-send write (disposition ok, NativeAccepted failed) must be derivable as ambiguous"
-        );
-    }
-
-    #[test]
-    fn rejected_disposition_is_not_ambiguous() {
-        let mut auth = sample_authority();
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let conclusion = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
-            .expect("conclude");
-        assert_eq!(conclusion.durable_outcome(), DurableOutcome::Rejected);
-
-        let arm_id = auth.arms.keys().next().unwrap().clone();
-        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
-        auth.persist_mut().arm_states.push((arm_id, arm_gen));
-        let recovery = auth.recover().expect("recover");
-        assert!(
-            recovery.derivable_ambiguous_attempts().is_empty(),
-            "Rejected disposition must not be derivable as ambiguous"
-        );
-    }
-
-    // -- c7: reconcile persistence ------------------------------------
-
-    fn controller_that_reconciles(d: ReconciliationDisposition) -> FakeController {
-        FakeController::new(vec![]).with_reconciliation(d)
-    }
-
-    /// Reconcile helper: admit → prepare → ambiguous conclude.
-    fn admit_prepare_ambiguous(auth: &mut DaemonAuthority<FakePersist>) -> String {
-        let req = std_req();
-        let _signal_id = req.signal_id.clone();
-        let admission = auth.admit_claim(&req).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        auth.conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
-            .expect("conclude");
-        admission.attempt_id
-    }
-
-    #[test]
-    fn reconcile_accepted_records_native_accepted_and_reconciliation_resolved() {
-        let mut auth = sample_authority();
-        let attempt_id = admit_prepare_ambiguous(&mut auth);
-
-        let controller = controller_that_reconciles(ReconciliationDisposition::Accepted);
-        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
-        assert_eq!(result, ReconciliationDisposition::Accepted);
-
-        // Verify durable transitions: NativeAccepted + ReconciliationResolved
-        let snap = auth.persist().clone().recover().expect("recover");
-        let key = "sig-1:attempt-1";
-        let ts = snap.transitions.get(key).expect("transitions exist");
-        assert!(ts.contains(&Transition::NativeAccepted));
-        assert!(ts.contains(&Transition::ReconciliationResolved));
-    }
-
-    #[test]
-    fn reconcile_proven_not_accepted_records_reconciliation_resolved() {
-        let mut auth = sample_authority();
-        let attempt_id = admit_prepare_ambiguous(&mut auth);
-
-        let controller = controller_that_reconciles(ReconciliationDisposition::ProvenNotAccepted);
-        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
-        assert_eq!(result, ReconciliationDisposition::ProvenNotAccepted);
-
-        let snap = auth.persist().clone().recover().expect("recover");
-        let key = "sig-1:attempt-1";
-        let ts = snap.transitions.get(key).expect("transitions exist");
-        assert!(ts.contains(&Transition::ReconciliationResolved));
-        // Not accepted, so no NativeAccepted
-        assert!(!ts.contains(&Transition::NativeAccepted));
-    }
-
-    #[test]
-    fn reconcile_terminal_records_reconciliation_resolved() {
-        let mut auth = sample_authority();
-        let attempt_id = admit_prepare_ambiguous(&mut auth);
-
-        let controller = controller_that_reconciles(ReconciliationDisposition::Terminal);
-        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
-        assert_eq!(result, ReconciliationDisposition::Terminal);
-
-        let snap = auth.persist().clone().recover().expect("recover");
-        let key = "sig-1:attempt-1";
-        let ts = snap.transitions.get(key).expect("transitions exist");
-        assert!(ts.contains(&Transition::ReconciliationResolved));
-    }
-
-    #[test]
-    fn reconcile_unknown_does_not_resolve() {
-        let mut auth = sample_authority();
-        let attempt_id = admit_prepare_ambiguous(&mut auth);
-
-        let controller = controller_that_reconciles(ReconciliationDisposition::Unknown);
-        let result = auth.reconcile(&controller, &attempt_id).expect("reconcile");
-        assert_eq!(result, ReconciliationDisposition::Unknown);
-
-        let snap = auth.persist().clone().recover().expect("recover");
-        let key = "sig-1:attempt-1";
-        let ts = snap.transitions.get(key);
-        if let Some(ts) = ts {
-            assert!(!ts.contains(&Transition::ReconciliationResolved));
-            assert!(!ts.contains(&Transition::NativeAccepted));
-        }
-    }
-
-    #[test]
-    fn reconcile_without_prior_reconciliation_required_fails() {
-        let mut auth = sample_authority();
-        // Admit + prepare + accepted conclusion (not ambiguous)
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        auth.conclude_dispatch(
-            &prepared,
-            DispatchDisposition::Accepted {
-                correlation: "corr-1".to_owned(),
-            },
-            vec![],
-        )
-        .expect("conclude");
-
-        // No ReconciliationRequired transition exists — reconcile should fail.
-        let controller = controller_that_reconciles(ReconciliationDisposition::Accepted);
-        let err = auth
-            .reconcile(&controller, &admission.attempt_id)
-            .expect_err("reconcile without required should fail");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn reconciled_attempt_not_derivable_ambiguous_after_restart() {
-        let mut auth = sample_authority();
-        let attempt_id = admit_prepare_ambiguous(&mut auth);
-
-        // Reconcile to proven-not-accepted
-        let controller = controller_that_reconciles(ReconciliationDisposition::ProvenNotAccepted);
-        auth.reconcile(&controller, &attempt_id).expect("reconcile");
-
-        // Propagate arm state for recovery
-        let arm_id = auth.arms.keys().next().unwrap().clone();
-        let arm_gen = auth.arms[&arm_id].generation;
-        auth.persist_mut().arm_states.push((arm_id, arm_gen));
-
-        // Restart: fresh authority from same backend
-        let mut auth2 = DaemonAuthority::new(auth.persist().clone(), auth.now);
-        auth2.register_arm(sample_arm());
-        let recovery = auth2.recover().expect("recover");
-
-        let ambiguous = recovery.derivable_ambiguous_attempts();
-        assert!(
-            !ambiguous.contains(&attempt_id),
-            "reconciled attempt must not be derivable as ambiguous"
-        );
-    }
-
-    // -- c5: post-send boundary failure coverage -------------------------
-
-    #[test]
-    fn ambiguous_conclusion_partial_write_is_derivable_as_ambiguous() {
-        // Disposition writes but ReconciliationRequired transition fails
-        // (partial record_conclusion for Ambiguous disposition).
-        let mut auth = sample_authority_with_persist(FakePersist {
-            next_transition_error: Some("transition write failed".to_owned()),
-            transition_allow_count: 1, // DispatchPrepared passes; ReconciliationRequired fails
-            ..Default::default()
-        });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        let err = auth
-            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
-            .expect_err("ReconciliationRequired failure");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend, got {err:?}"
-        );
-
-        // Disposition recorded, ReconciliationRequired missing → derivable ambiguous
-        let arm_id = auth.arms.keys().next().unwrap().clone();
-        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
-        auth.persist_mut().arm_states.push((arm_id, arm_gen));
-        let recovery = auth.recover().expect("recover");
-        let ambiguous = recovery.derivable_ambiguous_attempts();
-        assert!(
-            ambiguous.contains(&admission.attempt_id),
-            "Ambiguous partial write (disposition ok, ReconciliationRequired failed) must be derivable"
-        );
-    }
-
-    #[test]
-    fn observation_exact_turn_start_failure_after_conclusion_is_post_send() {
-        // record_conclusion succeeds (disposition + NativeAccepted)
-        // but ExactTurnStart observation write fails.
+    fn observation_turn_start_failure_surfaces_missing_evidence_after_restart() {
         let mut auth = sample_authority_with_persist(FakePersist {
             next_transition_error: Some("ExactTurnStart failed".to_owned()),
-            transition_allow_count: 2, // DispatchPrepared + NativeAccepted pass
+            transition_allow_count: 0,
             ..Default::default()
         });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let err = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
                 vec![LifecycleObservation::TurnStarted("T1".to_owned())],
             )
-            .expect_err("ExactTurnStart failure");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend for observation failure, got {err:?}"
-        );
+            .expect_err("observation failure");
+        assert!(matches!(err, DispatchError::PostSend(_)));
+        // NativeAccepted is durable (atomic conclusion), observation absent.
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
+        assert!(ts.contains(&Transition::NativeAccepted));
+        assert!(!ts.contains(&Transition::ExactTurnStart));
 
-        // Recover: NativeAccepted present, ExactTurnStart missing
-        let arm_id = auth.arms.keys().next().unwrap().clone();
-        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
-        auth.persist_mut().arm_states.push((arm_id, arm_gen));
-        let _recovery = auth.recover().expect("recover");
-        let ts = auth
-            .persist()
-            .get_transitions("sig-1", &admission.attempt_id);
+        // Fresh restart: the accepted attempt surfaces as missing evidence.
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
         assert!(
-            ts.contains(&Transition::NativeAccepted),
-            "NativeAccepted must be durable after record_conclusion"
+            recovery.missing_evidence_attempts().contains(&attempt_id),
+            "accepted-without-evidence must be visible after restart"
         );
         assert!(
-            !ts.contains(&Transition::ExactTurnStart),
-            "ExactTurnStart must not be present after failed observation write"
+            !recovery
+                .derivable_ambiguous_attempts()
+                .contains(&attempt_id),
+            "not ambiguous — the acceptance is durably known"
         );
     }
 
     #[test]
-    fn observation_exact_turn_terminal_failure_after_conclusion_is_post_send() {
-        // record_conclusion + ExactTurnStart succeed, ExactTurnTerminal fails.
+    fn observation_terminal_failure_keeps_started_evidence() {
         let mut auth = sample_authority_with_persist(FakePersist {
             next_transition_error: Some("ExactTurnTerminal failed".to_owned()),
-            transition_allow_count: 3, // DispatchPrepared + NativeAccepted + ExactTurnStart pass
+            transition_allow_count: 1,
             ..Default::default()
         });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let err = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1897,75 +1869,50 @@ mod tests {
                     LifecycleObservation::TurnTerminal("T1".to_owned(), true),
                 ],
             )
-            .expect_err("ExactTurnTerminal failure");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend for ExactTurnTerminal failure, got {err:?}"
-        );
-
-        // ExactTurnStart durable, ExactTurnTerminal missing
-        let ts = auth
-            .persist()
-            .get_transitions("sig-1", &admission.attempt_id);
-        assert!(ts.contains(&Transition::NativeAccepted));
+            .expect_err("terminal failure");
+        assert!(matches!(err, DispatchError::PostSend(_)));
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
         assert!(ts.contains(&Transition::ExactTurnStart));
         assert!(!ts.contains(&Transition::ExactTurnTerminal));
+        // Started evidence is present — not in the missing-evidence set.
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
+        assert!(!recovery.missing_evidence_attempts().contains(&attempt_id));
     }
 
     #[test]
-    fn observation_controller_lost_failure_after_conclusion_is_post_send() {
-        // record_conclusion succeeds, ControllerLost observation write fails.
+    fn observation_controller_lost_failure_is_post_send() {
         let mut auth = sample_authority_with_persist(FakePersist {
             next_transition_error: Some("ControllerLost failed".to_owned()),
-            transition_allow_count: 2, // DispatchPrepared + NativeAccepted pass
+            transition_allow_count: 0,
             ..Default::default()
         });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let err = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
                 vec![LifecycleObservation::ControllerLost],
             )
-            .expect_err("ControllerLost failure");
-        assert!(
-            matches!(err, DispatchError::PostSend(_)),
-            "expected PostSend for ControllerLost failure, got {err:?}"
-        );
-
-        // NativeAccepted durable, ControllerLost missing
-        let ts = auth
-            .persist()
-            .get_transitions("sig-1", &admission.attempt_id);
+            .expect_err("observation failure");
+        assert!(matches!(err, DispatchError::PostSend(_)));
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
         assert!(ts.contains(&Transition::NativeAccepted));
         assert!(!ts.contains(&Transition::ControllerLost));
     }
 
     #[test]
-    fn restart_after_post_send_failure_no_replay_grant() {
-        // After a post-send conclusion failure, a new claim admission
-        // for the same arm at the same generation must return Occupied
-        // (the arm is still occupied by the failed attempt).
-        // Replay of the same request_id works normally.
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+    fn restart_after_post_send_failure_blocks_new_grant_until_rearm() {
         let mut auth = sample_authority_with_persist(FakePersist {
             next_disposition_error: Some("post-send write failed".to_owned()),
             ..Default::default()
         });
-        let admission = auth.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
         let _err = auth
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1973,396 +1920,384 @@ mod tests {
             )
             .expect_err("post-send failure");
 
-        // Propagate arm state for recovery
-        let arm_id = auth.arms.keys().next().unwrap().clone();
-        let arm_gen = auth.arms.get(&arm_id).unwrap().generation;
-        auth.persist_mut().arm_states.push((arm_id, arm_gen));
-
-        // Session 2: fresh authority from same persist backend
-        let mut auth2 = DaemonAuthority::new(auth.persist().clone(), now);
-        auth2.register_arm(sample_arm());
+        // Full production restart — no registration, no map copying.
+        let mut auth2 = restarted(auth.persist());
         let _recovery = auth2.recover().expect("recover");
 
-        // Replay of the same request_id must still work
+        // Replay works, returns the same attempt id.
         let replay = auth2.admit_claim(&std_req()).expect("replay after failure");
-        assert_eq!(
-            replay.outcome,
-            ClaimOutcome::Replay,
-            "replay must work after post-send failure"
-        );
-        assert_eq!(replay.attempt_id, admission.attempt_id);
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert_eq!(replay.attempt_id, attempt_id);
+        assert!(replay.into_receipt().is_none());
 
-        // A new claim on the same arm at same generation must be Occupied
-        let ev2 = vec![sample_event("new-claim")];
-        let new_req = claim_req("arm-01", "req-2", "sig-2", ev2);
-        let occupied = auth2.admit_claim(&new_req).expect_err("must be occupied");
-        assert!(
-            matches!(occupied, AdmissionError::Occupied),
-            "new claim must be Occupied after post-send failure, got {occupied:?}"
-        );
+        // A new claim on the same arm/generation is Occupied until re-arm.
+        let req2 = claim_req("arm-01", "req-2", "sig-2", vec![sample_event("new")]);
+        let occupied = auth2.admit_claim(&req2).expect_err("must be occupied");
+        assert!(matches!(occupied, AdmissionError::Occupied));
 
-        // After re-arm, a new claim at the new generation must succeed
+        // Re-arm on the recovered authority → new claim at gen 2.
         auth2.advance_generation("arm-01").expect("re-arm");
-        let ev3 = vec![sample_event("rearmed-claim")];
-        let rearmed_req = claim_req("arm-01", "req-3", "sig-3", ev3);
-        let fresh = auth2.admit_claim(&rearmed_req).expect("fresh after re-arm");
-        assert_eq!(
-            fresh.claim.generation, 2,
-            "fresh claim must be at generation 2 after re-arm"
-        );
-        assert!(fresh.attachment.is_some(), "must mint attachment");
+        let req3 = claim_req("arm-01", "req-3", "sig-3", vec![sample_event("fresh")]);
+        let fresh = auth2.admit_claim(&req3).expect("fresh after re-arm");
+        assert_eq!(fresh.attempt_id, "attempt-2", "counter must have survived");
+        assert!(fresh.into_receipt().is_some());
     }
 
-    #[test]
-    fn full_post_send_failure_boundary_matrix() {
-        // Exercise every PostSend failure boundary and verify the
-        // correct partial state is persisted for recovery.
-
-        // -- Boundary 1: disposition write fails (entire conclusion lost) --
-        {
-            let mut auth = sample_authority_with_persist(FakePersist {
-                next_disposition_error: Some("disk full".to_owned()),
-                ..Default::default()
-            });
-            let admission = auth.admit_claim(&std_req()).expect("admit");
-            let att = admission.attachment.expect("attachment");
-            let (prepared, _cmd) = auth
-                .prepare_dispatch(&admission.claim, &att)
-                .expect("prepare");
-            let _err = auth
-                .conclude_dispatch(
-                    &prepared,
-                    DispatchDisposition::Accepted {
-                        correlation: "corr-1".to_owned(),
-                    },
-                    vec![],
-                )
-                .expect_err("disposition failure");
-
-            let ts = auth
-                .persist()
-                .get_transitions("sig-1", &admission.attempt_id);
-            assert!(ts.contains(&Transition::DispatchPrepared));
-            assert!(
-                !ts.contains(&Transition::NativeAccepted),
-                "NativeAccepted must not exist when disposition write failed"
-            );
-            assert!(
-                auth.persist()
-                    .get_disposition(&admission.attempt_id)
-                    .is_none(),
-                "no disposition stored"
-            );
-        }
-
-        // -- Boundary 2: Ambiguous + ReconciliationRequired transition fails --
-        // With two-phase atomic conclusion, neither disposition nor
-        // transition appears when conclusion fails.
-        {
-            let mut auth = sample_authority_with_persist(FakePersist {
-                next_transition_error: Some("ReconciliationRequired failed".to_owned()),
-                transition_allow_count: 1, // DispatchPrepared uses slot 1
-                ..Default::default()
-            });
-            let admission = auth.admit_claim(&std_req()).expect("admit");
-            let att = admission.attachment.expect("attachment");
-            let (prepared, _cmd) = auth
-                .prepare_dispatch(&admission.claim, &att)
-                .expect("prepare");
-            let _err = auth
-                .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
-                .expect_err("ReconciliationRequired failure");
-
-            // Atomic: neither disposition nor ReconciliationRequired appears
-            assert!(
-                auth.persist()
-                    .get_disposition(&admission.attempt_id)
-                    .is_none(),
-                "disposition must NOT be recorded (atomic failure)"
-            );
-            let ts = auth
-                .persist()
-                .get_transitions("sig-1", &admission.attempt_id);
-            assert!(!ts.contains(&Transition::ReconciliationRequired));
-        }
-
-        // -- Boundary 3: NativeAccepted fails (Accepted atomic failure) --
-        // With two-phase atomic conclusion, neither disposition nor
-        // NativeAccepted appears when conclusion fails.
-        {
-            let mut auth = sample_authority_with_persist(FakePersist {
-                next_transition_error: Some("NativeAccepted failed".to_owned()),
-                transition_allow_count: 1, // DispatchPrepared uses slot 1
-                ..Default::default()
-            });
-            let admission = auth.admit_claim(&std_req()).expect("admit");
-            let att = admission.attachment.expect("attachment");
-            let (prepared, _cmd) = auth
-                .prepare_dispatch(&admission.claim, &att)
-                .expect("prepare");
-            let _err = auth
-                .conclude_dispatch(
-                    &prepared,
-                    DispatchDisposition::Accepted {
-                        correlation: "corr-1".to_owned(),
-                    },
-                    vec![],
-                )
-                .expect_err("NativeAccepted failure");
-
-            assert!(
-                auth.persist()
-                    .get_disposition(&admission.attempt_id)
-                    .is_none(),
-                "disposition must NOT be recorded (atomic failure)"
-            );
-            let ts = auth
-                .persist()
-                .get_transitions("sig-1", &admission.attempt_id);
-            assert!(!ts.contains(&Transition::NativeAccepted));
-        }
-    }
-
-    // -- c6: recovery from persisted state only — -------------------------
-    // No test map copying into FakePersist; all metadata is production-
-    // persisted via register_arm, advance_generation, and the Persist
-    // contract.
+    // -- Full semantic packet recovery -----------------------------------
 
     #[test]
-    fn recovery_from_backend_only_no_test_copying() {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
+    fn recovery_reconstructs_full_semantic_packet_from_backend_alone() {
+        // Session 1: production ops only — no FakePersist field copying.
+        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now());
+        auth1.register_arm(sample_arm()).expect("register arm-01");
+        auth1
+            .register_arm(KnownArm {
+                arm_id: "arm-02".to_owned(),
+                seat_id: "dev".to_owned(),
+                route: "managed_turn_start".to_owned(),
+                coverage_until: now() + TimeDuration::hours(5),
+                ..sample_arm()
+            })
+            .expect("register arm-02");
+        auth1.advance_generation("arm-01").expect("advance");
 
-        // Session 1: register arm, advance generation to persist
-        // arm state, then admit/prepare/conclude at the advanced gen.
-        // No direct FakePersist field manipulation.
-        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
-        auth1.register_arm(sample_arm());
-        // Advance generation before claim — persists arm state for recovery.
-        auth1.advance_generation("arm-01").expect("advance gen");
-
-        let admission = auth1.admit_claim(&std_req()).expect("admit");
-        // Claim is at generation 2
-        assert_eq!(admission.claim.generation, 2);
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth1
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
+        let admission = auth1
+            .admit_claim(&claim_req(
+                "arm-01",
+                "req-1",
+                "sig-1",
+                vec![sample_event("hello")],
+            ))
+            .expect("admit");
+        let attempt_id = admission.attempt_id.clone();
+        let receipt = admission.into_receipt().expect("receipt");
+        let (prepared, _cmd) = auth1.prepare_dispatch(receipt).expect("prepare");
         auth1
             .conclude_dispatch(
-                &prepared,
+                prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
-                vec![],
+                vec![
+                    LifecycleObservation::TurnStarted("T1".to_owned()),
+                    LifecycleObservation::TurnTerminal("T1".to_owned(), true),
+                ],
             )
             .expect("conclude");
 
-        // Session 2: fresh authority from same backend.
-        let persisted = auth1.persist().clone();
-        let mut auth2 = DaemonAuthority::new(persisted, now);
-        auth2.register_arm(sample_arm());
+        auth1
+            .record_handled_cursor("arm-01", "cursor-42")
+            .expect("cursor");
+        auth1.set_rearmed("arm-01").expect("rearm");
+
+        // Session 2: fresh authority from the backend alone. No
+        // register_arm before recover.
+        let mut auth2 = restarted(auth1.persist());
         let recovery = auth2.recover().expect("recover after restart");
 
+        // Arms: full policy, not skeletons.
+        let arm = recovery.arms.get("arm-01").expect("arm-01");
+        assert_eq!(arm.generation, 2, "advanced generation must survive");
+        assert_eq!(arm.seat_id, "example-devrev");
+        assert_eq!(arm.capability, ManagedCapability::ManagedTurnStart);
+        assert_eq!(arm.coverage_until, sample_arm().coverage_until);
+        let arm2 = recovery.arms.get("arm-02").expect("arm-02");
+        assert_eq!(arm2.seat_id, "dev");
+        assert_eq!(arm2.route, "managed_turn_start");
+
+        // Attachments: installed, exact persisted lease (not wall clock).
+        let att = recovery.attachments.get(&attempt_id).expect("attachment");
+        assert_eq!(att.seat_id(), "example-devrev");
+        assert_eq!(att.capability(), ManagedCapability::ManagedTurnStart);
+        assert_eq!(att.lease_until(), sample_arm().coverage_until);
+        assert!(!att.is_revoked());
+        assert!(!att.verifier_ref().is_empty());
         assert!(
-            recovery.arms.contains_key("arm-01"),
-            "arm-01 must be reconstructed from persisted arm_states"
-        );
-        let arm = recovery.arms.get("arm-01").expect("arm exists");
-        assert_eq!(
-            arm.generation, 2,
-            "generation must be 2 after recovery (advance persisted)"
+            auth2.get_attachment(&attempt_id).is_some(),
+            "attachment must be installed into live authority state"
         );
 
-        // Claim replay works from recovered state (same generation).
-        let replay = auth2.admit_claim(&std_req()).expect("replay after restart");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert_eq!(replay.attempt_id, admission.attempt_id);
-        assert!(
-            replay.attachment.is_none(),
-            "replay must not mint attachment"
-        );
-    }
-
-    #[test]
-    fn recovery_preserves_revoked_attachment_rejection() {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
-        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
-        auth1.register_arm(sample_arm());
-
-        let admission = auth1.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        // Revoke the attachment before prepare — prepares must fail.
-        auth1.revoke_attachment(&att.attempt_id);
-        let err = auth1
-            .prepare_dispatch(&admission.claim, &att)
-            .expect_err("prepare after revoke");
-        assert!(
-            matches!(err, DispatchError::PreSend(_)),
-            "prepare must fail for revoked attachment"
-        );
-
-        // Fresh authority, same backend — claim is still recorded,
-        // replay works but no dispatch-capable attachment.
-        let persisted = auth1.persist().clone();
-        let mut auth2 = DaemonAuthority::new(persisted, now);
-        auth2.register_arm(sample_arm());
-        let _recovery = auth2.recover().expect("recover");
-
-        let replay = auth2.admit_claim(&std_req()).expect("replay");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert!(replay.attachment.is_none());
-    }
-
-    #[test]
-    fn recovery_preserves_generation_advance_for_new_claim() {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
-        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
-        auth1.register_arm(sample_arm());
-
-        // Admit and conclude at gen 1
-        let admission = auth1.admit_claim(&std_req()).expect("admit");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth1
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        auth1
-            .conclude_dispatch(
-                &prepared,
-                DispatchDisposition::Accepted {
-                    correlation: "corr-1".to_owned(),
-                },
-                vec![],
-            )
-            .expect("conclude");
-
-        // Advance generation through production re-arm path
-        let gen2 = auth1.advance_generation("arm-01").expect("advance");
-        assert_eq!(gen2, 2);
-
-        // Restart: fresh authority from same backend.
-        // register_arm provides the arm definition; recover()
-        // restores the persisted generation (gen 2).
-        let persisted = auth1.persist().clone();
-        let mut auth2 = DaemonAuthority::new(persisted, now);
-        auth2.register_arm(sample_arm());
-        let recovery = auth2.recover().expect("recover");
-
-        // Generation 2 must survive restart
-        let arm = recovery.arms.get("arm-01").expect("arm exists");
-        assert_eq!(
-            arm.generation, 2,
-            "generation 2 must be recovered from persisted state"
-        );
-
-        // A new claim must get generation 2
-        let ev2 = vec![sample_event("gen2-claim")];
-        let req2 = claim_req("arm-01", "req-2", "sig-2", ev2);
-        let fresh = auth2.admit_claim(&req2).expect("fresh at gen 2");
-        assert_eq!(fresh.claim.generation, 2);
-        assert!(fresh.attachment.is_some());
-        assert_eq!(fresh.attachment.unwrap().generation, 2);
-    }
-
-    #[test]
-    fn fresh_authority_restart_reconstructs_full_semantic_packet() {
-        let now = time::macros::datetime!(2026-01-15 12:00:00 UTC);
-
-        // Session 1: admit claims, record handled cursors, set re-arm positions.
-        let mut auth1 = DaemonAuthority::new(FakePersist::default(), now);
-        auth1.register_arm(sample_arm());
-        auth1.register_arm(KnownArm {
-            arm_id: "arm-02".to_owned(),
-            generation: 1,
-            seat_id: "dev".to_owned(),
-            route: "test".to_owned(),
-            coverage_until: now + time::Duration::hours(24),
-        });
-
-        let admission = auth1.admit_claim(&std_req()).expect("admit claim");
-        let att = admission.attachment.expect("attachment");
-        let (prepared, _cmd) = auth1
-            .prepare_dispatch(&admission.claim, &att)
-            .expect("prepare");
-        auth1
-            .conclude_dispatch(
-                &prepared,
-                DispatchDisposition::Accepted {
-                    correlation: "corr-1".to_owned(),
-                },
-                vec![],
-            )
-            .expect("conclude");
-
-        auth1.record_handled_cursor("arm-01", "cursor-42");
-        auth1.set_rearmed("arm-01");
-
-        // Propagate live authority metadata to the fake persist backend for recovery.
-        // Only arm-01 is expected to be recovered; arm-02 is a
-        // fresh-registered peer arm that was never persisted.
-        let arm_states: Vec<(String, u64)> =
-            vec![("arm-01".to_owned(), auth1.arms["arm-01"].generation)];
-        let cursors = auth1.handled_cursors.clone();
-        let rearmed = auth1.rearm_positions.clone();
-        {
-            let p = auth1.persist_mut();
-            for (arm_id, generation) in arm_states {
-                p.arm_states.push((arm_id, generation));
-            }
-            p.handled_cursors = cursors;
-            p.rearm_positions = rearmed;
-        }
-
-        // Session 2: fresh authority (different instance) recovers from persist.
-        let mut auth2 = DaemonAuthority::new(auth1.persist().clone(), now);
-        auth2.register_arm(sample_arm());
-        let recovery = auth2.recover().expect("recover after restart");
-
-        // Verify full semantic packet reconstructed from persisted data.
-        assert_eq!(recovery.arms.len(), 1); // arm-02 not in persisted arm_states
-        assert!(
-            recovery.arms.contains_key("arm-01"),
-            "persisted arm must be reconstructed"
-        );
-        assert!(
-            !recovery.arms.contains_key("arm-02"),
-            "arm-02 was not persisted and should not appear"
-        );
-        assert!(
-            !recovery.attachments.is_empty(),
-            "attachments must be present"
-        );
         assert_eq!(
             recovery.handled_cursors.get("arm-01").map(String::as_str),
-            Some("cursor-42"),
-            "handled cursor must survive restart"
+            Some("cursor-42")
         );
-        assert_eq!(
-            recovery.rearm_positions.get("arm-01"),
-            Some(&true),
-            "re-arm position must survive restart"
-        );
+        assert_eq!(recovery.rearm_positions.get("arm-01"), Some(&true));
 
-        // Verify derivable ambiguous: none, since our only attempt was cleanly concluded.
-        let ambiguous = recovery.derivable_ambiguous_attempts();
-        assert!(
-            ambiguous.is_empty(),
-            "no ambiguous work expected for cleanly concluded attempt"
-        );
-
-        // Verify claim replay returns recorded attempt_id, not a fresh one.
+        // Replay returns the recorded attempt; no fresh receipt.
         let replay = auth2.admit_claim(&std_req()).expect("replay after restart");
-        assert_eq!(
-            replay.outcome,
-            ClaimOutcome::Replay,
-            "recovery must replay, not re-admit"
-        );
-        assert_eq!(
-            replay.attempt_id, admission.attempt_id,
-            "replay must return recorded attempt_id"
-        );
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert_eq!(replay.attempt_id, attempt_id);
+        assert!(replay.into_receipt().is_none());
+
+        // The recovered authority serves a complete fresh cycle.
+        auth2.advance_generation("arm-01").expect("re-arm");
+        let req2 = claim_req("arm-01", "req-4", "sig-4", vec![sample_event("next")]);
+        let admission2 = auth2.admit_claim(&req2).expect("fresh admit");
+        let receipt2 = admission2.into_receipt().expect("receipt");
+        let (prepared2, _cmd2) = auth2.prepare_dispatch(receipt2).expect("prepare");
+        auth2
+            .conclude_dispatch(prepared2, DispatchDisposition::Rejected, vec![])
+            .expect("conclude");
+    }
+
+    #[test]
+    fn recovery_attempt_counter_continues_monotonically() {
+        let mut auth1 = sample_authority();
+        let (first, _rcpt) = admitted(&mut auth1);
+        assert_eq!(first, "attempt-1");
+        let mut auth2 = restarted(auth1.persist());
+        auth2.recover().expect("recover");
+        let req2 = claim_req("arm-01", "req-2", "sig-2", vec![sample_event("next")]);
+        auth2.advance_generation("arm-01").expect("advance");
+        let admission = auth2.admit_claim(&req2).expect("admit");
+        assert_eq!(admission.attempt_id, "attempt-2");
+    }
+
+    // -- Split-phase reconciliation --------------------------------------
+
+    fn admit_prepare_ambiguous(auth: &mut DaemonAuthority<FakePersist>) -> String {
+        let (attempt_id, receipt) = admitted(auth);
+        let (prepared, _cmd) = auth.prepare_dispatch(receipt).expect("prepare");
+        auth.conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+            .expect("conclude");
+        attempt_id
+    }
+
+    #[test]
+    fn unreconciled_ambiguous_attempt_is_derivable_after_restart() {
+        // Key fix: a properly recorded ambiguous conclusion must be
+        // discoverable for reconciliation after restart.
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
         assert!(
-            replay.attachment.is_none(),
-            "replay must not mint a new dispatch-capable attachment"
+            recovery
+                .derivable_ambiguous_attempts()
+                .contains(&attempt_id),
+            "unreconciled ambiguous attempt must be derivable after restart"
         );
+    }
+
+    #[test]
+    fn split_phase_reconcile_commits_resolution_durably() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+
+        // Phase 1: authority produces work; no controller borrowed.
+        let work = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect("prepare_reconciliation");
+        assert_eq!(work.attempt_id(), attempt_id);
+
+        // Provider probe happens strictly outside authority.
+        let controller = FakeController::new(vec![])
+            .with_reconciliation(crate::controller::ReconciliationDisposition::ProvenNotAccepted);
+        let disposition = controller.reconcile(work.attempt_id());
+
+        // Phase 2: authority commits the probe result.
+        let result = auth
+            .commit_reconciliation(work, disposition)
+            .expect("commit_reconciliation");
+        assert_eq!(
+            result,
+            crate::controller::ReconciliationDisposition::ProvenNotAccepted
+        );
+
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
+        assert!(ts.contains(&Transition::ReconciliationResolved), "{ts:?}");
+        assert!(!ts.contains(&Transition::NativeAccepted));
+        assert_eq!(
+            auth.persist().reconciliations.get(&attempt_id),
+            Some(&ReconciliationState::ProvenNotAccepted)
+        );
+
+        // Restart: resolved attempts are no longer derivable.
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
+        assert!(
+            !recovery
+                .derivable_ambiguous_attempts()
+                .contains(&attempt_id)
+        );
+    }
+
+    #[test]
+    fn split_phase_reconcile_accepted_records_native_accepted() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+        let work = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect("prepare_reconciliation");
+        let controller = FakeController::new(vec![])
+            .with_reconciliation(crate::controller::ReconciliationDisposition::Accepted);
+        let disposition = controller.reconcile(work.attempt_id());
+        auth.commit_reconciliation(work, disposition)
+            .expect("commit");
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
+        assert!(ts.contains(&Transition::NativeAccepted));
+        assert!(ts.contains(&Transition::ReconciliationResolved));
+        assert_eq!(
+            auth.persist().reconciliations.get(&attempt_id),
+            Some(&ReconciliationState::Accepted)
+        );
+    }
+
+    #[test]
+    fn reconcile_unknown_stays_derivable_after_restart() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+        let work = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect("prepare_reconciliation");
+        let controller = FakeController::new(vec![])
+            .with_reconciliation(crate::controller::ReconciliationDisposition::Unknown);
+        let disposition = controller.reconcile(work.attempt_id());
+        auth.commit_reconciliation(work, disposition)
+            .expect("commit");
+        // The Unknown probe result is persisted but does not resolve.
+        assert_eq!(
+            auth.persist().reconciliations.get(&attempt_id),
+            Some(&ReconciliationState::Unknown)
+        );
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
+        assert!(
+            recovery
+                .derivable_ambiguous_attempts()
+                .contains(&attempt_id),
+            "Unknown resolution must stay derivable"
+        );
+    }
+
+    #[test]
+    fn repeated_same_resolution_is_idempotent_conflicting_fails() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+        let controller = FakeController::new(vec![])
+            .with_reconciliation(crate::controller::ReconciliationDisposition::Terminal);
+        let work = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect("prepare_reconciliation");
+        let disposition = controller.reconcile(work.attempt_id());
+        auth.commit_reconciliation(work, disposition)
+            .expect("first resolution");
+
+        // After resolution, prepare refuses — no second probe cycle.
+        let err = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect_err("already resolved — prepare must refuse");
+        assert!(matches!(err, DispatchError::PostSend(_)));
+
+        // Durable state has exactly one Resolved transition.
+        let ts = auth.persist().get_transitions("sig-1", &attempt_id);
+        assert_eq!(
+            ts.iter()
+                .filter(|t| **t == Transition::ReconciliationResolved)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reconciliation_requires_prior_ambiguity() {
+        let mut auth = sample_authority();
+        let (attempt_id, prepared, _cmd) = admitted_prepared(&mut auth);
+        auth.conclude_dispatch(
+            prepared,
+            DispatchDisposition::Accepted {
+                correlation: "corr-1".to_owned(),
+            },
+            vec![],
+        )
+        .expect("conclude");
+        // Not ambiguous: the commit of any resolution refuses to run
+        // because no ReconciliationRequired transition exists.
+        let work = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect("binding exists");
+        let disposition = crate::controller::ReconciliationDisposition::Accepted;
+        let err = auth
+            .commit_reconciliation(work, disposition)
+            .expect_err("no prior ReconciliationRequired");
+        assert!(matches!(err, DispatchError::PostSend(_)));
+    }
+
+    #[test]
+    fn reconciliation_unknown_attempt_fails_closed_without_fallback() {
+        let mut auth = sample_authority();
+        admit_prepare_ambiguous(&mut auth);
+        let err = auth
+            .prepare_reconciliation("attempt-99")
+            .expect_err("unknown attempt must fail closed");
+        assert!(
+            matches!(&err, DispatchError::PostSend(msg) if msg.contains("binding")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_binding_tamper_fails_closed() {
+        let mut auth = sample_authority();
+        let attempt_id = admit_prepare_ambiguous(&mut auth);
+        auth.persist_mut()
+            .attempt_signals
+            .insert(attempt_id.clone(), "sig-retarget".to_owned());
+        // The commit must fail closed — no fallback to attempt_id.
+        let work = auth
+            .prepare_reconciliation(&attempt_id)
+            .expect("prepare reads the (tampered) binding");
+        let disposition = crate::controller::ReconciliationDisposition::Terminal;
+        let err = auth
+            .commit_reconciliation(work, disposition)
+            .expect_err("tampered binding");
+        assert!(matches!(err, DispatchError::PostSend(_)));
+    }
+
+    // -- Fail-closed cursor / re-arm --------------------------------------
+
+    #[test]
+    fn handled_cursor_and_rearm_persist_and_recover() {
+        let mut auth = sample_authority();
+        auth.record_handled_cursor("arm-01", "cursor-7")
+            .expect("cursor");
+        auth.set_rearmed("arm-01").expect("rearm");
+        let persist = auth.persist();
+        assert_eq!(
+            persist.handled_cursors.get("arm-01"),
+            Some(&"cursor-7".to_owned())
+        );
+        assert_eq!(persist.rearm_positions.get("arm-01"), Some(&true));
+
+        let mut auth2 = restarted(auth.persist());
+        let recovery = auth2.recover().expect("recover");
+        assert_eq!(
+            recovery.handled_cursors.get("arm-01").map(String::as_str),
+            Some("cursor-7")
+        );
+        assert_eq!(recovery.rearm_positions.get("arm-01"), Some(&true));
+    }
+
+    #[test]
+    fn cursor_and_rearm_storage_failures_leave_live_state_unchanged() {
+        let mut auth = sample_authority();
+        auth.persist_mut().next_cursor_error = Some("cursor failed".to_owned());
+        assert!(matches!(
+            auth.record_handled_cursor("arm-01", "cursor-7"),
+            Err(AdmissionError::Storage(_))
+        ));
+        assert!(!auth.persist().handled_cursors.contains_key("arm-01"));
+        auth.persist_mut().next_rearm_error = Some("rearm failed".to_owned());
+        assert!(matches!(
+            auth.set_rearmed("arm-01"),
+            Err(AdmissionError::Storage(_))
+        ));
+        assert!(!auth.persist().rearm_positions.contains_key("arm-01"));
+        // Clearing the fault lets both records land.
+        auth.persist_mut().next_cursor_error = None;
+        auth.persist_mut().next_rearm_error = None;
+        auth.record_handled_cursor("arm-01", "cursor-7")
+            .expect("cursor ok");
+        auth.set_rearmed("arm-01").expect("rearm ok");
     }
 }

@@ -10,44 +10,194 @@
 //! `gearwitd` is the sole registry, policy, lease, claim, lifecycle,
 //! persistence, handled-cursor, and re-arm authority. The controller port
 //! consumes its contracts; it does not maintain competing state.
+//!
+//! # Sealing
+//!
+//! Every surface the caller handles between authority phases is sealed:
+//! attachment, action, and command carry no public constructible or mutable
+//! fields and cannot be cloned. The command is consumed by the native-I/O
+//! adapter exactly once.
 
 use time::OffsetDateTime;
 
+/// Closed capability set for controller grants.
+///
+/// The managed-turn-start capability is the only closed value in Gate 1.
+/// Route strings are mapped into this set through [`ManagedCapability::parse`];
+/// anything else fails closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ManagedCapability {
+    /// Start an exact managed model turn for a claimed Gearwit signal.
+    ManagedTurnStart,
+}
+
+impl ManagedCapability {
+    /// Canonical provider route spelling for the managed-turn capability.
+    pub const MANAGED_TURN_START_ROUTE: &'static str = "complete_background_tool";
+
+    /// Parse a provider route name into the closed capability set.
+    #[must_use]
+    pub fn parse(route: &str) -> Option<Self> {
+        match route {
+            Self::MANAGED_TURN_START_ROUTE | "managed_turn_start" => Some(Self::ManagedTurnStart),
+            _ => None,
+        }
+    }
+
+    /// The canonical route spelling for this capability.
+    #[must_use]
+    pub fn as_route(self) -> &'static str {
+        match self {
+            Self::ManagedTurnStart => Self::MANAGED_TURN_START_ROUTE,
+        }
+    }
+}
+
 /// Host-minted controller attachment bound to seat, arm, generation,
-/// capabilities, and lease.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// capability, and lease.
+///
+/// Sealed: fields are private and this type is not `Clone`. Only the daemon
+/// authority mints attachment instances; the controller port can only read
+/// dimensions through accessors.
+#[derive(Debug, Eq, PartialEq)]
 pub struct ControllerAttachment {
     /// Stable attempt id (minted by gearwitd).
-    pub attempt_id: String,
+    attempt_id: String,
     /// Arm id.
-    pub arm_id: String,
+    arm_id: String,
     /// Arm generation at claim time.
-    pub generation: u64,
+    generation: u64,
     /// Seat token this attempt runs for.
-    pub seat_id: String,
-    /// Bounded capability route (e.g. `"complete_background_tool"`).
-    pub route: String,
+    seat_id: String,
+    /// Bounded capability route.
+    route: String,
+    /// Closed capability granted by this attachment.
+    capability: ManagedCapability,
     /// Lease end.
-    pub lease_until: OffsetDateTime,
+    lease_until: OffsetDateTime,
+}
+
+impl ControllerAttachment {
+    /// Authority-only construction.
+    pub(crate) fn new(
+        attempt_id: String,
+        arm_id: String,
+        generation: u64,
+        seat_id: String,
+        route: String,
+        capability: ManagedCapability,
+        lease_until: OffsetDateTime,
+    ) -> Self {
+        Self {
+            attempt_id,
+            arm_id,
+            generation,
+            seat_id,
+            route,
+            capability,
+            lease_until,
+        }
+    }
+
+    /// The attempt id.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// The arm id.
+    #[must_use]
+    pub fn arm_id(&self) -> &str {
+        &self.arm_id
+    }
+
+    /// The arm generation at claim time.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The seat token.
+    #[must_use]
+    pub fn seat_id(&self) -> &str {
+        &self.seat_id
+    }
+
+    /// The bounded capability route.
+    #[must_use]
+    pub fn route(&self) -> &str {
+        &self.route
+    }
+
+    /// The closed capability granted.
+    #[must_use]
+    pub fn capability(&self) -> ManagedCapability {
+        self.capability
+    }
+
+    /// The lease end.
+    #[must_use]
+    pub fn lease_until(&self) -> OffsetDateTime {
+        self.lease_until
+    }
 }
 
 /// Authority-produced bounded controller work for phase 2.
 ///
-/// Carries the minted attachment (seat, arm, generation, route, lease,
-/// `attempt_id`) and the signal action to dispatch. All fields are
-/// authority-produced — callers cannot supply or alter them.
-/// The opaque `attempt_id` for phase 3 correlation is private.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The only handle the caller receives for the native-I/O phase. Sealed: all
+/// fields are private, there is no `Clone`, and the command is single-use —
+/// [`ControllerCommand::dispatch`] consumes it. Read dimensions only through
+/// accessors, before dispatch.
+#[derive(Debug, Eq, PartialEq)]
 pub struct ControllerCommand {
     /// Authority-minted attachment for the controller.
-    pub attachment: ControllerAttachment,
+    attachment: ControllerAttachment,
     /// Bounded signal action for dispatch.
-    pub action: SignalAction,
-    /// Opaque `attempt_id` for phase 3 conclusion.
-    pub(crate) attempt_id: String,
+    action: SignalAction,
+    /// Opaque `attempt_id` for phase 3 correlation.
+    attempt_id: String,
 }
 
-impl ControllerCommand {}
+impl ControllerCommand {
+    /// Authority-only construction.
+    pub(crate) fn new(
+        attachment: ControllerAttachment,
+        action: SignalAction,
+        attempt_id: String,
+    ) -> Self {
+        Self {
+            attachment,
+            action,
+            attempt_id,
+        }
+    }
+
+    /// Read-only attachment reference.
+    #[must_use]
+    pub fn attachment(&self) -> &ControllerAttachment {
+        &self.attachment
+    }
+
+    /// Read-only action reference.
+    #[must_use]
+    pub fn action(&self) -> &SignalAction {
+        &self.action
+    }
+
+    /// The opaque `attempt_id`, for phase 3 observation correlation.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Consume this command and perform the native dispatch exactly once.
+    ///
+    /// After this call the command is gone — a duplicate dispatch cannot be
+    /// assembled from the same command.
+    pub fn dispatch(self, controller: &mut dyn Controller) -> DispatchDisposition {
+        controller.dispatch(&self.attachment, &self.action)
+    }
+}
 
 /// The fixed action: a closed, versioned `handle_claimed_signal`.
 ///
@@ -55,14 +205,45 @@ impl ControllerCommand {}
 /// retrieved through the authorized persistence port, not passed
 /// here. Provider bodies and ring reason are data — never
 /// interpolated as model instructions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Sealed: fields are private; only the daemon authority produces actions.
+#[derive(Debug, Eq, PartialEq)]
 pub struct SignalAction {
     /// Claimed signal id.
-    pub signal_id: String,
+    signal_id: String,
     /// Provider name.
-    pub provider: String,
+    provider: String,
     /// Count of events in the batch.
-    pub event_count: usize,
+    event_count: usize,
+}
+
+impl SignalAction {
+    /// Authority-only construction.
+    pub(crate) fn new(signal_id: String, provider: String, event_count: usize) -> Self {
+        Self {
+            signal_id,
+            provider,
+            event_count,
+        }
+    }
+
+    /// The claimed signal id.
+    #[must_use]
+    pub fn signal_id(&self) -> &str {
+        &self.signal_id
+    }
+
+    /// The provider name.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The event count.
+    #[must_use]
+    pub fn event_count(&self) -> usize {
+        self.event_count
+    }
 }
 
 /// Result of dispatching a claimed signal to the controller.
@@ -234,22 +415,23 @@ mod tests {
     use super::*;
 
     fn sample_attachment() -> ControllerAttachment {
-        ControllerAttachment {
-            attempt_id: "01J00000000000000000000099".to_owned(),
-            arm_id: "01J00000000000000000000010".to_owned(),
-            generation: 1,
-            seat_id: "example-devrev".to_owned(),
-            route: "complete_background_tool".to_owned(),
-            lease_until: time::macros::datetime!(2026-01-15 12:20:00 UTC),
-        }
+        ControllerAttachment::new(
+            "01J00000000000000000000099".to_owned(),
+            "01J00000000000000000000010".to_owned(),
+            1,
+            "example-devrev".to_owned(),
+            ManagedCapability::MANAGED_TURN_START_ROUTE.to_owned(),
+            ManagedCapability::ManagedTurnStart,
+            time::macros::datetime!(2026-01-15 12:20:00 UTC),
+        )
     }
 
     fn sample_action() -> SignalAction {
-        SignalAction {
-            signal_id: "01J00000000000000000000021".to_owned(),
-            provider: "mattermost".to_owned(),
-            event_count: 1,
-        }
+        SignalAction::new(
+            "01J00000000000000000000021".to_owned(),
+            "mattermost".to_owned(),
+            1,
+        )
     }
 
     #[test]
@@ -262,15 +444,22 @@ mod tests {
             Some(LifecycleObservation::TurnTerminal("T1".to_owned(), true)),
             None, // no more observations
         ]);
-
-        let disposition = controller.dispatch(&sample_attachment(), &sample_action());
-        assert_eq!(
-            disposition,
-            DispatchDisposition::Accepted {
-                correlation: "turn-XYZ".to_owned(),
-            }
+        controller.dispatch(
+            &ControllerAttachment::new(
+                "01J00000000000000000000099".to_owned(),
+                "01J00000000000000000000010".to_owned(),
+                1,
+                "example-devrev".to_owned(),
+                ManagedCapability::MANAGED_TURN_START_ROUTE.to_owned(),
+                ManagedCapability::ManagedTurnStart,
+                time::macros::datetime!(2026-01-15 12:20:00 UTC),
+            ),
+            &SignalAction::new(
+                "01J00000000000000000000021".to_owned(),
+                "mattermost".to_owned(),
+                1,
+            ),
         );
-        assert_eq!(controller.dispatch_count(), 1);
 
         let obs = controller.poll_observation("01J00000000000000000000099");
         assert_eq!(
@@ -287,9 +476,41 @@ mod tests {
     }
 
     #[test]
+    fn command_dispatch_is_single_use() {
+        // The command is consumed by dispatch: constructing the same fake
+        // dispatch outcome twice is impossible without a second command, and
+        // commands are not Clone (compile-time property).
+        let mut controller = FakeController::new(vec![
+            DispatchDisposition::Accepted {
+                correlation: "turn-XYZ".to_owned(),
+            },
+            DispatchDisposition::Rejected,
+        ]);
+        let cmd = ControllerCommand::new(
+            sample_attachment(),
+            sample_action(),
+            "01J00000000000000000000099".to_owned(),
+        );
+        assert_eq!(cmd.attempt_id(), "01J00000000000000000000099");
+        let disposition = cmd.dispatch(&mut controller);
+        assert_eq!(
+            disposition,
+            DispatchDisposition::Accepted {
+                correlation: "turn-XYZ".to_owned(),
+            }
+        );
+        assert_eq!(controller.dispatch_count(), 1);
+    }
+
+    #[test]
     fn rejected_dispatch_is_not_consumed_again() {
         let mut controller = FakeController::new(vec![DispatchDisposition::Rejected]);
-        let disposition = controller.dispatch(&sample_attachment(), &sample_action());
+        let cmd = ControllerCommand::new(
+            sample_attachment(),
+            sample_action(),
+            "01J00000000000000000000099".to_owned(),
+        );
+        let disposition = cmd.dispatch(&mut controller);
         assert_eq!(disposition, DispatchDisposition::Rejected);
         assert_eq!(controller.dispatch_count(), 1);
     }
@@ -307,9 +528,31 @@ mod tests {
     }
 
     #[test]
+    fn capability_set_is_closed() {
+        assert_eq!(
+            ManagedCapability::parse("complete_background_tool"),
+            Some(ManagedCapability::ManagedTurnStart)
+        );
+        assert_eq!(
+            ManagedCapability::parse("managed_turn_start"),
+            Some(ManagedCapability::ManagedTurnStart)
+        );
+        assert_eq!(ManagedCapability::parse("not_a_capability"), None);
+        assert_eq!(
+            ManagedCapability::ManagedTurnStart.as_route(),
+            "complete_background_tool"
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "no scripted dispatch disposition")]
     fn panics_on_empty_script() {
         let mut controller = FakeController::new(vec![]);
-        controller.dispatch(&sample_attachment(), &sample_action());
+        let cmd = ControllerCommand::new(
+            sample_attachment(),
+            sample_action(),
+            "01J00000000000000000000099".to_owned(),
+        );
+        let _ = cmd.dispatch(&mut controller);
     }
 }

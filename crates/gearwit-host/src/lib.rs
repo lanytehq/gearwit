@@ -19,13 +19,13 @@ pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };
 pub use authority::{
-    AdmissionError, AdmissionResult, AuthorityRecovery, ClaimRequest, ClaimedSignal,
+    AdmissionError, AdmissionReceipt, AdmissionResult, AuthorityRecovery, ClaimRequest,
     DaemonAuthority, DispatchConclusion, DispatchError, DurableOutcome, MintedAttachment,
-    PreparedDispatch,
+    PreparedDispatch, ReconciliationWork,
 };
 pub use controller::{
-    Controller, ControllerAttachment, DispatchDisposition, FakeController, LifecycleObservation,
-    ReconciliationDisposition, SignalAction,
+    Controller, ControllerAttachment, ControllerCommand, DispatchDisposition, FakeController,
+    LifecycleObservation, ManagedCapability, ReconciliationDisposition, SignalAction,
 };
 pub use coordinator::HostCoordinator;
 pub use deliver::{
@@ -47,9 +47,9 @@ pub use persist::{
 mod tests {
     use super::{
         AcceptOutcome, AckStore, BindError, DeliveryLedger, GearwitPaths, HISTORY_CAP, KnownArm,
-        LinkError, LinkSession, LinkTable, SOCKET_FILE, admit_attach, drop_session,
-        prepare_delivery, record_delivery_result, redeliver_pending, send_delivery, serve_attach,
-        serve_connection, wait_disconnect,
+        LinkError, LinkSession, LinkTable, ManagedCapability, SOCKET_FILE, admit_attach,
+        drop_session, prepare_delivery, record_delivery_result, redeliver_pending, send_delivery,
+        serve_attach, serve_connection, wait_disconnect,
     };
     use gearwit_protocol::{
         HandledCursor, MAX_PAYLOAD, ProviderEvent, SCHEMA, WaiterLink, decode_handled_payload,
@@ -107,6 +107,7 @@ mod tests {
             generation: 1,
             seat_id: "example-devrev".to_owned(),
             route: "complete_background_tool".to_owned(),
+            capability: ManagedCapability::ManagedTurnStart,
             coverage_until: instant + TimeDuration::minutes(20),
         }
     }
