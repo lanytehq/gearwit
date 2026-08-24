@@ -1,0 +1,16 @@
+[package]
+name = "gearwit-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Local gearwitd link admission and private socket"
+
+[lints]
+workspace = true
+
+[dependencies]
+gearwit-protocol.workspace = true
+time = { version = "0.3", default-features = false, features = ["parsing", "formatting"] }

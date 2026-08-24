@@ -118,6 +118,14 @@ name = "gearwit-domain"
 version = "0.1.0"
 
 [[package]]
+name = "gearwit-host"
+version = "0.1.0"
+dependencies = [
+ "gearwit-protocol",
+ "time",
+]
+
+[[package]]
 name = "gearwit-protocol"
 version = "0.1.0"
 dependencies = [
@@ -255,6 +263,7 @@ dependencies = [
  "deranged",
  "num-conv",
  "powerfmt",
+ "serde_core",
  "time-core",
  "time-macros",
 ]

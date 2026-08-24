@@ -18,7 +18,8 @@ Initial boundaries:
   frames + length-prefixed codec pinned to Crucible `d121642`.
 - `gearwit-platform`: host paths, process census, and OS capability traits.
 - `gearwit-host`: daemon plus internal registry, router, policy, adapter, and
-  persistence modules.
+  persistence modules. First slice: owner-only waiter-link socket and one-link
+  admission.
 - `gearwit-cli`: thin client and explicit in-process degraded wait path.
   First slice: `gearwit self who`, in-process `gearwit self wait-on`, and
   `gearwit self check`.
