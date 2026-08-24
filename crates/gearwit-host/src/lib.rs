@@ -19,8 +19,9 @@ pub use deliver::{
     redeliver_pending, send_delivery,
 };
 pub use link::{
-    AcceptOutcome, LinkError, ServeAttach, read_incoming, read_waiter_link, serve_attach,
-    serve_connection, wait_disconnect, waiter_frame_config, write_handled, write_waiter_link,
+    AcceptOutcome, LinkError, PreparedAttach, ServeAttach, commit_prepared_attach, prepare_attach,
+    read_incoming, read_waiter_link, record_ack, serve_attach, serve_connection, split_stream,
+    wait_disconnect, waiter_frame_config, write_handled, write_prepared_attach, write_waiter_link,
 };
 pub use paths::{BindError, BoundListener, GearwitPaths, SOCKET_FILE, canonical_root};
 

@@ -12,7 +12,8 @@ use time::OffsetDateTime;
 
 use crate::ack::{AckStore, HandledServe, apply_handled_request};
 use crate::admit::{
-    AttachDecision, KnownArm, LinkSession, LinkTable, commit_attach, decide_attach, drop_expired,
+    AdmittedLink, AttachDecision, KnownArm, LinkSession, LinkTable, commit_attach, decide_attach,
+    drop_expired,
 };
 
 /// Waiter-link session failure.
@@ -209,11 +210,174 @@ pub fn serve_attach(
     finish_attach(reader, writer, request, table, now, started, arms)
 }
 
+/// Split an accepted stream into a framed reader/writer. Does not touch arm state.
+///
+/// # Errors
+///
+/// Returns [`LinkError`] if timeouts cannot be applied or the stream cannot be cloned.
+pub fn split_stream(
+    stream: IpcStream,
+) -> Result<(FrameReader<IpcStream>, FrameWriter<IpcStream>), LinkError> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let writer_stream = stream.try_clone()?;
+    Ok((
+        FrameReader::with_config(stream, waiter_frame_config()),
+        FrameWriter::with_config(writer_stream, waiter_frame_config()),
+    ))
+}
+
+/// Admission decision ready to write; no socket I/O.
+pub struct PreparedAttach {
+    reply: WaiterLink,
+    session: Option<LinkSession>,
+    lease_until: Option<OffsetDateTime>,
+    pending: PendingCommit,
+    decision_now: OffsetDateTime,
+}
+
+enum PendingCommit {
+    Accept(Box<AdmittedLink>),
+    Reject {
+        request: Box<WaiterLink>,
+        reply: Box<WaiterLink>,
+    },
+    Replay,
+}
+
+/// Decide attach using only `table`. Caller must not hold `AckStore`.
+///
+/// # Errors
+///
+/// Returns [`LinkError`] when the request is not a valid attach.
+pub fn prepare_attach(
+    table: &mut LinkTable,
+    request: WaiterLink,
+    now: OffsetDateTime,
+    started: Instant,
+    arms: &[KnownArm],
+) -> Result<PreparedAttach, LinkError> {
+    let elapsed = time::Duration::try_from(started.elapsed()).unwrap_or(time::Duration::ZERO);
+    let decision_now = now.saturating_add(elapsed);
+    drop_expired(table, decision_now);
+    Ok(match decide_attach(table, request, decision_now, arms)? {
+        AttachDecision::Accept { link, reply } => {
+            let session = LinkSession {
+                link_id: link.link_id.clone(),
+                arm_id: link.arm_id.clone(),
+                generation: link.generation,
+            };
+            let lease_until = Some(link.lease_until);
+            PreparedAttach {
+                reply,
+                session: Some(session),
+                lease_until,
+                pending: PendingCommit::Accept(link),
+                decision_now,
+            }
+        }
+        AttachDecision::Replay { reply, session } => {
+            let lease_until = table.current().map(|current| current.lease_until);
+            PreparedAttach {
+                reply,
+                session,
+                lease_until,
+                pending: PendingCommit::Replay,
+                decision_now,
+            }
+        }
+        AttachDecision::Reject { request, reply } => PreparedAttach {
+            reply: reply.clone(),
+            session: None,
+            lease_until: None,
+            pending: PendingCommit::Reject {
+                request: Box::new(request),
+                reply: Box::new(reply),
+            },
+            decision_now,
+        },
+    })
+}
+
+/// Write the prepared attach reply. Caller must not hold state locks.
+///
+/// # Errors
+///
+/// Returns [`LinkError`] if the reply cannot be written.
+pub fn write_prepared_attach(
+    reader: &mut FrameReader<IpcStream>,
+    writer: &mut FrameWriter<IpcStream>,
+    prepared: &PreparedAttach,
+) -> Result<(), LinkError> {
+    if let Some(lease_until) = prepared.lease_until {
+        apply_session_read_timeout(reader.get_mut(), lease_until, prepared.decision_now)?;
+    }
+    write_waiter_link(writer, &prepared.reply)
+}
+
+/// Commit a prepared attach after a successful write. Skips a stale generation
+/// if a newer live link is already in the table.
+pub fn commit_prepared_attach(
+    table: &mut LinkTable,
+    prepared: PreparedAttach,
+    reader: FrameReader<IpcStream>,
+    writer: FrameWriter<IpcStream>,
+    write_ok: bool,
+) -> Option<ServeAttach> {
+    if !write_ok {
+        return None;
+    }
+    let PreparedAttach {
+        reply,
+        session,
+        pending,
+        ..
+    } = prepared;
+    match pending {
+        PendingCommit::Accept(link) => {
+            if table
+                .current()
+                .is_some_and(|current| current.generation > link.generation)
+            {
+                return None;
+            }
+            commit_attach(table, *link);
+        }
+        PendingCommit::Reject { request, reply } => {
+            crate::admit::commit_reject(table, *request, *reply);
+        }
+        PendingCommit::Replay => {}
+    }
+    Some(ServeAttach {
+        reply,
+        session,
+        reader,
+        writer,
+    })
+}
+
+/// Record an ACK using only `acks`. Caller writes the reply after dropping the lock.
+///
+/// # Errors
+///
+/// Returns [`LinkError`] when the payload is not a request or the recorder fails.
+pub fn record_ack(
+    acks: &mut AckStore,
+    request: HandledCursor,
+    now: OffsetDateTime,
+) -> Result<HandledServe, LinkError> {
+    let HandledCursor::Request { .. } = &request else {
+        return Err(LinkError::Handled(HandledCursorError::Semantic(
+            "expected request",
+        )));
+    };
+    Ok(apply_handled_request(acks, request, now)?)
+}
+
 /// Dispatch waiter-link attach vs handled-cursor on one accepted stream.
 ///
-/// ACK connections never occupy or replace the attached delivery writer.
-/// Live arm/generation is read from `acks` at this accept, not a cloned
-/// worker-start snapshot.
+/// Frame read/write happen outside table/ack mutation. Tests may still pass
+/// both stores; they are used one at a time.
 ///
 /// # Errors
 ///
@@ -230,26 +394,20 @@ pub fn serve_connection(
     match read_incoming(&mut reader)? {
         Incoming::Waiter(request) => {
             let arms: Vec<KnownArm> = acks.arm().cloned().into_iter().collect();
-            let served = finish_attach(reader, writer, request, table, now, started, &arms)?;
-            Ok(AcceptOutcome::Attached(Box::new(served)))
+            let prepared = prepare_attach(table, request, now, started, &arms)?;
+            let write_ok = write_prepared_attach(&mut reader, &mut writer, &prepared).is_ok();
+            commit_prepared_attach(table, prepared, reader, writer, write_ok)
+                .map(|served| AcceptOutcome::Attached(Box::new(served)))
+                .ok_or(LinkError::Message(WaiterLinkError::Semantic(
+                    "attach write failed",
+                )))
         }
         Incoming::Handled(request) => {
-            let served = finish_ack(&mut writer, request, acks, now)?;
+            let served = record_ack(acks, request, now)?;
+            let _ = write_handled(&mut writer, &served.reply);
             Ok(AcceptOutcome::Ack(Box::new(served)))
         }
     }
-}
-
-fn split_stream(
-    stream: IpcStream,
-) -> Result<(FrameReader<IpcStream>, FrameWriter<IpcStream>), LinkError> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let writer_stream = stream.try_clone()?;
-    Ok((
-        FrameReader::with_config(stream, waiter_frame_config()),
-        FrameWriter::with_config(writer_stream, waiter_frame_config()),
-    ))
 }
 
 fn finish_attach(
@@ -261,56 +419,11 @@ fn finish_attach(
     started: Instant,
     arms: &[KnownArm],
 ) -> Result<ServeAttach, LinkError> {
-    let elapsed = time::Duration::try_from(started.elapsed()).unwrap_or(time::Duration::ZERO);
-    let decision_now = now.saturating_add(elapsed);
-    drop_expired(table, decision_now);
-    let (reply, session) = match decide_attach(table, request, decision_now, arms)? {
-        AttachDecision::Accept { link, reply } => {
-            let session = LinkSession {
-                link_id: link.link_id.clone(),
-                arm_id: link.arm_id.clone(),
-                generation: link.generation,
-            };
-            apply_session_read_timeout(reader.get_mut(), link.lease_until, decision_now)?;
-            write_waiter_link(&mut writer, &reply)?;
-            commit_attach(table, *link);
-            (reply, Some(session))
-        }
-        AttachDecision::Replay { reply, session } => {
-            if let Some(current) = table.current() {
-                apply_session_read_timeout(reader.get_mut(), current.lease_until, decision_now)?;
-            }
-            write_waiter_link(&mut writer, &reply)?;
-            (reply, session)
-        }
-        AttachDecision::Reject { request, reply } => {
-            write_waiter_link(&mut writer, &reply)?;
-            crate::admit::commit_reject(table, request, reply.clone());
-            (reply, None)
-        }
-    };
-    Ok(ServeAttach {
-        reply,
-        session,
-        reader,
-        writer,
-    })
-}
-
-fn finish_ack(
-    writer: &mut FrameWriter<IpcStream>,
-    request: HandledCursor,
-    acks: &mut AckStore,
-    now: OffsetDateTime,
-) -> Result<HandledServe, LinkError> {
-    let HandledCursor::Request { .. } = &request else {
-        return Err(LinkError::Handled(HandledCursorError::Semantic(
-            "expected request",
-        )));
-    };
-    let served = apply_handled_request(acks, request, now)?;
-    let _ = write_handled(writer, &served.reply);
-    Ok(served)
+    let prepared = prepare_attach(table, request, now, started, arms)?;
+    let write_ok = write_prepared_attach(&mut reader, &mut writer, &prepared).is_ok();
+    commit_prepared_attach(table, prepared, reader, writer, write_ok).ok_or(LinkError::Message(
+        WaiterLinkError::Semantic("attach write failed"),
+    ))
 }
 
 fn apply_session_read_timeout(
