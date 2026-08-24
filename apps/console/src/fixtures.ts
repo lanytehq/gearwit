@@ -62,7 +62,7 @@ export const events: AttentionEvent[] = [
     lifecycle: [
       { id: "observed", label: "Observed", state: "complete", evidence: "provider_proven", detail: "Provider observed event" },
       { id: "drained", label: "Drained", state: "unknown", evidence: "unknown", detail: "Drain evidence absent" },
-      { id: "delivery", label: "Delivery", state: "pending", evidence: "provider_proven", detail: "Delivery awaits an attached route" },
+      { id: "delivery", label: "Delivery", state: "pending", evidence: "fixture_simulated", detail: "Fixture models delivery as awaiting an attached route" },
       { id: "turn", label: "Turn", state: "unknown", evidence: "unknown", detail: "No harness evidence" },
       { id: "handled", label: "Handled", state: "unknown", evidence: "unknown", detail: "No seat acknowledgement" },
     ],
@@ -109,6 +109,26 @@ export const seats: Seat[] = [
     controller: { kind: "unknown", evidence: "unknown" },
   },
 ];
+
+export function fixtureDoorbellEvent(seat: Seat): AttentionEvent {
+  return {
+    id: `fixture-ring:${seat.id}`,
+    level: "act",
+    kind: "Fixture doorbell",
+    title: "Test ring simulated for an attached route",
+    detail: "Simulation only: no daemon, provider, delivery, or model turn was contacted.",
+    seat: seat.name,
+    age: "now",
+    source: { kind: "known", value: "fixture receipt", evidence: "fixture_simulated" },
+    lifecycle: [
+      { id: "observed", label: "Observed", state: "complete", evidence: "fixture_simulated", detail: "UI generated a fixture signal" },
+      { id: "drained", label: "Drained", state: "unknown", evidence: "unknown", detail: "No daemon or provider drain occurred" },
+      { id: "delivery", label: "Delivery", state: "unknown", evidence: "unknown", detail: "No delivery occurred" },
+      { id: "turn", label: "Turn", state: "unknown", evidence: "unknown", detail: "No harness contacted" },
+      { id: "handled", label: "Handled", state: "unknown", evidence: "unknown", detail: "No seat acknowledgement" },
+    ],
+  };
+}
 
 export const scenarios: SystemScenario[] = [
   { id: "fixture", status: "fixture", title: "Fixture mode", detail: "No daemon attached" },

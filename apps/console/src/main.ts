@@ -1,4 +1,4 @@
-import { events, scenarios, seats } from "./fixtures";
+import { events, fixtureDoorbellEvent, scenarios, seats } from "./fixtures";
 import {
   canRingController,
   countArmedWaits,
@@ -208,23 +208,7 @@ function setupDoorbellBench(): void {
   ring.addEventListener("click", () => {
     const seat = selectedSeat();
     if (!canRingController(seat)) return;
-    const event: AttentionEvent = {
-      id: `fixture-ring:${seat.id}`,
-      level: "act",
-      kind: "Fixture doorbell",
-      title: "Test ring reached an attached route",
-      detail: "Simulation only: no daemon, provider, or model turn was contacted.",
-      seat: seat.name,
-      age: "now",
-      source: { kind: "known", value: "fixture receipt", evidence: "controller_proven" },
-      lifecycle: [
-        { id: "observed", label: "Observed", state: "complete", evidence: "provider_proven", detail: "Fixture signal observed" },
-        { id: "drained", label: "Drained", state: "complete", evidence: "provider_proven", detail: "Fixture event set drained" },
-        { id: "delivery", label: "Delivery", state: "complete", evidence: "controller_proven", detail: "Fixture attachment selected" },
-        { id: "turn", label: "Turn", state: "unknown", evidence: "unknown", detail: "No harness contacted" },
-        { id: "handled", label: "Handled", state: "unknown", evidence: "unknown", detail: "No seat acknowledgement" },
-      ],
-    };
+    const event = fixtureDoorbellEvent(seat);
     const previousCount = visibleEvents.length;
     visibleEvents = prependEventOnce(visibleEvents, event);
     requiredElement("#attention-count").textContent = String(

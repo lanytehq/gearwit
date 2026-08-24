@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { events, scenarios, seats } from "./fixtures";
+import { events, fixtureDoorbellEvent, scenarios, seats } from "./fixtures";
 import {
   canRingController,
   countArmedWaits,
@@ -38,12 +38,36 @@ describe("attention projection", () => {
   });
 
   test("suppresses a duplicate ring receipt", () => {
-    const ring = { ...events[0]!, id: "fixture-ring:seat-1" };
+    const ring = fixtureDoorbellEvent(seats[0]!);
     const first = prependEventOnce(events, ring);
     const duplicate = prependEventOnce(first, ring);
     expect(first).toHaveLength(events.length + 1);
     expect(duplicate).toHaveLength(first.length);
     expect(duplicate[0]?.id).toBe(ring.id);
+  });
+
+  test("keeps doorbell simulation separate from runtime evidence", () => {
+    const ring = fixtureDoorbellEvent(seats[0]!);
+    expect(ring.source.evidence).toBe("fixture_simulated");
+    expect(ring.lifecycle.map(({ state, evidence }) => [state, evidence])).toEqual([
+      ["complete", "fixture_simulated"],
+      ["unknown", "unknown"],
+      ["unknown", "unknown"],
+      ["unknown", "unknown"],
+      ["unknown", "unknown"],
+    ]);
+  });
+
+  test("attributes provider observation without promoting local routing", () => {
+    const providerEvent = events[3]!;
+    expect(providerEvent.source.evidence).toBe("provider_proven");
+    expect(providerEvent.lifecycle.map(({ state, evidence }) => [state, evidence])).toEqual([
+      ["complete", "provider_proven"],
+      ["unknown", "unknown"],
+      ["pending", "fixture_simulated"],
+      ["unknown", "unknown"],
+      ["unknown", "unknown"],
+    ]);
   });
 
   test("requires one ordered status for every lifecycle phase", () => {

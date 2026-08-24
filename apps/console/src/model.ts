@@ -1,6 +1,7 @@
 export type EvidenceClass =
   | "controller_proven"
   | "provider_proven"
+  | "fixture_simulated"
   | "self_declared"
   | "census_inferred"
   | "unknown";
@@ -79,6 +80,7 @@ export interface Seat {
 export const evidenceLabel: Record<EvidenceClass, string> = {
   controller_proven: "Controller-proven",
   provider_proven: "Provider-proven",
+  fixture_simulated: "Fixture-simulated",
   self_declared: "Self-declared",
   census_inferred: "Census-inferred",
   unknown: "Unknown",
@@ -87,6 +89,7 @@ export const evidenceLabel: Record<EvidenceClass, string> = {
 export const evidenceGlyph: Record<EvidenceClass, string> = {
   controller_proven: "P",
   provider_proven: "V",
+  fixture_simulated: "F",
   self_declared: "D",
   census_inferred: "I",
   unknown: "?",

@@ -363,6 +363,7 @@ h2 { margin: 0; font-family: Georgia, serif; font-size: clamp(2rem, 4vw, 3.4rem)
   font-weight: 800;
 }
 .tier-proven { color: var(--acid); }
+.tier-simulated { color: #101f1b; background: #a9d9d4; }
 .tier-declared { color: #f0ce79; }
 .tier-inferred { color: #a9d9d4; }
 .tier-unknown { color: #d2d0c8; background: var(--muted); }
