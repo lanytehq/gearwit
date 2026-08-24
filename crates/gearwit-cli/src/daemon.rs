@@ -17,9 +17,9 @@ use crate::wait_on::{
 };
 use gearwit_domain::DeliveryRoute;
 use gearwit_host::{
-    AdmittedLink, DeliveryAttempt, DeliveryLedger, GearwitPaths, KnownArm, LinkError, LinkSession,
-    LinkTable, ServeAttach, drop_session, prepare_delivery, read_waiter_link,
-    record_delivery_result, redeliver_pending, send_delivery, serve_attach,
+    AcceptOutcome, AckRearm, AckStore, AdmittedLink, DeliveryAttempt, DeliveryLedger, GearwitPaths,
+    KnownArm, LinkError, LinkSession, LinkTable, ServeAttach, drop_session, prepare_delivery,
+    read_waiter_link, record_delivery_result, redeliver_pending, send_delivery, serve_connection,
 };
 use gearwit_protocol::{ProviderEvent, WaiterLink};
 use ipcprims::frame::FrameError;
@@ -297,6 +297,8 @@ pub struct DaemonPipe {
     pub claim: Option<SignalClaim>,
     /// True after a successful delivery write for the pending batch.
     pub attempted: bool,
+    /// Handled-cursor recorder used by ingest tests and local pipes.
+    pub acks: AckStore,
 }
 
 impl DaemonPipe {
@@ -328,10 +330,13 @@ fn daemon_coverage(wait: WaitResult, current_after: &str) -> DaemonCoverage {
 /// Drain from the exclusive wait baseline, claim once, optionally deliver.
 ///
 /// A wait match is only a hint: events always come from `drain`.
+/// `note_claimed` runs on a new stable claim; `note_delivered` runs only
+/// after a successful delivery write.
 #[must_use]
 pub fn ingest_match<D: EventDrain, I: DeliveryIo>(
     request: &IngestRequest<'_, D>,
     pipe: &mut DaemonPipe,
+    acks: &mut AckStore,
     io: Option<&mut I>,
     mint_signal: impl FnOnce() -> String,
 ) -> IngestOutcome {
@@ -363,15 +368,22 @@ pub fn ingest_match<D: EventDrain, I: DeliveryIo>(
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned());
     let events = provider_events_from_drain(&drained.drained_events, &observed);
+    let is_new = pipe.claim.is_none();
     match claim_or_reuse(&mut pipe.claim, request.arm, &events, mint_signal()) {
-        Ok(live) => deliver_claimed(
-            live,
-            request.link,
-            pipe,
-            request.now,
-            io,
-            DaemonCoverage::Pause,
-        ),
+        Ok(live) => {
+            if is_new && acks.note_claimed(live.signal_id.clone()).is_err() {
+                return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
+            }
+            deliver_claimed(
+                live,
+                request.link,
+                pipe,
+                acks,
+                request.now,
+                io,
+                DaemonCoverage::Pause,
+            )
+        }
         Err(ClaimError::OccupiedDifferent) => pipe.snapshot(DaemonCoverage::Pause, waiter_attached),
     }
 }
@@ -380,6 +392,7 @@ fn deliver_claimed<I: DeliveryIo>(
     live: SignalClaim,
     link: Option<&AdmittedLink>,
     pipe: &mut DaemonPipe,
+    acks: &mut AckStore,
     now: OffsetDateTime,
     io: Option<&mut I>,
     coverage: DaemonCoverage,
@@ -450,6 +463,19 @@ fn deliver_claimed<I: DeliveryIo>(
             result_outcome: None,
             waiter_attached,
         };
+    }
+    let delivered = match &message {
+        WaiterLink::DeliverEvents { events, .. } => events
+            .iter()
+            .map(|event| event.event_ref.clone())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    if acks
+        .note_delivered(live.signal_id.clone(), delivered, &live.event_refs)
+        .is_err()
+    {
+        return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
     }
     pipe.attempted = true;
     let mut result_outcome = None;
@@ -547,13 +573,51 @@ pub fn shutdown_daemon(
 }
 
 enum DaemonEvent {
-    Attached(ServeAttach),
+    Attached(Box<ServeAttach>),
+    CoverageRearm(AckRearm),
 }
 
 fn lock_table(table: &Mutex<LinkTable>) -> std::sync::MutexGuard<'_, LinkTable> {
     table
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_acks(acks: &Mutex<AckStore>) -> std::sync::MutexGuard<'_, AckStore> {
+    acks.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply a first-accepted ACK to coverage. Returns false when already applied.
+#[must_use]
+pub fn take_coverage_rearm(
+    spec: &mut WaitOnSpec,
+    arm: &mut KnownArm,
+    pipe: &mut DaemonPipe,
+    rearm: &AckRearm,
+) -> bool {
+    if arm.generation == rearm.generation
+        && spec.after.as_deref() == Some(rearm.after.as_str())
+        && pipe.claim.is_none()
+        && pipe.ledger.pending().is_none()
+    {
+        return false;
+    }
+    arm.generation = rearm.generation;
+    spec.after = Some(rearm.after.clone());
+    pipe.claim = None;
+    pipe.ledger = DeliveryLedger::default();
+    pipe.attempted = false;
+    true
+}
+
+fn revoke_generation(served: &mut Option<ServeAttach>, table: &Mutex<LinkTable>) {
+    let session = served.take().and_then(|served| served.session);
+    let mut table = lock_table(table);
+    if let Some(session) = session.as_ref() {
+        drop_session(&mut table, session);
+    }
+    table.drop_current();
 }
 
 fn halt(
@@ -627,6 +691,7 @@ fn flush_attached(
     served: &mut ServeAttach,
     table: &Mutex<LinkTable>,
     pipe: &mut DaemonPipe,
+    acks: &mut AckStore,
     now: OffsetDateTime,
 ) -> bool {
     if pipe
@@ -650,6 +715,7 @@ fn flush_attached(
         live,
         Some(&link),
         pipe,
+        acks,
         now,
         Some(&mut io),
         DaemonCoverage::Pause,
@@ -729,8 +795,8 @@ fn poll_result(
 fn spawn_accept(
     listener: gearwit_host::BoundListener,
     table: Arc<Mutex<LinkTable>>,
+    acks: Arc<Mutex<AckStore>>,
     stop: Arc<AtomicBool>,
-    arm: KnownArm,
     tx: mpsc::Sender<DaemonEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -741,15 +807,27 @@ fn spawn_accept(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            let mut table = lock_table(&table);
             let instant = OffsetDateTime::now_utc();
-            if let Ok(served) =
-                serve_attach(stream, &mut table, instant, std::slice::from_ref(&arm))
-            {
-                drop(table);
-                if tx.send(DaemonEvent::Attached(served)).is_err() {
-                    break;
+            let mut table = lock_table(&table);
+            let mut acks = lock_acks(&acks);
+            match serve_connection(stream, &mut table, &mut acks, instant) {
+                Ok(AcceptOutcome::Attached(served)) => {
+                    drop(acks);
+                    drop(table);
+                    if tx.send(DaemonEvent::Attached(served)).is_err() {
+                        break;
+                    }
                 }
+                Ok(AcceptOutcome::Ack(served)) => {
+                    drop(acks);
+                    drop(table);
+                    if let Some(rearm) = served.rearm
+                        && tx.send(DaemonEvent::CoverageRearm(rearm)).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => {}
             }
         }
     })
@@ -761,6 +839,7 @@ fn ingest_child_exit(
     arm: &KnownArm,
     table: &Mutex<LinkTable>,
     pipe: &mut DaemonPipe,
+    acks: &mut AckStore,
 ) -> DaemonCoverage {
     let link = current_link(table);
     ingest_match(
@@ -773,6 +852,7 @@ fn ingest_child_exit(
             now: OffsetDateTime::now_utc(),
         },
         pipe,
+        acks,
         None::<&mut LinkIo>,
         || ulid::Ulid::new().to_string(),
     )
@@ -817,13 +897,14 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
     };
 
     let table = Arc::new(Mutex::new(LinkTable::default()));
+    let acks = Arc::new(Mutex::new(AckStore::with_arm(arm.clone())));
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let mut accept = Some(spawn_accept(
         listener,
         Arc::clone(&table),
+        Arc::clone(&acks),
         Arc::clone(&stop),
-        arm.clone(),
         tx,
     ));
 
@@ -831,6 +912,7 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
     spec.follow = true;
     let mut children = ChildSlot::new();
     let mut pipe = DaemonPipe::default();
+    let mut arm = arm;
     let mut served: Option<ServeAttach> = None;
     if spawn_chanvoy(&mut children, &spec).is_err() {
         return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
@@ -843,42 +925,19 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(DaemonEvent::Attached(next)) => {
-                let keep = {
-                    let locked = lock_table(&table);
-                    retain_live_attach(&next, &locked, served.as_ref())
-                };
-                if keep {
-                    if let Some(old) = served.take() {
-                        let old_session = old.session.clone();
-                        drop(old);
-                        if let Some(old_session) = old_session {
-                            let mut locked = lock_table(&table);
-                            on_transport_loss(&mut pipe, &mut locked, Some(&old_session), now);
-                        }
-                    }
-                    let mut next = next;
-                    let lease_until = {
-                        let locked = lock_table(&table);
-                        locked.current().map(|link| link.lease_until)
-                    };
-                    let timeout_failed = match lease_until {
-                        Some(lease_until) => {
-                            set_poll_timeout(&mut next, lease_until, now).is_err()
-                                || lease_expired(lease_until, now)
-                        }
-                        None => false,
-                    };
-                    if timeout_failed {
-                        served = Some(next);
-                        revoke_exact(&mut served, &table, &mut pipe, now, true);
-                    } else {
-                        served = Some(next);
-                        if let Some(current) = served.as_mut()
-                            && flush_attached(current, &table, &mut pipe, now)
-                        {
-                            revoke_exact(&mut served, &table, &mut pipe, now, true);
-                        }
-                    }
+                adopt_attached(next, &mut served, &table, &mut pipe, &acks, now);
+            }
+            Ok(DaemonEvent::CoverageRearm(rearm)) => {
+                if let Err(code) = restart_after_ack(
+                    &rearm,
+                    &mut spec,
+                    &mut arm,
+                    &mut pipe,
+                    &mut served,
+                    &table,
+                    &mut children,
+                ) {
+                    return halt(&table, &mut children, &stop, &socket, &mut accept, code);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -887,32 +946,128 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
             }
         }
         poll_result(&mut served, &table, &mut pipe, now);
-        match children.try_wait() {
-            Ok(Some(status)) => match ingest_child_exit(status, &spec, &arm, &table, &mut pipe) {
-                DaemonCoverage::Rearm { after } => {
-                    spec.after = Some(after);
-                    if spawn_chanvoy(&mut children, &spec).is_err() {
-                        return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
-                    }
-                }
-                DaemonCoverage::Pause => {
-                    if let Some(current) = served.as_mut()
-                        && flush_attached(current, &table, &mut pipe, now)
-                    {
-                        revoke_exact(&mut served, &table, &mut pipe, now, true);
-                    }
-                }
-                DaemonCoverage::Halt { exit } => {
-                    return halt(&table, &mut children, &stop, &socket, &mut accept, exit);
-                }
+        if let Some(code) = poll_chanvoy(
+            &mut LoopIo {
+                children: &mut children,
+                spec: &mut spec,
+                arm: &arm,
+                table: &table,
+                pipe: &mut pipe,
+                acks: &acks,
+                served: &mut served,
             },
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("gearwit: chanvoy child: {error}");
-                return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
-            }
+            now,
+        ) {
+            return halt(&table, &mut children, &stop, &socket, &mut accept, code);
         }
     }
+}
+
+struct LoopIo<'a> {
+    children: &'a mut ChildSlot,
+    spec: &'a mut WaitOnSpec,
+    arm: &'a KnownArm,
+    table: &'a Mutex<LinkTable>,
+    pipe: &'a mut DaemonPipe,
+    acks: &'a Mutex<AckStore>,
+    served: &'a mut Option<ServeAttach>,
+}
+
+fn adopt_attached(
+    next: Box<ServeAttach>,
+    served: &mut Option<ServeAttach>,
+    table: &Mutex<LinkTable>,
+    pipe: &mut DaemonPipe,
+    acks: &Mutex<AckStore>,
+    now: OffsetDateTime,
+) {
+    let keep = {
+        let locked = lock_table(table);
+        retain_live_attach(&next, &locked, served.as_ref())
+    };
+    if !keep {
+        return;
+    }
+    if let Some(old) = served.take() {
+        let old_session = old.session.clone();
+        drop(old);
+        if let Some(old_session) = old_session {
+            let mut locked = lock_table(table);
+            on_transport_loss(pipe, &mut locked, Some(&old_session), now);
+        }
+    }
+    let mut next = *next;
+    let lease_until = lock_table(table).current().map(|link| link.lease_until);
+    let timeout_failed = match lease_until {
+        Some(lease_until) => {
+            set_poll_timeout(&mut next, lease_until, now).is_err()
+                || lease_expired(lease_until, now)
+        }
+        None => false,
+    };
+    *served = Some(next);
+    if timeout_failed || flush_current(served, table, pipe, acks, now) {
+        revoke_exact(served, table, pipe, now, true);
+    }
+}
+
+fn restart_after_ack(
+    rearm: &AckRearm,
+    spec: &mut WaitOnSpec,
+    arm: &mut KnownArm,
+    pipe: &mut DaemonPipe,
+    served: &mut Option<ServeAttach>,
+    table: &Mutex<LinkTable>,
+    children: &mut ChildSlot,
+) -> Result<(), i32> {
+    if !take_coverage_rearm(spec, arm, pipe, rearm) {
+        return Ok(());
+    }
+    revoke_generation(served, table);
+    children.kill_and_reap().map_err(|_| 2)?;
+    spawn_chanvoy(children, spec).map(|_| ())
+}
+
+fn poll_chanvoy(io: &mut LoopIo<'_>, now: OffsetDateTime) -> Option<i32> {
+    match io.children.try_wait() {
+        Ok(Some(status)) => {
+            let coverage = {
+                let mut acks = lock_acks(io.acks);
+                ingest_child_exit(status, io.spec, io.arm, io.table, io.pipe, &mut acks)
+            };
+            match coverage {
+                DaemonCoverage::Rearm { after } => {
+                    io.spec.after = Some(after);
+                    spawn_chanvoy(io.children, io.spec).err()
+                }
+                DaemonCoverage::Pause => {
+                    if flush_current(io.served, io.table, io.pipe, io.acks, now) {
+                        revoke_exact(io.served, io.table, io.pipe, now, true);
+                    }
+                    None
+                }
+                DaemonCoverage::Halt { exit } => Some(exit),
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("gearwit: chanvoy child: {error}");
+            Some(2)
+        }
+    }
+}
+
+fn flush_current(
+    served: &mut Option<ServeAttach>,
+    table: &Mutex<LinkTable>,
+    pipe: &mut DaemonPipe,
+    acks: &Mutex<AckStore>,
+    now: OffsetDateTime,
+) -> bool {
+    served.as_mut().is_some_and(|current| {
+        let mut acks = lock_acks(acks);
+        flush_attached(current, table, pipe, &mut acks, now)
+    })
 }
 
 #[cfg(test)]
@@ -920,12 +1075,13 @@ mod tests {
     use super::{
         ClaimError, DaemonCoverage, DeliveryIo, IngestOutcome, ResultApply, apply_waiter_result,
         claim_or_reuse, ingest_match, lease_expired, on_transport_loss, provider_events_from_drain,
-        retain_live_attach, shutdown_daemon, spawn_accept,
+        retain_live_attach, shutdown_daemon, spawn_accept, take_coverage_rearm,
     };
     use crate::child::ChildSlot;
     use crate::wait_on::{DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitResult};
     use gearwit_host::{
-        DeliveryAttempt, GearwitPaths, KnownArm, LinkSession, LinkTable, admit_attach,
+        AckRearm, AckStore, DeliveryAttempt, GearwitPaths, KnownArm, LinkSession, LinkTable,
+        admit_attach,
     };
     use gearwit_protocol::{ProviderEvent, SCHEMA, WaiterLink, parse_waiter_link};
     use std::path::PathBuf;
@@ -1055,7 +1211,11 @@ mod tests {
         io: Option<&mut ScriptedIo>,
         mint: &str,
     ) -> IngestOutcome {
-        ingest_match(
+        let mut acks = std::mem::take(&mut pipe.acks);
+        if acks.arm().is_none() {
+            acks = AckStore::with_arm(arm());
+        }
+        let outcome = ingest_match(
             &super::IngestRequest {
                 spec: &spec(),
                 wait,
@@ -1065,9 +1225,12 @@ mod tests {
                 now: now(),
             },
             pipe,
+            &mut acks,
             io,
             || mint.to_owned(),
-        )
+        );
+        pipe.acks = acks;
+        outcome
     }
 
     #[test]
@@ -1230,6 +1393,86 @@ mod tests {
         assert_eq!(outcome.coverage, DaemonCoverage::Pause);
         let sent = io.sent.expect("sent");
         assert!(matches!(sent, WaiterLink::DeliverEvents { .. }));
+        let accepted = gearwit_host::record_handled(
+            &mut pipe.acks,
+            gearwit_protocol::parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("request"),
+            now(),
+        )
+        .expect("ack");
+        assert!(matches!(
+            accepted,
+            gearwit_protocol::HandledCursor::Accepted { ref cursor, .. } if cursor == "post02"
+        ));
+    }
+
+    #[test]
+    fn write_failure_does_not_admit_delivery_for_ack() {
+        let (_table, link) = admitted();
+        let drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Ok(vec![event("post02", "one")]),
+        };
+        let mut pipe = super::DaemonPipe::default();
+        let mut io = ScriptedIo {
+            fail_send: true,
+            sent: None,
+            complete: false,
+        };
+        ingest(
+            WaitResult::Matched,
+            &drain,
+            Some(&link),
+            &mut pipe,
+            Some(&mut io),
+            "01J00000000000000000000021",
+        );
+        let reply = gearwit_host::record_handled(
+            &mut pipe.acks,
+            gearwit_protocol::parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("request"),
+            now(),
+        )
+        .expect("ack before delivery");
+        assert!(matches!(
+            reply,
+            gearwit_protocol::HandledCursor::Rejected { code, .. } if code == "ack_before_delivery"
+        ));
+    }
+
+    #[test]
+    fn prefix_coverage_rearm_is_idempotent_and_clears_claim() {
+        let mut spec = spec();
+        let mut live = arm();
+        let mut pipe = super::DaemonPipe {
+            claim: Some(super::SignalClaim {
+                arm_id: live.arm_id.clone(),
+                generation: 1,
+                signal_id: "01J00000000000000000000021".to_owned(),
+                event_refs: vec!["post02".to_owned(), "post03".to_owned()],
+                events: vec![provider("post02"), provider("post03")],
+            }),
+            attempted: true,
+            ..super::DaemonPipe::default()
+        };
+        let rearm = AckRearm {
+            after: "post02".to_owned(),
+            generation: 2,
+            signal_id: "01J00000000000000000000021".to_owned(),
+        };
+        assert!(take_coverage_rearm(&mut spec, &mut live, &mut pipe, &rearm));
+        assert_eq!(spec.after.as_deref(), Some("post02"));
+        assert_eq!(live.generation, 2);
+        assert!(pipe.claim.is_none());
+        assert!(!pipe.attempted);
+        assert!(!take_coverage_rearm(
+            &mut spec, &mut live, &mut pipe, &rearm
+        ));
+        assert_eq!(live.generation, 2);
     }
 
     #[test]
@@ -1303,8 +1546,8 @@ mod tests {
         let handle = spawn_accept(
             listener,
             Arc::new(Mutex::new(LinkTable::default())),
+            Arc::new(Mutex::new(AckStore::with_arm(arm()))),
             Arc::clone(&stop),
-            arm(),
             tx,
         );
         let mut accept = Some(handle);
@@ -1334,8 +1577,8 @@ mod tests {
         let handle = spawn_accept(
             listener,
             Arc::new(Mutex::new(LinkTable::default())),
+            Arc::new(Mutex::new(AckStore::with_arm(live_arm))),
             Arc::clone(&stop),
-            live_arm,
             tx,
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1388,8 +1631,8 @@ mod tests {
         let handle = spawn_accept(
             listener,
             Arc::clone(&table),
+            Arc::new(Mutex::new(AckStore::with_arm(live_arm))),
             Arc::clone(&stop),
-            live_arm,
             tx,
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1401,6 +1644,7 @@ mod tests {
             .expect("write");
         let first_served = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(super::DaemonEvent::Attached(served)) => served,
+            Ok(super::DaemonEvent::CoverageRearm(_)) => panic!("first attach got rearm"),
             Err(error) => panic!("first attach {error}"),
         };
         {
@@ -1416,6 +1660,7 @@ mod tests {
             .expect("write");
         let second_served = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(super::DaemonEvent::Attached(served)) => served,
+            Ok(super::DaemonEvent::CoverageRearm(_)) => panic!("second attach got rearm"),
             Err(error) => panic!("second attach {error}"),
         };
         {
@@ -1440,6 +1685,7 @@ mod tests {
             .expect("write");
         let successor_served = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(super::DaemonEvent::Attached(served)) => served,
+            Ok(super::DaemonEvent::CoverageRearm(_)) => panic!("successor attach got rearm"),
             Err(error) => panic!("successor attach {error}"),
         };
         {

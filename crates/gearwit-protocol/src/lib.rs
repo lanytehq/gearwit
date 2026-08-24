@@ -6,7 +6,10 @@ mod codec;
 mod handled;
 mod messages;
 
-pub use codec::{MAX_PAYLOAD, PayloadError, decode_payload, encode_payload};
+pub use codec::{
+    Incoming, MAX_PAYLOAD, PayloadError, decode_handled_payload, decode_incoming, decode_payload,
+    encode_handled_payload, encode_payload,
+};
 pub use handled::{
     HANDLED_SCHEMA, HandledCursor, HandledCursorError, parse_handled_cursor, validate_handled,
 };
@@ -129,6 +132,29 @@ mod tests {
         assert!(matches!(
             decode_payload(&[0xff]),
             Err(PayloadError::InvalidUtf8)
+        ));
+    }
+
+    #[test]
+    fn decode_incoming_dispatches_on_schema() {
+        let waiter = fs::read_to_string(fixture_root().join("conforming/attach-waiter.json"))
+            .expect("waiter");
+        assert!(matches!(
+            super::decode_incoming(waiter.as_bytes()).expect("waiter"),
+            super::Incoming::Waiter(_)
+        ));
+        let handled = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/handled-cursor/conforming/request-prefix.json"),
+        )
+        .expect("handled");
+        assert!(matches!(
+            super::decode_incoming(handled.as_bytes()).expect("handled"),
+            super::Incoming::Handled(_)
+        ));
+        assert!(matches!(
+            super::decode_incoming(br#"{"schema":"nope"}"#),
+            Err(PayloadError::UnknownSchema)
         ));
     }
 

@@ -8,7 +8,9 @@ mod deliver;
 mod link;
 mod paths;
 
-pub use ack::{AckStore, rearm_from_handled, record_handled};
+pub use ack::{
+    AckRearm, AckStore, HandledServe, apply_handled_request, rearm_from_handled, record_handled,
+};
 pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };
@@ -17,20 +19,22 @@ pub use deliver::{
     redeliver_pending, send_delivery,
 };
 pub use link::{
-    LinkError, ServeAttach, read_waiter_link, serve_attach, wait_disconnect, waiter_frame_config,
-    write_waiter_link,
+    AcceptOutcome, LinkError, ServeAttach, read_incoming, read_waiter_link, serve_attach,
+    serve_connection, wait_disconnect, waiter_frame_config, write_handled, write_waiter_link,
 };
 pub use paths::{BindError, BoundListener, GearwitPaths, SOCKET_FILE, canonical_root};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BindError, DeliveryLedger, GearwitPaths, HISTORY_CAP, KnownArm, LinkError, LinkSession,
-        LinkTable, SOCKET_FILE, admit_attach, drop_session, prepare_delivery,
-        record_delivery_result, redeliver_pending, send_delivery, serve_attach, wait_disconnect,
+        AcceptOutcome, AckStore, BindError, DeliveryLedger, GearwitPaths, HISTORY_CAP, KnownArm,
+        LinkError, LinkSession, LinkTable, SOCKET_FILE, admit_attach, drop_session,
+        prepare_delivery, record_delivery_result, redeliver_pending, send_delivery, serve_attach,
+        serve_connection, wait_disconnect,
     };
     use gearwit_protocol::{
-        MAX_PAYLOAD, ProviderEvent, SCHEMA, WaiterLink, decode_payload, encode_payload,
+        HandledCursor, MAX_PAYLOAD, ProviderEvent, SCHEMA, WaiterLink, decode_handled_payload,
+        decode_payload, encode_handled_payload, encode_payload, parse_handled_cursor,
         parse_waiter_link,
     };
     use ipcprims::frame::{COMMAND, DATA, FrameReader};
@@ -951,6 +955,260 @@ mod tests {
             .expect("result");
         let redeliver = rx.recv_timeout(Duration::from_secs(2)).expect("done");
         assert!(!redeliver);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fixture_ack_request() -> HandledCursor {
+        parse_handled_cursor(include_str!(
+            "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+        ))
+        .expect("ack fixture")
+    }
+
+    fn ack_store(instant: OffsetDateTime) -> AckStore {
+        let mut store = AckStore::with_arm(arm(instant));
+        store
+            .note_claimed("01J00000000000000000000021".to_owned())
+            .expect("claim");
+        store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &[
+                    "post02".to_owned(),
+                    "post03".to_owned(),
+                    "post04".to_owned(),
+                ],
+            )
+            .expect("delivered");
+        store
+    }
+
+    #[test]
+    fn ack_connection_does_not_occupy_or_replace_writer() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut table = LinkTable::default();
+            let mut acks = ack_store(instant);
+            let first = listener.accept().expect("attach accept");
+            let attached = serve_connection(first, &mut table, &mut acks, instant).expect("attach");
+            assert!(matches!(attached, AcceptOutcome::Attached(_)));
+            let link_id = table.current().expect("live").link_id.clone();
+            let second = listener.accept().expect("ack accept");
+            let ack = serve_connection(second, &mut table, &mut acks, instant).expect("ack");
+            assert!(matches!(ack, AcceptOutcome::Ack(_)));
+            tx.send((
+                table.current().map(|link| link.link_id.clone()),
+                acks.arm().map(|arm| arm.generation),
+                link_id,
+            ))
+            .expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut waiter = UnixDomainSocket::connect(&socket).expect("waiter");
+        waiter
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("payload"),
+            ))
+            .expect("attach");
+        let mut waiter_reader = FrameReader::with_config(waiter, super::waiter_frame_config());
+        let attach_reply = decode_payload(&waiter_reader.read_frame().expect("accepted").payload)
+            .expect("attach decode");
+        assert!(matches!(attach_reply, WaiterLink::AttachAccepted { .. }));
+        thread::sleep(Duration::from_millis(20));
+        let mut ack_client = UnixDomainSocket::connect(&socket).expect("ack");
+        ack_client
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_handled_payload(&fixture_ack_request()).expect("ack payload"),
+            ))
+            .expect("ack write");
+        let mut ack_reader = FrameReader::with_config(ack_client, super::waiter_frame_config());
+        let ack_reply =
+            decode_handled_payload(&ack_reader.read_frame().expect("ack frame").payload)
+                .expect("ack decode");
+        assert!(matches!(ack_reply, HandledCursor::Accepted { .. }));
+        let (current, generation, original) =
+            rx.recv_timeout(Duration::from_secs(2)).expect("done");
+        assert_eq!(current.as_ref(), Some(&original));
+        assert_eq!(generation, Some(2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_ack_does_not_touch_the_link_table() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut table = LinkTable::default();
+            let mut acks = ack_store(instant);
+            let first = listener.accept().expect("attach");
+            serve_connection(first, &mut table, &mut acks, instant).expect("attached");
+            let second = listener.accept().expect("bad");
+            let result = serve_connection(second, &mut table, &mut acks, instant);
+            tx.send((
+                result.is_err(),
+                table.current().is_some(),
+                acks.arm().map(|arm| arm.generation),
+            ))
+            .expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut waiter = UnixDomainSocket::connect(&socket).expect("waiter");
+        waiter
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("payload"),
+            ))
+            .expect("attach");
+        let mut waiter_reader = FrameReader::with_config(waiter, super::waiter_frame_config());
+        let _ = waiter_reader.read_frame().expect("accepted");
+        thread::sleep(Duration::from_millis(20));
+        let mut bad = UnixDomainSocket::connect(&socket).expect("bad");
+        bad.write_all(&ipc_frame(COMMAND, br#"{"schema":"nope"}"#))
+            .expect("write");
+        let (failed, live, generation) = rx.recv_timeout(Duration::from_secs(2)).expect("done");
+        assert!(failed);
+        assert!(live);
+        assert_eq!(generation, Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejected_ack_is_isolated_from_the_waiter() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut table = LinkTable::default();
+            let mut acks = AckStore::with_arm(arm(instant));
+            let first = listener.accept().expect("attach");
+            serve_connection(first, &mut table, &mut acks, instant).expect("attached");
+            let second = listener.accept().expect("ack");
+            let outcome = serve_connection(second, &mut table, &mut acks, instant).expect("ack");
+            tx.send((
+                matches!(
+                    outcome,
+                    AcceptOutcome::Ack(ref served)
+                        if matches!(served.reply, HandledCursor::Rejected { .. })
+                ),
+                table.current().is_some(),
+                acks.arm().map(|arm| arm.generation),
+            ))
+            .expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut waiter = UnixDomainSocket::connect(&socket).expect("waiter");
+        waiter
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("payload"),
+            ))
+            .expect("attach");
+        let mut waiter_reader = FrameReader::with_config(waiter, super::waiter_frame_config());
+        let _ = waiter_reader.read_frame().expect("accepted");
+        thread::sleep(Duration::from_millis(20));
+        let mut ack_client = UnixDomainSocket::connect(&socket).expect("ack");
+        ack_client
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_handled_payload(&fixture_ack_request()).expect("ack payload"),
+            ))
+            .expect("ack write");
+        let mut ack_reader = FrameReader::with_config(ack_client, super::waiter_frame_config());
+        let ack_reply =
+            decode_handled_payload(&ack_reader.read_frame().expect("ack frame").payload)
+                .expect("ack decode");
+        assert!(matches!(
+            ack_reply,
+            HandledCursor::Rejected { code, .. } if code == "unknown_signal"
+        ));
+        let (rejected, live, generation) = rx.recv_timeout(Duration::from_secs(2)).expect("done");
+        assert!(rejected);
+        assert!(live);
+        assert_eq!(generation, Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ack_write_loss_replays_exactly_without_second_rearm() {
+        let instant = now();
+        let mut store = ack_store(instant);
+        let request = fixture_ack_request();
+        let first =
+            super::apply_handled_request(&mut store, request.clone(), instant).expect("first");
+        assert!(first.rearm.is_some());
+        assert_eq!(store.arm().expect("arm").generation, 2);
+        let replay = super::apply_handled_request(&mut store, request, instant).expect("replay");
+        assert_eq!(replay.reply, first.reply);
+        assert!(replay.rearm.is_none());
+        assert_eq!(store.arm().expect("arm").generation, 2);
+    }
+
+    #[test]
+    fn old_generation_attach_is_fenced_after_ack_rearm() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut table = LinkTable::default();
+            let mut acks = ack_store(instant);
+            let first = listener.accept().expect("ack");
+            serve_connection(first, &mut table, &mut acks, instant).expect("ack");
+            let second = listener.accept().expect("stale attach");
+            let outcome = serve_connection(second, &mut table, &mut acks, instant).expect("stale");
+            tx.send(matches!(
+                outcome,
+                AcceptOutcome::Attached(ref served)
+                    if matches!(
+                        served.reply,
+                        WaiterLink::AttachRejected { ref code, .. } if code == "stale_generation"
+                    )
+            ))
+            .expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut ack_client = UnixDomainSocket::connect(&socket).expect("ack");
+        ack_client
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_handled_payload(&fixture_ack_request()).expect("ack payload"),
+            ))
+            .expect("ack write");
+        let mut ack_reader = FrameReader::with_config(ack_client, super::waiter_frame_config());
+        let _ = ack_reader.read_frame().expect("ack reply");
+        thread::sleep(Duration::from_millis(20));
+        let mut waiter = UnixDomainSocket::connect(&socket).expect("waiter");
+        waiter
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("payload"),
+            ))
+            .expect("attach");
+        let mut waiter_reader = FrameReader::with_config(waiter, super::waiter_frame_config());
+        let reply =
+            decode_payload(&waiter_reader.read_frame().expect("rejected").payload).expect("decode");
+        assert!(matches!(
+            reply,
+            WaiterLink::AttachRejected { code, .. } if code == "stale_generation"
+        ));
+        assert!(rx.recv_timeout(Duration::from_secs(2)).expect("done"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

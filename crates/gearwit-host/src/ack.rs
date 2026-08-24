@@ -234,6 +234,64 @@ pub fn rearm_from_handled(
     Ok(cursor)
 }
 
+/// Coverage successor after the first accepted ACK for an open signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AckRearm {
+    /// Exclusive `--after` cursor for the successor drain.
+    pub after: String,
+    /// Live generation after the bump.
+    pub generation: u64,
+    /// Closed signal.
+    pub signal_id: String,
+}
+
+/// Record an ACK; rearm only on the first accepted reply for an open signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandledServe {
+    /// Reply to write on the ACK connection.
+    pub reply: HandledCursor,
+    /// Present only when this request closed the signal and bumped generation.
+    pub rearm: Option<AckRearm>,
+}
+
+/// Record `request`, then rearm exactly once if it was newly accepted.
+///
+/// Exact history replay returns the same reply and does not bump generation
+/// again. A failed reply write does not undo the record.
+///
+/// # Errors
+///
+/// Returns [`HandledCursorError`] when the request is not a valid ACK request
+/// or rearm fails for a reason other than an already-closed signal.
+pub fn apply_handled_request(
+    store: &mut AckStore,
+    request: HandledCursor,
+    now: OffsetDateTime,
+) -> Result<HandledServe, HandledCursorError> {
+    let reply = record_handled(store, request, now)?;
+    let rearm = match &reply {
+        HandledCursor::Accepted {
+            signal_id, cursor, ..
+        } => match rearm_from_handled(store, signal_id) {
+            Ok(_) => {
+                let generation = store
+                    .arm()
+                    .map(|arm| arm.generation)
+                    .ok_or(HandledCursorError::Semantic("unknown_arm"))?;
+                Some(AckRearm {
+                    after: cursor.clone(),
+                    generation,
+                    signal_id: signal_id.clone(),
+                })
+            }
+            Err(HandledCursorError::Semantic("stale_generation")) => None,
+            Err(error) => return Err(error),
+        },
+        _ => None,
+    };
+    Ok(HandledServe { reply, rearm })
+}
+
 fn validate_leading_prefix(
     delivered: &[String],
     drain_snapshot: &[String],
@@ -344,7 +402,7 @@ fn format_time(instant: OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AckStore, rearm_from_handled, record_handled};
+    use super::{AckStore, apply_handled_request, rearm_from_handled, record_handled};
     use crate::admit::KnownArm;
     use gearwit_protocol::{HANDLED_SCHEMA, HandledCursor, parse_handled_cursor};
     use time::format_description::well_known::Rfc3339;
@@ -796,5 +854,30 @@ mod tests {
         let replay = record_handled(&mut store, first, now()).expect("replay");
         assert_eq!(replay, accepted);
         assert_eq!(store.arm().expect("arm").generation, 1);
+    }
+
+    #[test]
+    fn apply_records_before_rearm_and_replay_does_not_bump() {
+        let mut store = store_with_batch();
+        let first = apply_handled_request(
+            &mut store,
+            request("post02", "01J00000000000000000000051"),
+            now(),
+        )
+        .expect("first");
+        assert!(matches!(first.reply, HandledCursor::Accepted { .. }));
+        let rearm = first.rearm.expect("rearm");
+        assert_eq!(rearm.after, "post02");
+        assert_eq!(rearm.generation, 2);
+        assert_eq!(store.arm().expect("arm").generation, 2);
+        let replay = apply_handled_request(
+            &mut store,
+            request("post02", "01J00000000000000000000051"),
+            now(),
+        )
+        .expect("replay");
+        assert_eq!(replay.reply, first.reply);
+        assert!(replay.rearm.is_none());
+        assert_eq!(store.arm().expect("arm").generation, 2);
     }
 }
