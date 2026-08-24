@@ -6,7 +6,9 @@ mod codec;
 mod messages;
 
 pub use codec::{MAX_PAYLOAD, PayloadError, decode_payload, encode_payload};
-pub use messages::{PIN_COMMIT, SCHEMA, WaiterLink, WaiterLinkError, parse_waiter_link, validate};
+pub use messages::{
+    PIN_COMMIT, ProviderEvent, SCHEMA, WaiterLink, WaiterLinkError, parse_waiter_link, validate,
+};
 
 #[cfg(test)]
 mod tests {

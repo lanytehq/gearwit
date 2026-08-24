@@ -3,11 +3,15 @@
 #![forbid(unsafe_code)]
 
 mod admit;
+mod deliver;
 mod link;
 mod paths;
 
 pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
+};
+pub use deliver::{
+    DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result, send_delivery,
 };
 pub use link::{
     LinkError, ServeAttach, read_waiter_link, serve_attach, wait_disconnect, waiter_frame_config,
@@ -18,11 +22,13 @@ pub use paths::{BindError, BoundListener, GearwitPaths, SOCKET_FILE, canonical_r
 #[cfg(test)]
 mod tests {
     use super::{
-        BindError, GearwitPaths, HISTORY_CAP, KnownArm, LinkError, LinkSession, LinkTable,
-        SOCKET_FILE, admit_attach, drop_session, serve_attach, wait_disconnect,
+        BindError, DeliveryLedger, GearwitPaths, HISTORY_CAP, KnownArm, LinkError, LinkSession,
+        LinkTable, SOCKET_FILE, admit_attach, drop_session, prepare_delivery,
+        record_delivery_result, send_delivery, serve_attach, wait_disconnect,
     };
     use gearwit_protocol::{
-        MAX_PAYLOAD, WaiterLink, decode_payload, encode_payload, parse_waiter_link,
+        MAX_PAYLOAD, ProviderEvent, SCHEMA, WaiterLink, decode_payload, encode_payload,
+        parse_waiter_link,
     };
     use ipcprims::frame::{COMMAND, DATA, FrameReader};
     use ipcprims::transport::UnixDomainSocket;
@@ -688,6 +694,194 @@ mod tests {
         std::fs::set_permissions(&root, permissions).expect("chmod");
         let paths = GearwitPaths::from_root(root.clone()).expect("paths");
         assert_eq!(mode(paths.root()), 0o700);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn sample_event() -> ProviderEvent {
+        ProviderEvent {
+            provider: "mattermost".to_owned(),
+            event_ref: "post02".to_owned(),
+            actor: Some("example-devlead".to_owned()),
+            observed_at: "2026-01-15T12:05:00Z".to_owned(),
+            body: "first bounded event".to_owned(),
+        }
+    }
+
+    #[test]
+    fn completed_delivery_is_not_redelivered() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("admit");
+        let link = table.current().expect("link").clone();
+        let mut ledger = DeliveryLedger::default();
+        let first = prepare_delivery(
+            &mut ledger,
+            &link,
+            "01J00000000000000000000021".to_owned(),
+            "complete_background_tool".to_owned(),
+            vec![sample_event()],
+            instant,
+        )
+        .expect("prepare");
+        assert!(ledger.should_redeliver());
+        let WaiterLink::DeliverEvents { delivery_id, .. } = &first else {
+            panic!("deliver");
+        };
+        let result = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: link.link_id.clone(),
+            signal_id: "01J00000000000000000000021".to_owned(),
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:03Z".to_owned(),
+        };
+        record_delivery_result(&mut ledger, &result).expect("result");
+        assert!(!ledger.should_redeliver());
+        let second = prepare_delivery(
+            &mut ledger,
+            &link,
+            "01J00000000000000000000022".to_owned(),
+            "complete_background_tool".to_owned(),
+            vec![sample_event()],
+            instant,
+        )
+        .expect("next batch");
+        let WaiterLink::DeliverEvents {
+            delivery_id: second_id,
+            ..
+        } = second
+        else {
+            panic!("deliver");
+        };
+        assert_ne!(*delivery_id, second_id);
+    }
+
+    #[test]
+    fn link_lost_redelivers_same_id_on_new_link() {
+        let instant = now();
+        let mut table = LinkTable::default();
+        admit_attach(&mut table, fixture_attach(), instant, &[arm(instant)]).expect("admit");
+        let first_link = table.current().expect("link").clone();
+        let mut ledger = DeliveryLedger::default();
+        let first = prepare_delivery(
+            &mut ledger,
+            &first_link,
+            "01J00000000000000000000021".to_owned(),
+            "complete_background_tool".to_owned(),
+            vec![sample_event()],
+            instant,
+        )
+        .expect("prepare");
+        let WaiterLink::DeliverEvents { delivery_id, .. } = &first else {
+            panic!("deliver");
+        };
+        let lost = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: delivery_id.clone(),
+            link_id: first_link.link_id.clone(),
+            signal_id: "01J00000000000000000000021".to_owned(),
+            outcome: "link_lost".to_owned(),
+            observed_at: "2026-01-15T12:05:03Z".to_owned(),
+        };
+        record_delivery_result(&mut ledger, &lost).expect("lost");
+        assert!(ledger.should_redeliver());
+        table.drop_current();
+        admit_attach(
+            &mut table,
+            attach_with("01J00000000000000000000098"),
+            instant,
+            &[arm(instant)],
+        )
+        .expect("successor");
+        let successor = table.current().expect("successor").clone();
+        let again = prepare_delivery(
+            &mut ledger,
+            &successor,
+            "01J00000000000000000000021".to_owned(),
+            "complete_background_tool".to_owned(),
+            vec![sample_event()],
+            instant,
+        )
+        .expect("redeliver");
+        match again {
+            WaiterLink::DeliverEvents {
+                delivery_id: again_id,
+                link_id,
+                ..
+            } => {
+                assert_eq!(again_id, *delivery_id);
+                assert_eq!(link_id, successor.link_id);
+            }
+            other => panic!("expected redelivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deliver_over_socket_then_result() {
+        let root = temp_root();
+        let paths = GearwitPaths::from_root(root.clone()).expect("paths");
+        let listener = paths.bind().expect("bind");
+        let socket = paths.socket_path();
+        let instant = now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let stream = listener.accept().expect("accept");
+            let mut table = LinkTable::default();
+            let mut served =
+                serve_attach(stream, &mut table, instant, &[arm(instant)]).expect("attach");
+            let link = table.current().expect("link").clone();
+            let mut ledger = DeliveryLedger::default();
+            let delivery = prepare_delivery(
+                &mut ledger,
+                &link,
+                "01J00000000000000000000021".to_owned(),
+                "complete_background_tool".to_owned(),
+                vec![sample_event()],
+                instant,
+            )
+            .expect("prepare");
+            send_delivery(&mut served.writer, &delivery).expect("send");
+            let result = super::read_waiter_link(&mut served.reader).expect("result");
+            record_delivery_result(&mut ledger, &result).expect("record");
+            tx.send(ledger.should_redeliver()).expect("send");
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut client = UnixDomainSocket::connect(&socket).expect("connect");
+        client
+            .write_all(&ipc_frame(
+                COMMAND,
+                &encode_payload(&fixture_attach()).expect("payload"),
+            ))
+            .expect("attach");
+        let writer_stream = client.try_clone().expect("clone");
+        let mut reader = FrameReader::with_config(client, super::waiter_frame_config());
+        let _ = reader.read_frame().expect("accepted");
+        let frame = reader.read_frame().expect("delivery");
+        let delivery = decode_payload(&frame.payload).expect("decode");
+        let WaiterLink::DeliverEvents {
+            delivery_id,
+            link_id,
+            signal_id,
+            ..
+        } = delivery
+        else {
+            panic!("expected deliver_events");
+        };
+        let result = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id,
+            link_id,
+            signal_id,
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:03Z".to_owned(),
+        };
+        let mut writer =
+            ipcprims::frame::FrameWriter::with_config(writer_stream, super::waiter_frame_config());
+        writer
+            .send(COMMAND, &encode_payload(&result).expect("encode"))
+            .expect("result");
+        let redeliver = rx.recv_timeout(Duration::from_secs(2)).expect("done");
+        assert!(!redeliver);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

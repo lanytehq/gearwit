@@ -112,8 +112,10 @@ pub struct ServeAttach {
     pub reply: WaiterLink,
     /// Session token when a live link was admitted or replayed.
     pub session: Option<LinkSession>,
-    /// Remaining reader used to observe disconnect.
+    /// Remaining reader used to observe disconnect and results.
     pub reader: FrameReader<IpcStream>,
+    /// Writer used for `deliver_events` on this session.
+    pub writer: FrameWriter<IpcStream>,
 }
 
 /// Block until the waiter closes the stream.
@@ -189,6 +191,7 @@ pub fn serve_attach(
         reply,
         session,
         reader,
+        writer,
     })
 }
 
