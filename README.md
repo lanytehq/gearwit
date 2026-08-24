@@ -60,6 +60,8 @@ cargo run -p gearwit-cli -- self who
 cargo run -p gearwit-cli -- self wait-on CHANNEL --after ID --timeout 20m \
   --source chanvoy --return background-tool
 cargo run -p gearwit-cli -- self check
+cargo run -p gearwit-cli -- daemon wait-on CHANNEL --after ID --timeout 20m \
+  --source chanvoy --return notify-operator
 ```
 
 `self who` is a census-safe local card with per-field evidence. `self wait-on`

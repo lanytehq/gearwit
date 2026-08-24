@@ -10,6 +10,16 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Daemon(daemon) => match daemon.command {
+            DaemonCommand::WaitOn(args) => {
+                let code = run_wait_on(&spec_from_args(args, true));
+                ExitCode::from(u8::try_from(code).unwrap_or(2))
+            }
+            DaemonCommand::Status => {
+                print!("{}", render_check());
+                ExitCode::SUCCESS
+            }
+        },
         Commands::Self_(self_cmd) => match self_cmd.command {
             SelfCommand::Who => {
                 let card = WhoCard::from_census(&ProcessCensus::from_current_process());
@@ -17,14 +27,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             SelfCommand::WaitOn(args) => {
-                let code = run_wait_on(&WaitOnSpec {
-                    channel: args.channel,
-                    after: Some(args.after),
-                    timeout: args.timeout,
-                    team: args.team,
-                    source: args.source,
-                    return_route: args.return_route.route(),
-                });
+                let code = run_wait_on(&spec_from_args(args, false));
                 ExitCode::from(u8::try_from(code).unwrap_or(2))
             }
             SelfCommand::Check => {
@@ -53,6 +56,23 @@ enum Commands {
     /// Verbs for the calling seat.
     #[command(name = "self")]
     Self_(SelfArgs),
+    /// Local watcher process. Not a harness inject. Coverage only.
+    Daemon(DaemonArgs),
+}
+
+#[derive(Debug, Parser)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Sit on a channel and re-arm from `newest_observed`. Notify/observe only.
+    #[command(name = "wait-on")]
+    WaitOn(WaitOnArgs),
+    /// Print the last stored receipt.
+    Status,
 }
 
 #[derive(Debug, Parser)]
@@ -109,6 +129,18 @@ enum ReturnArg {
     /// Notify an operator; do not claim a model turn.
     #[value(name = "notify-operator")]
     NotifyOperator,
+}
+
+fn spec_from_args(args: WaitOnArgs, follow: bool) -> WaitOnSpec {
+    WaitOnSpec {
+        channel: args.channel,
+        after: Some(args.after),
+        timeout: args.timeout,
+        team: args.team,
+        source: args.source,
+        return_route: args.return_route.route(),
+        follow,
+    }
 }
 
 impl ReturnArg {

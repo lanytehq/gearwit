@@ -28,6 +28,9 @@ pub struct WaitOnSpec {
     pub source: String,
     /// Declared return route. Not proof that a model turn started.
     pub return_route: DeliveryRoute,
+    /// If true, re-arm coverage from `newest_observed` after a match or the same
+    /// cursor after a deadman. This is daemon coverage, not a handled cursor.
+    pub follow: bool,
 }
 
 /// How the waiter process ended. Not a harness-turn claim.
@@ -582,19 +585,52 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
     }
 }
 
-/// Run `chanvoy wait` and print a receipt. Returns the process exit code.
+/// Run one wait interval, print and store a receipt.
 #[must_use]
-pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
+pub fn run_wait_on_once(spec: &WaitOnSpec) -> WaitOutcome {
     let outcome = attach_drain(execute_wait_on(spec, &ChanvoyRunner), spec, &ChanvoyDrain);
-    let receipt = render_wait_receipt(spec, &outcome);
-    eprint!("{receipt}");
+    let mut receipt = render_wait_receipt(spec, &outcome);
+    if spec.follow {
+        receipt = format!("{receipt}coverage_mode: follow_newest_observed\n");
+        eprint!("{receipt}");
+    } else {
+        eprint!("{receipt}");
+    }
     if let Err(error) = crate::check::store_last_receipt(&receipt) {
         eprintln!("gearwit: could not store last receipt: {error}");
     }
     if outcome.waiter == WaiterState::NotStarted && outcome.chanvoy_exit.is_none() {
         eprintln!("gearwit: waiter did not start");
     }
-    outcome.process_exit
+    outcome
+}
+
+/// Run `chanvoy wait` and print a receipt. Returns the process exit code.
+#[must_use]
+pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
+    if spec.follow {
+        return run_watch_loop(spec.clone());
+    }
+    run_wait_on_once(spec).process_exit
+}
+
+/// Coverage loop: re-arm from newest observed after match, same cursor after deadman.
+#[must_use]
+pub fn run_watch_loop(mut spec: WaitOnSpec) -> i32 {
+    spec.follow = true;
+    loop {
+        let outcome = run_wait_on_once(&spec);
+        match outcome.result {
+            WaitResult::Matched => {
+                let Some(newest) = outcome.newest_observed else {
+                    return 2;
+                };
+                spec.after = Some(newest);
+            }
+            WaitResult::Timeout => {}
+            WaitResult::Error => return outcome.process_exit,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -616,6 +652,7 @@ mod tests {
             team: None,
             source: "chanvoy".to_owned(),
             return_route: gearwit_domain::DeliveryRoute::ReturnForeground,
+            follow: false,
         }
     }
 
