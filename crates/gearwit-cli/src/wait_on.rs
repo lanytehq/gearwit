@@ -93,6 +93,10 @@ pub struct WaitOutcome {
     pub chanvoy_exit: Option<i32>,
     /// Process exit: 0 matched, 1 timeout, otherwise 2.
     pub process_exit: i32,
+    /// Provider posts observed after the exclusive arm baseline.
+    pub drained_ids: Vec<String>,
+    /// Newest observed post id from that drain, if any.
+    pub newest_observed: Option<String>,
 }
 
 /// Spawn a waiter. Tests inject a missing runner.
@@ -299,6 +303,8 @@ timeout: {timeout}
 return: {return_route}  (self_declared)
 durability: in_process
 chanvoy_exit: {chanvoy_exit}
+drained_count: {drained_count}
+newest_observed: {newest_observed}
 {phases}
 ",
         source = paste_field(&spec.source, MAX_ID),
@@ -312,7 +318,86 @@ chanvoy_exit: {chanvoy_exit}
         chanvoy_exit = outcome
             .chanvoy_exit
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+        drained_count = outcome.drained_ids.len(),
+        newest_observed = outcome
+            .newest_observed
+            .as_deref()
+            .map_or_else(|| "unknown".to_owned(), |id| paste_field(id, MAX_ID),),
     )
+}
+
+/// Parse post ids from `chanvoy read --json` (object with `messages` or a bare array).
+#[must_use]
+pub fn parse_drained_ids(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let messages = value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    let Some(messages) = messages else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| paste_token(id, MAX_ID).map(ToOwned::to_owned))
+        })
+        .collect()
+}
+
+/// Drain provider posts after the exclusive arm baseline.
+pub trait EventDrain {
+    /// Return observed post ids, oldest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from the provider CLI.
+    fn drain_after(&self, spec: &WaitOnSpec) -> io::Result<Vec<String>>;
+}
+
+/// Default drain: `chanvoy read --json --after`.
+pub struct ChanvoyDrain;
+
+impl EventDrain for ChanvoyDrain {
+    fn drain_after(&self, spec: &WaitOnSpec) -> io::Result<Vec<String>> {
+        let mut command = Command::new("chanvoy");
+        command.arg("read");
+        if let Some(team) = &spec.team {
+            command.arg("--team").arg(team);
+        }
+        command.arg(&spec.channel);
+        if let Some(after) = &spec.after {
+            command.arg("--after").arg(after);
+        }
+        command.arg("--json");
+        let output = command.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_drained_ids(&stdout))
+    }
+}
+
+/// Fill drain fields after a matched waiter. Timeouts and errors skip drain.
+pub fn attach_drain(
+    mut outcome: WaitOutcome,
+    spec: &WaitOnSpec,
+    drain: &impl EventDrain,
+) -> WaitOutcome {
+    if outcome.result != WaitResult::Matched {
+        return outcome;
+    }
+    if let Ok(ids) = drain.drain_after(spec) {
+        outcome.newest_observed = ids.last().cloned();
+        outcome.drained_ids = ids;
+    } else {
+        outcome.drained_ids.clear();
+        outcome.newest_observed = None;
+    }
+    outcome
 }
 
 /// Execute a wait with an injected runner.
@@ -324,6 +409,8 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
             result: WaitResult::Error,
             chanvoy_exit: None,
             process_exit: 2,
+            drained_ids: Vec::new(),
+            newest_observed: None,
         };
     }
     let args = chanvoy_wait_args(spec);
@@ -340,6 +427,8 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
                 result: WaitResult::from_code(process_exit),
                 chanvoy_exit: raw,
                 process_exit,
+                drained_ids: Vec::new(),
+                newest_observed: None,
             }
         }
         Err(_) => WaitOutcome {
@@ -347,6 +436,8 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
             result: WaitResult::Error,
             chanvoy_exit: None,
             process_exit: 2,
+            drained_ids: Vec::new(),
+            newest_observed: None,
         },
     }
 }
@@ -354,7 +445,7 @@ pub fn execute_wait_on(spec: &WaitOnSpec, runner: &impl WaitRunner) -> WaitOutco
 /// Run `chanvoy wait` and print a receipt. Returns the process exit code.
 #[must_use]
 pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
-    let outcome = execute_wait_on(spec, &ChanvoyRunner);
+    let outcome = attach_drain(execute_wait_on(spec, &ChanvoyRunner), spec, &ChanvoyDrain);
     let receipt = render_wait_receipt(spec, &outcome);
     eprint!("{receipt}");
     if let Err(error) = crate::check::store_last_receipt(&receipt) {
@@ -369,8 +460,9 @@ pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        WaitOnSpec, WaitOutcome, WaitResult, WaitRunner, WaiterState, chanvoy_wait_args,
-        execute_wait_on, render_wait_receipt, waiter_receipt_log,
+        EventDrain, WaitOnSpec, WaitOutcome, WaitResult, WaitRunner, WaiterState, attach_drain,
+        chanvoy_wait_args, execute_wait_on, parse_drained_ids, render_wait_receipt,
+        waiter_receipt_log,
     };
     use gearwit_domain::InterruptPhase;
     use std::io;
@@ -437,6 +529,8 @@ mod tests {
             result: WaitResult::Matched,
             chanvoy_exit: Some(0),
             process_exit: 0,
+            drained_ids: vec!["post-a".to_owned(), "post-b".to_owned()],
+            newest_observed: Some("post-b".to_owned()),
         };
         let text = render_wait_receipt(&spec(), &outcome);
         assert!(text.contains("source: chanvoy"));
@@ -446,6 +540,8 @@ mod tests {
         assert!(text.contains("waiter_completed: matched  (waiter_process)"));
         assert!(text.contains("turn_started: unknown"));
         assert!(text.contains("durability: in_process"));
+        assert!(text.contains("drained_count: 2"));
+        assert!(text.contains("newest_observed: post-b"));
         let log = waiter_receipt_log(&outcome).expect("matched receipts");
         assert_eq!(log.len(), 2);
         assert!(log.observe(InterruptPhase::TurnStarted).is_unknown());
@@ -513,5 +609,33 @@ mod tests {
         let text = render_wait_receipt(&unsafe_spec, &outcome);
         assert!(text.contains("channel: rejected"));
         assert!(!text.contains("wait_result: matched\n"));
+    }
+
+    #[test]
+    fn parse_two_posts_oldest_first() {
+        let json = r#"{"messages":[{"id":"aaa"},{"id":"bbb"}]}"#;
+        assert_eq!(parse_drained_ids(json), ["aaa", "bbb"]);
+    }
+
+    struct FixedDrain(Vec<String>);
+
+    impl EventDrain for FixedDrain {
+        fn drain_after(&self, _spec: &WaitOnSpec) -> io::Result<Vec<String>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn matched_wait_drains_beyond_first_match() {
+        let outcome = attach_drain(
+            execute_wait_on(&spec(), &ExitCodeRunner(0)),
+            &spec(),
+            &FixedDrain(vec!["first".to_owned(), "second".to_owned()]),
+        );
+        assert_eq!(outcome.drained_ids, ["first", "second"]);
+        assert_eq!(outcome.newest_observed.as_deref(), Some("second"));
+        let text = render_wait_receipt(&spec(), &outcome);
+        assert!(text.contains("newest_observed: second"));
+        assert!(text.contains("drained_count: 2"));
     }
 }
