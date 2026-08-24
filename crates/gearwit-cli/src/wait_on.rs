@@ -7,6 +7,10 @@ use std::io;
 use std::process::{Command, ExitStatus};
 
 use crate::sanitize::{MAX_ID, MAX_TIMEOUT, paste_field, paste_token};
+use gearwit_domain::{
+    CoverageEndReason, InterruptPhase, LifecycleFact, LifecycleReceipt, PhaseObservation,
+    ReceiptLog, ReceiptSource, WaiterCompletion,
+};
 
 /// Arguments for an in-process wait.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,9 +144,65 @@ pub fn chanvoy_wait_args(spec: &WaitOnSpec) -> Vec<String> {
     args
 }
 
-/// Render a paste-safe receipt. `turn_started` stays unknown.
+/// Build waiter-process receipts. The waiter cannot evidence `turn_started`.
+#[must_use]
+pub fn waiter_receipt_log(outcome: &WaitOutcome) -> ReceiptLog {
+    let mut log = ReceiptLog::new();
+    let mut append = |sequence: u64, fact: LifecycleFact| {
+        if let Ok(receipt) = LifecycleReceipt::try_new(sequence, fact, ReceiptSource::WaiterProcess)
+        {
+            let _ = log.append(receipt);
+        }
+    };
+    if outcome.waiter == WaiterState::NotStarted {
+        append(
+            1,
+            LifecycleFact::CoverageEnded(CoverageEndReason::RunnerNotStarted),
+        );
+        return log;
+    }
+    append(1, LifecycleFact::WaitArmed);
+    let completion = match outcome.result {
+        WaitResult::Matched => WaiterCompletion::Matched,
+        WaitResult::Timeout => WaiterCompletion::DeadmanExpired,
+        WaitResult::Error => WaiterCompletion::Failed,
+    };
+    append(2, LifecycleFact::WaiterCompleted(completion));
+    log
+}
+
+fn format_phase_line(log: &ReceiptLog, phase: InterruptPhase) -> String {
+    match log.observe(phase) {
+        PhaseObservation::Unknown => format!("{phase}: unknown"),
+        PhaseObservation::Observed { fact, source } => {
+            let detail = match fact {
+                LifecycleFact::WaiterCompleted(completion) => completion.as_str(),
+                LifecycleFact::CoverageEnded(reason) => reason.as_str(),
+                _ => "observed",
+            };
+            format!("{phase}: {detail}  ({})", source.as_str())
+        }
+    }
+}
+
+/// Render a paste-safe receipt using interrupt-lifecycle tokens.
 #[must_use]
 pub fn render_wait_receipt(spec: &WaitOnSpec, outcome: &WaitOutcome) -> String {
+    let log = waiter_receipt_log(outcome);
+    let phases = [
+        InterruptPhase::WaitArmed,
+        InterruptPhase::SignalMatched,
+        InterruptPhase::WaiterCompleted,
+        InterruptPhase::TurnStarted,
+        InterruptPhase::ModelObserved,
+        InterruptPhase::SeatActed,
+        InterruptPhase::CoverageRearmed,
+        InterruptPhase::CoverageEnded,
+    ]
+    .into_iter()
+    .map(|phase| format_phase_line(&log, phase))
+    .collect::<Vec<_>>()
+    .join("\n");
     format!(
         "\
 gearwit self wait-on
@@ -150,12 +210,8 @@ channel: {channel}
 after: {after}
 timeout: {timeout}
 durability: in_process
-waiter_completed: {waiter}  (self_declared)
-wait_result: {wait_result}
 chanvoy_exit: {chanvoy_exit}
-turn_started: unknown
-reachability: unknown
-wake_plan: unknown
+{phases}
 ",
         channel = paste_field(&spec.channel, MAX_ID),
         after = spec
@@ -163,8 +219,6 @@ wake_plan: unknown
             .as_deref()
             .map_or_else(|| "unknown".to_owned(), |after| paste_field(after, MAX_ID)),
         timeout = paste_field(&spec.timeout, MAX_TIMEOUT),
-        waiter = outcome.waiter.as_str(),
-        wait_result = outcome.result.as_str(),
         chanvoy_exit = outcome
             .chanvoy_exit
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
@@ -222,8 +276,9 @@ pub fn run_wait_on(spec: &WaitOnSpec) -> i32 {
 mod tests {
     use super::{
         WaitOnSpec, WaitOutcome, WaitResult, WaitRunner, WaiterState, chanvoy_wait_args,
-        execute_wait_on, render_wait_receipt,
+        execute_wait_on, render_wait_receipt, waiter_receipt_log,
     };
+    use gearwit_domain::InterruptPhase;
     use std::io;
     use std::process::ExitStatus;
 
@@ -288,11 +343,13 @@ mod tests {
             process_exit: 0,
         };
         let text = render_wait_receipt(&spec(), &outcome);
-        assert!(text.contains("wait_result: matched"));
-        assert!(text.contains("waiter_completed: true  (self_declared)"));
+        assert!(text.contains("wait_armed: observed  (waiter_process)"));
+        assert!(text.contains("signal_matched: unknown"));
+        assert!(text.contains("waiter_completed: matched  (waiter_process)"));
         assert!(text.contains("turn_started: unknown"));
         assert!(text.contains("durability: in_process"));
-        assert!(!text.contains("completion_doorbell"));
+        let log = waiter_receipt_log(&outcome);
+        assert!(log.observe(InterruptPhase::TurnStarted).is_unknown());
     }
 
     #[test]
@@ -303,8 +360,9 @@ mod tests {
         assert_eq!(outcome.process_exit, 2);
         assert!(outcome.chanvoy_exit.is_none());
         let text = render_wait_receipt(&spec(), &outcome);
-        assert!(text.contains("waiter_completed: false  (self_declared)"));
-        assert!(text.contains("wait_result: error"));
+        assert!(text.contains("waiter_completed: unknown"));
+        assert!(text.contains("coverage_ended: runner_not_started  (waiter_process)"));
+        assert!(text.contains("turn_started: unknown"));
     }
 
     #[test]
