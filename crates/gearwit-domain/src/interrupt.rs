@@ -111,12 +111,16 @@ pub enum InterruptPhase {
     SignalMatched,
     /// The waiter process returned a terminal result.
     WaiterCompleted,
+    /// The provider/control plane drained events through an observed cursor.
+    EventsDrained,
     /// The harness began a model turn.
     TurnStarted,
     /// The model observed the correlated signal.
     ModelObserved,
     /// The seat acknowledged that it acted on the signal.
     SeatActed,
+    /// The newest fully handled cursor was recorded after action.
+    HandledCursorRecorded,
     /// The seat established successor coverage.
     CoverageRearmed,
     /// Coverage ended without a successor wait in this lifecycle.
@@ -131,9 +135,11 @@ impl InterruptPhase {
             Self::WaitArmed => "wait_armed",
             Self::SignalMatched => "signal_matched",
             Self::WaiterCompleted => "waiter_completed",
+            Self::EventsDrained => "events_drained",
             Self::TurnStarted => "turn_started",
             Self::ModelObserved => "model_observed",
             Self::SeatActed => "seat_acted",
+            Self::HandledCursorRecorded => "handled_cursor_recorded",
             Self::CoverageRearmed => "coverage_rearmed",
             Self::CoverageEnded => "coverage_ended",
         }
@@ -210,12 +216,19 @@ pub enum LifecycleFact {
     SignalMatched,
     /// A waiter that started returned.
     WaiterCompleted(WaiterCompletion),
+    /// Provider events were drained through the newest observed event.
+    EventsDrained {
+        /// Number of events returned by the drain.
+        event_count: u32,
+    },
     /// A harness turn began.
     TurnStarted,
     /// The model observed the correlated signal.
     ModelObserved,
     /// The seat acknowledged action.
     SeatActed,
+    /// The newest fully handled provider cursor was recorded.
+    HandledCursorRecorded,
     /// Successor coverage was established.
     CoverageRearmed,
     /// Coverage ended.
@@ -230,9 +243,11 @@ impl LifecycleFact {
             Self::WaitArmed => InterruptPhase::WaitArmed,
             Self::SignalMatched => InterruptPhase::SignalMatched,
             Self::WaiterCompleted(_) => InterruptPhase::WaiterCompleted,
+            Self::EventsDrained { .. } => InterruptPhase::EventsDrained,
             Self::TurnStarted => InterruptPhase::TurnStarted,
             Self::ModelObserved => InterruptPhase::ModelObserved,
             Self::SeatActed => InterruptPhase::SeatActed,
+            Self::HandledCursorRecorded => InterruptPhase::HandledCursorRecorded,
             Self::CoverageRearmed => InterruptPhase::CoverageRearmed,
             Self::CoverageEnded(_) => InterruptPhase::CoverageEnded,
         }
@@ -280,10 +295,15 @@ impl ReceiptSource {
                 InterruptPhase::WaitArmed
                     | InterruptPhase::SignalMatched
                     | InterruptPhase::WaiterCompleted
+                    | InterruptPhase::EventsDrained
+                    | InterruptPhase::HandledCursorRecorded
                     | InterruptPhase::CoverageRearmed
                     | InterruptPhase::CoverageEnded
             ),
-            Self::Provider => matches!(phase, InterruptPhase::SignalMatched),
+            Self::Provider => matches!(
+                phase,
+                InterruptPhase::SignalMatched | InterruptPhase::EventsDrained
+            ),
             Self::WaiterProcess => matches!(
                 phase,
                 InterruptPhase::WaitArmed
@@ -303,6 +323,7 @@ impl ReceiptSource {
                 phase,
                 InterruptPhase::ModelObserved
                     | InterruptPhase::SeatActed
+                    | InterruptPhase::HandledCursorRecorded
                     | InterruptPhase::CoverageRearmed
             ),
             Self::Operator => matches!(phase, InterruptPhase::SeatActed),
@@ -556,7 +577,12 @@ mod tests {
         );
         assert_eq!(DeliveryRoute::NotifyOperator.as_str(), "notify_operator");
         assert_eq!(InterruptPhase::SignalMatched.as_str(), "signal_matched");
+        assert_eq!(InterruptPhase::EventsDrained.as_str(), "events_drained");
         assert_eq!(InterruptPhase::SeatActed.as_str(), "seat_acted");
+        assert_eq!(
+            InterruptPhase::HandledCursorRecorded.as_str(),
+            "handled_cursor_recorded"
+        );
         assert_eq!(WaiterCompletion::DeadmanExpired.as_str(), "deadman_expired");
         assert_eq!(
             CoverageEndReason::RunnerNotStarted.as_str(),
@@ -590,6 +616,11 @@ mod tests {
         assert!(log.observe(InterruptPhase::TurnStarted).is_unknown());
         assert!(log.observe(InterruptPhase::ModelObserved).is_unknown());
         assert!(log.observe(InterruptPhase::SeatActed).is_unknown());
+        assert!(log.observe(InterruptPhase::EventsDrained).is_unknown());
+        assert!(
+            log.observe(InterruptPhase::HandledCursorRecorded)
+                .is_unknown()
+        );
     }
 
     #[test]
@@ -600,6 +631,44 @@ mod tests {
                 source: ReceiptSource::WaiterProcess,
                 phase: InterruptPhase::TurnStarted,
             })
+        );
+    }
+
+    #[test]
+    fn waiter_process_cannot_claim_events_drained() {
+        assert_eq!(
+            LifecycleReceipt::try_new(
+                1,
+                LifecycleFact::EventsDrained { event_count: 2 },
+                ReceiptSource::WaiterProcess,
+            ),
+            Err(ReceiptError::UnsupportedEvidence {
+                source: ReceiptSource::WaiterProcess,
+                phase: InterruptPhase::EventsDrained,
+            })
+        );
+    }
+
+    #[test]
+    fn drain_and_handled_cursor_are_independent_facts() {
+        let mut log = ReceiptLog::new();
+        log.append(receipt(
+            1,
+            LifecycleFact::EventsDrained { event_count: 2 },
+            ReceiptSource::ControlPlane,
+        ))
+        .expect("drain receipt");
+
+        assert_eq!(
+            log.observe(InterruptPhase::EventsDrained),
+            PhaseObservation::Observed {
+                fact: LifecycleFact::EventsDrained { event_count: 2 },
+                source: ReceiptSource::ControlPlane,
+            }
+        );
+        assert!(
+            log.observe(InterruptPhase::HandledCursorRecorded)
+                .is_unknown()
         );
     }
 
