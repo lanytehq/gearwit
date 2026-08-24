@@ -1,9 +1,11 @@
 //! Canonical Gearwit home, private directories, and waiter-link bind.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -84,9 +86,39 @@ pub fn canonical_root() -> Result<PathBuf, BindError> {
     Ok(PathBuf::from(home).join(".lanyte").join("gearwit"))
 }
 
+struct PathClaim {
+    path: PathBuf,
+}
+
+impl Drop for PathClaim {
+    fn drop(&mut self) {
+        INPROC_CLAIMS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("in-process bind claims")
+            .remove(&self.path);
+    }
+}
+
+fn claim_lock_path(path: &Path) -> Result<PathClaim, BindError> {
+    let mut claims = INPROC_CLAIMS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("in-process bind claims");
+    if !claims.insert(path.to_path_buf()) {
+        return Err(BindError::LiveListener(path.to_path_buf()));
+    }
+    Ok(PathClaim {
+        path: path.to_path_buf(),
+    })
+}
+
+static INPROC_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
 /// Bound waiter-link listener. Holds the advisory lock fd until drop.
 pub struct BoundListener {
     _lock: Flock<File>,
+    _claim: PathClaim,
     listener: UnixDomainSocket,
 }
 
@@ -178,10 +210,13 @@ impl GearwitPaths {
     ///
     /// Returns [`BindError`] for live listeners, non-sockets, or transport failure.
     pub fn bind(&self) -> Result<BoundListener, BindError> {
-        let lock = acquire_listener_lock(&self.root.join("run"))?;
+        let lock_path = self.root.join("run").join(LOCK_FILE);
+        let claim = claim_lock_path(&lock_path)?;
+        let lock = acquire_listener_lock(&lock_path)?;
         let listener = bind_private_socket(&self.socket_path())?;
         Ok(BoundListener {
             _lock: lock,
+            _claim: claim,
             listener,
         })
     }
@@ -258,13 +293,12 @@ fn ensure_shared_lanyte(dir: &Path) -> Result<(), BindError> {
     }
 }
 
-fn acquire_listener_lock(run_dir: &Path) -> Result<Flock<File>, BindError> {
-    let path = run_dir.join(LOCK_FILE);
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
+fn acquire_listener_lock(path: &Path) -> Result<Flock<File>, BindError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
-            return Err(BindError::Symlink(path));
+            return Err(BindError::Symlink(path.to_path_buf()));
         }
-        require_owned(&metadata, &path)?;
+        require_owned(&metadata, path)?;
     }
     let file = OpenOptions::new()
         .create(true)
@@ -272,15 +306,20 @@ fn acquire_listener_lock(run_dir: &Path) -> Result<Flock<File>, BindError> {
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(&path)?;
-    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-        return Err(BindError::Symlink(path));
-    }
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(nix::libc::ELOOP) {
+                BindError::Symlink(path.to_path_buf())
+            } else {
+                BindError::Io(error)
+            }
+        })?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(lock),
         Err((_, Errno::EAGAIN)) => {
-            warn_live(&path);
-            Err(BindError::LiveListener(path))
+            warn_live(path);
+            Err(BindError::LiveListener(path.to_path_buf()))
         }
         Err((_, error)) => Err(BindError::Io(io::Error::other(error))),
     }

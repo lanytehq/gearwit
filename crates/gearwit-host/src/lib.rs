@@ -436,6 +436,26 @@ mod tests {
         let exe = std::env::current_exe().expect("exe");
         for round in 0..5 {
             let root = temp_root();
+            let paths = GearwitPaths::from_root(root.clone()).expect("layout");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let spawn = |paths: GearwitPaths, barrier: std::sync::Arc<std::sync::Barrier>| {
+                thread::spawn(move || {
+                    barrier.wait();
+                    paths.bind()
+                })
+            };
+            let a = spawn(paths.clone(), barrier.clone());
+            let b = spawn(paths, barrier);
+            let a = a.join().expect("thread a");
+            let b = b.join().expect("thread b");
+            let thread_wins = usize::from(a.is_ok()) + usize::from(b.is_ok());
+            assert_eq!(thread_wins, 1, "thread round {round}");
+            drop(a.ok());
+            drop(b.ok());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        for round in 0..5 {
+            let root = temp_root();
             GearwitPaths::from_root(root.clone()).expect("layout");
             let spawn_child = |exe: PathBuf, root: PathBuf| {
                 thread::spawn(move || {
