@@ -683,12 +683,12 @@ pub struct AckRearmPlan<'a, C: CoverageChild, D: EventDrain> {
     pub pipe: &'a mut DaemonPipe,
     /// Old-generation waiter, if any.
     pub served: &'a mut Option<ServeAttach>,
-    /// Link table (caller must not hold this across socket I/O).
-    pub table: &'a mut LinkTable,
+    /// Link table; locked only for generation-selective revoke.
+    pub table: &'a Mutex<LinkTable>,
     /// Coverage child slot.
     pub children: &'a mut C,
-    /// Handled-cursor store.
-    pub acks: &'a mut AckStore,
+    /// Handled-cursor store; locked only while claiming a historical suffix.
+    pub acks: &'a Mutex<AckStore>,
     /// Drain used **before** any successor spawn.
     pub drain: &'a D,
     /// Clock for a new claim.
@@ -707,32 +707,28 @@ pub fn restart_after_ack<C: CoverageChild, D: EventDrain>(
     if !take_coverage_rearm(plan.spec, plan.arm, plan.pipe, plan.rearm) {
         return Ok(RearmFollowup::Unchanged);
     }
-    revoke_older_generation(plan.served, plan.table, plan.rearm.generation);
-    drain_or_spawn(plan)
-}
-
-fn drain_or_spawn<C: CoverageChild, D: EventDrain>(
-    plan: &mut AckRearmPlan<'_, C, D>,
-) -> Result<RearmFollowup, i32> {
+    {
+        let mut table = lock_table(plan.table);
+        revoke_older_generation(plan.served, &mut table, plan.rearm.generation);
+    }
     plan.children.kill_and_reap()?;
     let events = plan.drain.drain_after(plan.spec).map_err(|_| 2)?;
     if events.is_empty() {
         plan.children.spawn(plan.spec)?;
         return Ok(RearmFollowup::Waiting);
     }
+    let mut acks = lock_acks(plan.acks);
     let outcome = ingest_match(
         &IngestRequest {
             spec: plan.spec,
             wait: WaitResult::Matched,
-            drain: &OwnedDrain {
-                events: events.clone(),
-            },
+            drain: &OwnedDrain { events },
             arm: plan.arm,
             link: None,
             now: plan.now,
         },
         plan.pipe,
-        plan.acks,
+        &mut acks,
         None::<&mut LinkIo>,
         || ulid::Ulid::new().to_string(),
     );
@@ -1073,46 +1069,20 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
                 adopt_attached(next, &mut served, &table, &mut pipe, &acks, now);
             }
             Ok(DaemonEvent::CoverageRearm(rearm)) => {
-                if take_coverage_rearm(&mut spec, &mut arm, &mut pipe, &rearm) {
-                    {
-                        let mut locked = lock_table(&table);
-                        revoke_older_generation(&mut served, &mut locked, rearm.generation);
-                    }
-                    let drained = {
-                        if children.kill_and_reap().is_err() {
-                            return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
-                        }
-                        match ChanvoyDrain.drain_after(&spec) {
-                            Ok(events) => events,
-                            Err(_) => {
-                                return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
-                            }
-                        }
-                    };
-                    if drained.is_empty() {
-                        if spawn_chanvoy(&mut children, &spec).is_err() {
-                            return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
-                        }
-                    } else {
-                        let mut acks = lock_acks(&acks);
-                        let outcome = ingest_match(
-                            &IngestRequest {
-                                spec: &spec,
-                                wait: WaitResult::Matched,
-                                drain: &OwnedDrain { events: drained },
-                                arm: &arm,
-                                link: None,
-                                now,
-                            },
-                            &mut pipe,
-                            &mut acks,
-                            None::<&mut LinkIo>,
-                            || ulid::Ulid::new().to_string(),
-                        );
-                        if let DaemonCoverage::Halt { exit } = outcome.coverage {
-                            return halt(&table, &mut children, &stop, &socket, &mut accept, exit);
-                        }
-                    }
+                let result = restart_after_ack(&mut AckRearmPlan {
+                    rearm: &rearm,
+                    spec: &mut spec,
+                    arm: &mut arm,
+                    pipe: &mut pipe,
+                    served: &mut served,
+                    table: &table,
+                    children: &mut children,
+                    acks: &acks,
+                    drain: &ChanvoyDrain,
+                    now,
+                });
+                if let Err(code) = result {
+                    return halt(&table, &mut children, &stop, &socket, &mut accept, code);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1734,9 +1704,9 @@ mod tests {
         live: &mut KnownArm,
         pipe: &mut super::DaemonPipe,
         served: &mut Option<gearwit_host::ServeAttach>,
-        table: &mut LinkTable,
+        table: &Mutex<LinkTable>,
         children: &mut ScriptedChild,
-        acks: &mut AckStore,
+        acks: &Mutex<AckStore>,
         drain: &ScriptedDrain,
     ) -> Result<RearmFollowup, i32> {
         restart_after_ack(&mut AckRearmPlan {
@@ -1758,11 +1728,17 @@ mod tests {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
-        let mut table = LinkTable::default();
-        admit_attach(&mut table, fixture_attach(), now(), &[arm()]).expect("gen1");
+        let table = Mutex::new(LinkTable::default());
+        admit_attach(
+            &mut table.lock().expect("table"),
+            fixture_attach(),
+            now(),
+            &[arm()],
+        )
+        .expect("gen1");
         let mut children = ScriptedChild::default();
         let mut served = None;
-        let mut acks = AckStore::with_arm(arm());
+        let acks = Mutex::new(AckStore::with_arm(arm()));
         let drain = empty_drain();
         let followup = run_rearm(
             &ack_rearm(),
@@ -1770,9 +1746,9 @@ mod tests {
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &drain,
         )
         .expect("rearm");
@@ -1780,16 +1756,16 @@ mod tests {
         assert_eq!(spec.after.as_deref(), Some("post02"));
         assert_eq!(children.kills, 1);
         assert_eq!(children.spawns, vec![Some("post02".to_owned())]);
-        assert!(table.current().is_none());
+        assert!(table.lock().expect("table").current().is_none());
         let again = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &drain,
         )
         .expect("replay");
@@ -1803,12 +1779,12 @@ mod tests {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
-        let mut table = LinkTable::default();
+        let table = Mutex::new(LinkTable::default());
         let mut children = ScriptedChild::default();
         let mut served = None;
         let mut acks_arm = arm();
         acks_arm.generation = 2;
-        let mut acks = AckStore::with_arm(acks_arm);
+        let acks = Mutex::new(AckStore::with_arm(acks_arm));
         let drain = suffix_drain();
         let followup = run_rearm(
             &ack_rearm(),
@@ -1816,9 +1792,9 @@ mod tests {
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &drain,
         )
         .expect("suffix");
@@ -1837,25 +1813,28 @@ mod tests {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
-        let mut table = LinkTable::default();
-        admit_attach(&mut table, fixture_attach(), now(), &[arm()]).expect("gen1");
-        table.drop_current();
-        let mut gen2 = fixture_attach();
-        if let WaiterLink::AttachWaiter {
-            request_id,
-            generation,
-            ..
-        } = &mut gen2
+        let table = Mutex::new(LinkTable::default());
         {
-            *request_id = "01J00000000000000000000098".to_owned();
-            *generation = 2;
+            let mut locked = table.lock().expect("table");
+            admit_attach(&mut locked, fixture_attach(), now(), &[arm()]).expect("gen1");
+            locked.drop_current();
+            let mut gen2 = fixture_attach();
+            if let WaiterLink::AttachWaiter {
+                request_id,
+                generation,
+                ..
+            } = &mut gen2
+            {
+                *request_id = "01J00000000000000000000098".to_owned();
+                *generation = 2;
+            }
+            let mut successor_arm = arm();
+            successor_arm.generation = 2;
+            admit_attach(&mut locked, gen2, now(), &[successor_arm]).expect("gen2");
         }
-        let mut successor_arm = arm();
-        successor_arm.generation = 2;
-        admit_attach(&mut table, gen2, now(), &[successor_arm]).expect("gen2");
         let mut children = ScriptedChild::default();
         let mut served = None;
-        let mut acks = AckStore::with_arm(arm());
+        let acks = Mutex::new(AckStore::with_arm(arm()));
         let drain = empty_drain();
         run_rearm(
             &ack_rearm(),
@@ -1863,13 +1842,21 @@ mod tests {
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &drain,
         )
         .expect("rearm");
-        assert_eq!(table.current().expect("kept").generation, 2);
+        assert_eq!(
+            table
+                .lock()
+                .expect("table")
+                .current()
+                .expect("kept")
+                .generation,
+            2
+        );
         assert_eq!(children.spawns, vec![Some("post02".to_owned())]);
     }
 
@@ -1878,13 +1865,13 @@ mod tests {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
-        let mut table = LinkTable::default();
+        let table = Mutex::new(LinkTable::default());
         let mut children = ScriptedChild {
             fail_kill: true,
             ..ScriptedChild::default()
         };
         let mut served = None;
-        let mut acks = AckStore::with_arm(arm());
+        let acks = Mutex::new(AckStore::with_arm(arm()));
         let drain = empty_drain();
         let error = run_rearm(
             &ack_rearm(),
@@ -1892,9 +1879,9 @@ mod tests {
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &drain,
         )
         .expect_err("kill");
@@ -1907,13 +1894,13 @@ mod tests {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
-        let mut table = LinkTable::default();
+        let table = Mutex::new(LinkTable::default());
         let mut children = ScriptedChild {
             fail_spawn: true,
             ..ScriptedChild::default()
         };
         let mut served = None;
-        let mut acks = AckStore::with_arm(arm());
+        let acks = Mutex::new(AckStore::with_arm(arm()));
         let drain = empty_drain();
         let error = run_rearm(
             &ack_rearm(),
@@ -1921,9 +1908,9 @@ mod tests {
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &drain,
         )
         .expect_err("spawn");
@@ -1933,32 +1920,62 @@ mod tests {
     }
 
     #[test]
+    fn drain_failure_after_reap_leaves_zero_spawns_and_claims() {
+        let mut spec = spec();
+        let mut live = arm();
+        let mut pipe = claimed_pipe();
+        let table = Mutex::new(LinkTable::default());
+        let mut children = ScriptedChild::default();
+        let mut served = None;
+        let acks = Mutex::new(AckStore::with_arm(arm()));
+        let drain = ScriptedDrain {
+            events: Err(DrainError::Io),
+        };
+        let error = run_rearm(
+            &ack_rearm(),
+            &mut spec,
+            &mut live,
+            &mut pipe,
+            &mut served,
+            &table,
+            &mut children,
+            &acks,
+            &drain,
+        )
+        .expect_err("drain");
+        assert_eq!(error, 2);
+        assert_eq!(children.kills, 1);
+        assert!(children.spawns.is_empty());
+        assert!(pipe.claim.is_none());
+    }
+
+    #[test]
     fn next_suffix_ack_repeats_drain_before_spawn() {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
-        let mut table = LinkTable::default();
+        let table = Mutex::new(LinkTable::default());
         let mut children = ScriptedChild::default();
         let mut served = None;
         let mut acks_arm = arm();
         acks_arm.generation = 2;
-        let mut acks = AckStore::with_arm(acks_arm);
+        let acks = Mutex::new(AckStore::with_arm(acks_arm));
         let first = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &suffix_drain(),
         )
         .expect("first");
         assert_eq!(first, RearmFollowup::Paused);
         assert!(children.spawns.is_empty());
         live.generation = 2;
-        acks = AckStore::with_arm(live.clone());
+        *acks.lock().expect("acks") = AckStore::with_arm(live.clone());
         let second_rearm = AckRearm {
             after: "post03".to_owned(),
             generation: 3,
@@ -1970,9 +1987,9 @@ mod tests {
             &mut live,
             &mut pipe,
             &mut served,
-            &mut table,
+            &table,
             &mut children,
-            &mut acks,
+            &acks,
             &empty_drain(),
         )
         .expect("second");
