@@ -14,7 +14,8 @@
 //! merged schemas.
 
 use crate::controller::{
-    Controller, DispatchDisposition, LifecycleObservation, ReconciliationDisposition, SignalAction,
+    Controller, ControllerAttachment, ControllerCommand, DispatchDisposition, LifecycleObservation,
+    ReconciliationDisposition, SignalAction,
 };
 use crate::persist::{ClaimError, ClaimOutcome, DurableClaim, Persist, Transition};
 use crate::{KnownArm, RecoverySnapshot};
@@ -85,28 +86,17 @@ impl MintedAttachment {
 
 /// Result of preparing a dispatch under authority.
 ///
-/// Opaque, non-Clone, single-use token. The authority lock is released
-/// after this is returned; the caller performs native I/O and then
-/// passes this by value back into `conclude_dispatch`. Duplicate
-/// conclusion is a durable authority invariant, not only move semantics.
+/// Opaque, non-Clone, single-use token. All fields are private — callers
+/// cannot inspect or mutate any dimension. The authority emits a separate
+/// `ControllerCommand` for phase 2; this token is only consumed in phase 4
+/// by `conclude_dispatch`.
 #[derive(Debug)]
 pub struct PreparedDispatch {
     attempt_id: String,
     signal_id: String,
-    /// Action for native I/O — the only public field.
-    pub action: SignalAction,
-    /// Opaque consumed marker — authority sets this on first conclusion.
-    consumed: bool,
 }
 
-impl PreparedDispatch {
-    /// The signal action for native I/O the caller must execute.
-    /// Only method accessible to callers outside the authority.
-    #[must_use]
-    pub fn action(&self) -> &SignalAction {
-        &self.action
-    }
-}
+impl PreparedDispatch {}
 
 /// Result of concluding a dispatch after native I/O and observations.
 ///
@@ -386,8 +376,11 @@ impl<P: Persist> DaemonAuthority<P> {
     // -- Dispatch preparation --------------------------------------------
 
     /// Prepare a dispatch: validate the minted attachment, durably
-    /// record `DispatchPrepared`, and return a `PreparedDispatch` for
-    /// native I/O. The authority lock is released after this call.
+    /// record `DispatchPrepared`, and return both an opaque
+    /// `PreparedDispatch` (for phase 4 conclusion) and a
+    /// `ControllerCommand` (authority-produced bounded work for
+    /// phase 2 native I/O). The authority lock is released after
+    /// this call.
     ///
     /// # Errors
     ///
@@ -398,11 +391,11 @@ impl<P: Persist> DaemonAuthority<P> {
         &mut self,
         claim: &ClaimedSignal,
         attachment: &MintedAttachment,
-    ) -> Result<PreparedDispatch, DispatchError> {
+    ) -> Result<(PreparedDispatch, ControllerCommand), DispatchError> {
         // 1. Validate attachment against authority state
         self.validate_attachment(attachment, claim)?;
 
-        // 2. Record DispatchPrepared
+        // 2. Record DispatchPrepared durably
         self.persist
             .record_transition(
                 &claim.signal_id,
@@ -411,19 +404,37 @@ impl<P: Persist> DaemonAuthority<P> {
             )
             .map_err(|e| DispatchError::PreSend(format!("DispatchPrepared failed: {e:?}")))?;
 
-        // 3. Return prepared dispatch for native I/O
-        let action = SignalAction {
-            signal_id: claim.signal_id.clone(),
-            provider: "mattermost".to_owned(),
-            event_count: claim.events.len(),
+        // 3. Record the prepared attempt as durably pending
+        self.persist
+            .record_prepared(&attachment.attempt_id)
+            .map_err(|e| DispatchError::PreSend(format!("record_prepared failed: {e:?}")))?;
+
+        // 4. Build authority-produced controller command for phase 2
+        let cmd = ControllerCommand {
+            attachment: ControllerAttachment {
+                attempt_id: attachment.attempt_id.clone(),
+                arm_id: attachment.arm_id.clone(),
+                generation: attachment.generation,
+                seat_id: attachment.seat_id.clone(),
+                route: attachment.route.clone(),
+                lease_until: attachment.lease_until,
+            },
+            action: SignalAction {
+                signal_id: claim.signal_id.clone(),
+                provider: "mattermost".to_owned(),
+                event_count: claim.events.len(),
+            },
+            attempt_id: attachment.attempt_id.clone(),
         };
 
-        Ok(PreparedDispatch {
-            attempt_id: attachment.attempt_id.clone(),
-            signal_id: claim.signal_id.clone(),
-            action,
-            consumed: false,
-        })
+        // 5. Return opaque token for phase 4 + bounded controller command for phase 2
+        Ok((
+            PreparedDispatch {
+                attempt_id: attachment.attempt_id.clone(),
+                signal_id: claim.signal_id.clone(),
+            },
+            cmd,
+        ))
     }
 
     /// Record lifecycle observations as durable transitions.
@@ -480,21 +491,24 @@ impl<P: Persist> DaemonAuthority<P> {
     /// Returns `DispatchError::PostSend` when the disposition or
     /// observations cannot be persisted after native I/O.
     /// Returns `DispatchError::PreSend` when the prepared token has
-    /// already been consumed — duplicate conclusion is a durable
-    /// authority invariant.
+    /// already been concluded — duplicate conclusion is a durable
+    /// authority invariant checked against persisted state.
     pub fn conclude_dispatch(
         &mut self,
-        mut prepared: PreparedDispatch,
+        prepared: &PreparedDispatch,
         disposition: DispatchDisposition,
         observations: Vec<LifecycleObservation>,
     ) -> Result<DispatchConclusion, DispatchError> {
-        // 0. Reject already-consumed token (durable invariant)
-        if prepared.consumed {
+        // 0. Reject already-concluded attempts (durable invariant)
+        if self
+            .persist
+            .has_concluded(&prepared.attempt_id)
+            .map_err(|e| DispatchError::PostSend(format!("conclusion check failed: {e:?}")))?
+        {
             return Err(DispatchError::PreSend(
-                "prepared token already consumed".to_owned(),
+                "attempt has already been concluded — duplicate conclusion is a durable authority invariant".to_owned(),
             ));
         }
-        prepared.consumed = true;
 
         // 1. Atomically record disposition + first required transition
         let first_transition = match &disposition {
@@ -510,6 +524,11 @@ impl<P: Persist> DaemonAuthority<P> {
                 first_transition,
             )
             .map_err(|e| DispatchError::PostSend(format!("conclusion write failed: {e:?}")))?;
+
+        // 2. Mark this attempt as durably concluded
+        self.persist
+            .record_concluded(&prepared.attempt_id)
+            .map_err(|e| DispatchError::PostSend(format!("record_concluded failed: {e:?}")))?;
 
         // 2. Record lifecycle transitions based on disposition
         match &disposition {
@@ -1119,10 +1138,9 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (_prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
-        assert_eq!(prepared.attempt_id, admission.attempt_id);
         let forged = MintedAttachment {
             generation: 99,
             arm_id: att.arm_id.clone(),
@@ -1248,13 +1266,13 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let attempt_id = admission.attempt_id.clone();
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
-        let attempt_id = prepared.attempt_id.clone();
         let conclusion = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1280,12 +1298,12 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let attempt_id = prepared.attempt_id.clone();
         let conclusion = auth
-            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
             .expect("conclude");
         assert!(conclusion.reconciliation_required());
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Ambiguous);
@@ -1298,13 +1316,13 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let attempt_id = admission.attempt_id.clone();
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
-        let attempt_id = prepared.attempt_id.clone();
         let conclusion = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1322,11 +1340,11 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let conclusion = auth
-            .conclude_dispatch(prepared, DispatchDisposition::Rejected, vec![])
+            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert!(!conclusion.reconciliation_required());
         assert!(conclusion.observations.is_empty());
@@ -1338,12 +1356,12 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let conclusion = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1361,11 +1379,11 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
-            .conclude_dispatch(prepared, DispatchDisposition::Rejected, vec![])
+            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert_eq!(dc.durable_outcome(), DurableOutcome::Rejected);
 
@@ -1373,12 +1391,12 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1391,12 +1409,12 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1409,12 +1427,12 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1430,12 +1448,12 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "turn-X".to_owned(),
                 },
@@ -1449,11 +1467,11 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let dc = auth
-            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
             .expect("conclude");
         assert!(dc.reconciliation_required());
         assert_eq!(dc.durable_outcome(), DurableOutcome::Ambiguous);
@@ -1464,7 +1482,7 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let _prepared = auth
+        let (_prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let recovery = auth.recover().expect("recover");
@@ -1483,12 +1501,12 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1514,12 +1532,12 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1548,11 +1566,11 @@ mod tests {
         let mut auth = sample_authority();
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let conclusion = auth
-            .conclude_dispatch(prepared, DispatchDisposition::Rejected, vec![])
+            .conclude_dispatch(&prepared, DispatchDisposition::Rejected, vec![])
             .expect("conclude");
         assert_eq!(conclusion.durable_outcome(), DurableOutcome::Rejected);
 
@@ -1589,11 +1607,11 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let err = auth
-            .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+            .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
             .expect_err("ReconciliationRequired failure");
         assert!(
             matches!(err, DispatchError::PostSend(_)),
@@ -1623,12 +1641,12 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1668,12 +1686,12 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1707,12 +1725,12 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let err = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1745,12 +1763,12 @@ mod tests {
         });
         let admission = auth.admit_claim(&std_req()).expect("admit");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth
+        let (prepared, _cmd) = auth
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         let _err = auth
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },
@@ -1811,12 +1829,12 @@ mod tests {
             });
             let admission = auth.admit_claim(&std_req()).expect("admit");
             let att = admission.attachment.expect("attachment");
-            let prepared = auth
+            let (prepared, _cmd) = auth
                 .prepare_dispatch(&admission.claim, &att)
                 .expect("prepare");
             let _err = auth
                 .conclude_dispatch(
-                    prepared,
+                    &prepared,
                     DispatchDisposition::Accepted {
                         correlation: "corr-1".to_owned(),
                     },
@@ -1841,27 +1859,29 @@ mod tests {
         }
 
         // -- Boundary 2: Ambiguous + ReconciliationRequired transition fails --
+        // With two-phase atomic conclusion, neither disposition nor
+        // transition appears when conclusion fails.
         {
             let mut auth = sample_authority_with_persist(FakePersist {
                 next_transition_error: Some("ReconciliationRequired failed".to_owned()),
-                transition_allow_count: 1,
+                transition_allow_count: 1, // DispatchPrepared uses slot 1
                 ..Default::default()
             });
             let admission = auth.admit_claim(&std_req()).expect("admit");
             let att = admission.attachment.expect("attachment");
-            let prepared = auth
+            let (prepared, _cmd) = auth
                 .prepare_dispatch(&admission.claim, &att)
                 .expect("prepare");
             let _err = auth
-                .conclude_dispatch(prepared, DispatchDisposition::Ambiguous, vec![])
+                .conclude_dispatch(&prepared, DispatchDisposition::Ambiguous, vec![])
                 .expect_err("ReconciliationRequired failure");
 
-            // Disposition exists, ReconciliationRequired missing
+            // Atomic: neither disposition nor ReconciliationRequired appears
             assert!(
                 auth.persist()
                     .get_disposition(&admission.attempt_id)
-                    .is_some(),
-                "disposition must be recorded (partial write)"
+                    .is_none(),
+                "disposition must NOT be recorded (atomic failure)"
             );
             let ts = auth
                 .persist()
@@ -1869,21 +1889,23 @@ mod tests {
             assert!(!ts.contains(&Transition::ReconciliationRequired));
         }
 
-        // -- Boundary 3: NativeAccepted fails (Accepted partial write) --
+        // -- Boundary 3: NativeAccepted fails (Accepted atomic failure) --
+        // With two-phase atomic conclusion, neither disposition nor
+        // NativeAccepted appears when conclusion fails.
         {
             let mut auth = sample_authority_with_persist(FakePersist {
                 next_transition_error: Some("NativeAccepted failed".to_owned()),
-                transition_allow_count: 1,
+                transition_allow_count: 1, // DispatchPrepared uses slot 1
                 ..Default::default()
             });
             let admission = auth.admit_claim(&std_req()).expect("admit");
             let att = admission.attachment.expect("attachment");
-            let prepared = auth
+            let (prepared, _cmd) = auth
                 .prepare_dispatch(&admission.claim, &att)
                 .expect("prepare");
             let _err = auth
                 .conclude_dispatch(
-                    prepared,
+                    &prepared,
                     DispatchDisposition::Accepted {
                         correlation: "corr-1".to_owned(),
                     },
@@ -1894,8 +1916,8 @@ mod tests {
             assert!(
                 auth.persist()
                     .get_disposition(&admission.attempt_id)
-                    .is_some(),
-                "disposition must be recorded (partial write)"
+                    .is_none(),
+                "disposition must NOT be recorded (atomic failure)"
             );
             let ts = auth
                 .persist()
@@ -1921,12 +1943,12 @@ mod tests {
 
         let admission = auth1.admit_claim(&std_req()).expect("admit claim");
         let att = admission.attachment.expect("attachment");
-        let prepared = auth1
+        let (prepared, _cmd) = auth1
             .prepare_dispatch(&admission.claim, &att)
             .expect("prepare");
         auth1
             .conclude_dispatch(
-                prepared,
+                &prepared,
                 DispatchDisposition::Accepted {
                     correlation: "corr-1".to_owned(),
                 },

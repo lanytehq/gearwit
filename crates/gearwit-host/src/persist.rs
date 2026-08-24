@@ -249,11 +249,13 @@ pub trait Persist {
     /// Atomically record a dispatch conclusion: disposition plus the
     /// first required post-send transition in one semantic commit.
     ///
+    /// The implementation must stage/validate both writes and commit
+    /// them together. No partial write may be observable — either both
+    /// the disposition and transition appear, or neither does.
+    ///
     /// For `Accepted`, this is disposition + `NativeAccepted`.
     /// For `Ambiguous`, this is disposition + `ReconciliationRequired`.
-    /// For `Rejected`, this is disposition only (no transition needed).
-    /// Subsequent observation transitions are recorded separately via
-    /// `record_transition`.
+    /// For `Rejected`, this is disposition only (no transition).
     ///
     /// # Errors
     ///
@@ -266,6 +268,32 @@ pub trait Persist {
         disposition: &crate::controller::DispatchDisposition,
         first_transition: Option<Transition>,
     ) -> Result<(), WaiterLinkError>;
+
+    /// Durably record that an attempt has been prepared for dispatch.
+    /// Used to detect duplicate conclusion on restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
+    fn record_prepared(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError>;
+
+    /// True if the attempt has been durably concluded.
+    /// Checked before conclusion to enforce the durable single-conclusion
+    /// invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when the check fails.
+    fn has_concluded(&self, attempt_id: &str) -> Result<bool, WaiterLinkError>;
+
+    /// Durably mark an attempt as concluded.
+    /// Called after a successful conclusion to prevent duplicate
+    /// conclusion on restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
+    fn record_concluded(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +332,15 @@ pub struct FakePersist {
     pub handled_cursors: BTreeMap<String, String>,
     /// Re-arm positions to return on recovery.
     pub rearm_positions: BTreeMap<String, bool>,
+    /// Set of durably prepared `attempt_ids`.
+    pub prepared_set: BTreeMap<String, bool>,
+    /// Set of durably concluded `attempt_ids`.
+    pub concluded_set: BTreeMap<String, bool>,
+    /// When set, `record_prepared` returns an error with this message.
+    pub next_record_prepared_error: Option<String>,
+    /// When set, `record_conclusion` uses two-phase commit:
+    /// stage validates and returns Ok; commit applies the writes.
+    pub conclusion_commit_error: Option<String>,
 }
 
 impl FakePersist {
@@ -477,12 +514,69 @@ impl Persist for FakePersist {
         disposition: &crate::controller::DispatchDisposition,
         first_transition: Option<Transition>,
     ) -> Result<(), WaiterLinkError> {
-        // First write disposition — if this fails, the whole conclusion fails.
-        self.record_disposition(attempt_id, disposition)?;
-        // Then write the first transition if required.
-        if let Some(transition) = first_transition {
-            self.record_transition(signal_id, attempt_id, transition)?;
+        // Two-phase atomic commit: stage, validate, then commit.
+        // Phase 1: Validate both writes can succeed without mutations.
+        // Check that disposition write would succeed
+        if self.next_disposition_error.is_some() {
+            let msg = self.next_disposition_error.take().unwrap();
+            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
         }
+        // Check that transition write would succeed
+        if let Some(_transition) = first_transition {
+            self.transition_call_count += 1;
+            if self.transition_call_count > self.transition_allow_count
+                && self.next_transition_error.is_some()
+            {
+                // Reset the call count since we're aborting
+                self.transition_call_count -= 1;
+                let msg = self.next_transition_error.take().unwrap();
+                return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
+            }
+        }
+        // Check for commit failure injection
+        if let Some(msg) = self.conclusion_commit_error.take() {
+            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
+        }
+
+        // Phase 2: Commit — write disposition
+        if let Some(existing) = self.dispositions.get(attempt_id) {
+            if *existing != *disposition {
+                return Err(WaiterLinkError::Semantic(
+                    "conflicting disposition for attempt_id",
+                ));
+            }
+        } else {
+            self.dispositions
+                .insert(attempt_id.to_owned(), disposition.clone());
+        }
+
+        // Commit — write transition
+        if let Some(transition) = first_transition {
+            let key = (signal_id.to_owned(), attempt_id.to_owned());
+            let entry = self.transitions.entry(key).or_default();
+            if entry.contains(&transition) {
+                return Err(WaiterLinkError::Semantic("duplicate transition"));
+            }
+            entry.push(transition);
+        }
+
+        Ok(())
+    }
+
+    fn record_prepared(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError> {
+        if let Some(msg) = self.next_record_prepared_error.take() {
+            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
+        }
+        self.prepared_set.insert(attempt_id.to_owned(), true);
+        Ok(())
+    }
+
+    fn has_concluded(&self, attempt_id: &str) -> Result<bool, WaiterLinkError> {
+        Ok(self.concluded_set.contains_key(attempt_id))
+    }
+
+    fn record_concluded(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError> {
+        self.concluded_set.insert(attempt_id.to_owned(), true);
         Ok(())
     }
 

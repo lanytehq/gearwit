@@ -3,15 +3,15 @@
 //! Lives one level outside `DaemonAuthority`. Exercises the three-phase
 //! sequence required by cxotech ruling `ioe77faay3ndbc6mf5wcur1k6a`:
 //!
-//! 1. Enter authority → `prepare_dispatch` → exit (opaque token returned).
-//! 2. Caller performs `Controller::dispatch` with no authority guard.
+//! 1. Enter authority → `prepare_dispatch` → exit with opaque token +
+//!    authority-produced `ControllerCommand`.
+//! 2. Caller performs native I/O via `Controller` outside authority.
 //! 3. Re-enter authority → `conclude_dispatch` consuming the opaque token.
 //!
-//! The coordinator does not hold an authority reference across phases.
+//! The coordinator does NOT hold a controller reference. It emits bounded
+//! controller work; the caller drives provider I/O independently.
 
-use crate::controller::{
-    Controller, ControllerAttachment, DispatchDisposition, LifecycleObservation, SignalAction,
-};
+use crate::controller::{ControllerCommand, DispatchDisposition, LifecycleObservation};
 use crate::{
     AdmissionError, AdmissionResult, ClaimRequest, DaemonAuthority, DispatchConclusion,
     DispatchError, Persist, PreparedDispatch,
@@ -19,23 +19,21 @@ use crate::{
 
 /// Split-phase host coordinator for the Gearwit dispatch lifecycle.
 ///
-/// Owns the authority and a mutable controller reference. Callers drive
-/// phases explicitly — no authority borrow or lock survives across
-/// provider I/O.
-pub struct HostCoordinator<'c, P: Persist, C: Controller> {
+/// Owns the authority only. Emits `ControllerCommand` on prepare; accepts
+/// disposition + observations on conclude. No authority borrow or lock
+/// survives across provider I/O.
+pub struct HostCoordinator<P: Persist> {
     authority: DaemonAuthority<P>,
-    controller: &'c mut C,
     /// Opaque prepared token from phase 2, consumed in phase 4.
     pending: Option<PreparedDispatch>,
 }
 
-impl<'c, P: Persist, C: Controller> HostCoordinator<'c, P, C> {
-    /// Create a new coordinator with the given authority and controller.
+impl<P: Persist> HostCoordinator<P> {
+    /// Create a new coordinator with the given authority.
     #[must_use]
-    pub fn new(authority: DaemonAuthority<P>, controller: &'c mut C) -> Self {
+    pub fn new(authority: DaemonAuthority<P>) -> Self {
         Self {
             authority,
-            controller,
             pending: None,
         }
     }
@@ -57,66 +55,34 @@ impl<'c, P: Persist, C: Controller> HostCoordinator<'c, P, C> {
         self.authority.admit_claim(req)
     }
 
-    // -- Phase 2: prepare dispatch (entered authority, exits with token) --
+    // -- Phase 2: prepare dispatch (entered authority, exits with command) --
 
     /// Prepare a dispatch: validate attachment, record `DispatchPrepared`,
-    /// and store the opaque prepared token. The authority borrow ends here.
+    /// and return an authority-produced `ControllerCommand` for native I/O.
+    /// The opaque `PreparedDispatch` token is stored for phase 4.
+    /// The authority borrow ends here.
     ///
     /// # Errors
     ///
     /// Returns `DispatchError::PreSend` when validation or persistence fails.
-    pub fn prepare(&mut self, admission: &AdmissionResult) -> Result<(), DispatchError> {
+    pub fn prepare(
+        &mut self,
+        admission: &AdmissionResult,
+    ) -> Result<ControllerCommand, DispatchError> {
         let claim = admission.claim.clone();
         let att = admission
             .attachment
             .as_ref()
             .ok_or_else(|| DispatchError::PreSend("no attachment".to_owned()))?;
-        let prepared = self.authority.prepare_dispatch(&claim, att)?;
+        let (prepared, cmd) = self.authority.prepare_dispatch(&claim, att)?;
         self.pending = Some(prepared);
-        Ok(())
+        Ok(cmd)
     }
 
-    /// The signal action for native I/O (valid only after `prepare`).
-    ///
-    /// # Panics
-    ///
-    /// Panics if called before `prepare`.
-    #[must_use]
-    pub fn pending_action(&self) -> &SignalAction {
-        self.pending
-            .as_ref()
-            .expect("pending_action called before prepare")
-            .action()
-    }
+    // -- Phase 3: native I/O (no authority guard; caller drives) --
 
-    // -- Phase 3: native I/O (no authority guard) --
-
-    /// Dispatch through the controller — no authority guard held.
-    /// Returns the disposition.
-    pub fn dispatch(&mut self, attachment: &ControllerAttachment) -> DispatchDisposition {
-        let action = self.pending_action().clone();
-        self.controller.dispatch(attachment, &action)
-    }
-
-    /// Poll for lifecycle observations after dispatch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called before `prepare`.
-    pub fn poll_observations(&mut self) -> Vec<LifecycleObservation> {
-        let attempt_id = self
-            .pending
-            .as_ref()
-            .expect("poll_observations called before prepare")
-            .action()
-            .signal_id
-            .clone();
-        let mut obs = Vec::new();
-        while let Some(o) = self.controller.poll_observation(&attempt_id) {
-            obs.push(o);
-        }
-        obs
-    }
+    // No methods — the caller invokes `Controller::dispatch(command.attachment, command.action)`
+    // and `Controller::poll_observation(attempt_id)` outside authority.
 
     // -- Phase 4: conclude (re-entered authority, consumes token) --
 
@@ -137,7 +103,7 @@ impl<'c, P: Persist, C: Controller> HostCoordinator<'c, P, C> {
     ) -> Result<DispatchConclusion, DispatchError> {
         let prepared = self.pending.take().expect("conclude called before prepare");
         self.authority
-            .conclude_dispatch(prepared, disposition, observations)
+            .conclude_dispatch(&prepared, disposition, observations)
     }
 
     /// True if a prepared token is pending (between phases 2 and 4).

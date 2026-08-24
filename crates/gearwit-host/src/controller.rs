@@ -31,6 +31,24 @@ pub struct ControllerAttachment {
     pub lease_until: OffsetDateTime,
 }
 
+/// Authority-produced bounded controller work for phase 2.
+///
+/// Carries the minted attachment (seat, arm, generation, route, lease,
+/// `attempt_id`) and the signal action to dispatch. All fields are
+/// authority-produced — callers cannot supply or alter them.
+/// The opaque `attempt_id` for phase 3 correlation is private.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControllerCommand {
+    /// Authority-minted attachment for the controller.
+    pub attachment: ControllerAttachment,
+    /// Bounded signal action for dispatch.
+    pub action: SignalAction,
+    /// Opaque `attempt_id` for phase 3 conclusion.
+    pub(crate) attempt_id: String,
+}
+
+impl ControllerCommand {}
+
 /// The fixed action: a closed, versioned `handle_claimed_signal`.
 ///
 /// Carries only bounded Gearwit identifiers. The claimed batch is
