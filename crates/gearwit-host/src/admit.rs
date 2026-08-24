@@ -1,10 +1,13 @@
-//! One attached return link per arm generation.
+//! One attached return link per `(arm_id, generation)`.
 
 use gearwit_protocol::{SCHEMA, WaiterLink, WaiterLinkError, validate};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 /// Arm the daemon currently covers.
+///
+/// Founder v0 expects a single current arm at the daemon boundary. The
+/// admission table still keys the live link by `(arm_id, generation)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownArm {
     /// Arm id.
@@ -22,6 +25,8 @@ pub struct KnownArm {
 /// Currently admitted waiter link.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedLink {
+    /// Matching attach request id.
+    pub request_id: String,
     /// Link id.
     pub link_id: String,
     /// Arm id.
@@ -38,7 +43,7 @@ pub struct AdmittedLink {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LinkTable {
     current: Option<AdmittedLink>,
-    seq: u64,
+    last_accepted: Option<WaiterLink>,
 }
 
 impl LinkTable {
@@ -51,10 +56,15 @@ impl LinkTable {
     /// Drop the link (disconnect). Does not advance handled cursor.
     pub fn drop_current(&mut self) {
         self.current = None;
+        self.last_accepted = None;
     }
 }
 
 /// Admit or reject an `attach_waiter` message.
+///
+/// A repeated `request_id` for the active `(arm_id, generation)` returns the
+/// cached [`WaiterLink::AttachAccepted`]. A different request while a link is
+/// live is `already_attached`.
 ///
 /// # Errors
 ///
@@ -91,15 +101,23 @@ pub fn admit_attach(
     if now >= arm.coverage_until {
         return reject(&request_id, "coverage_ended", now);
     }
-    if table.current.is_some() {
+    if let Some(current) = &table.current {
+        if current.request_id == request_id
+            && current.arm_id == arm_id
+            && current.generation == generation
+        {
+            return table
+                .last_accepted
+                .clone()
+                .ok_or(WaiterLinkError::Semantic("missing cached admission"));
+        }
         return reject(&request_id, "already_attached", now);
     }
-    table.seq = table.seq.saturating_add(1);
-    let link_id = next_ulid(table.seq);
+    let link_id = ulid::Ulid::new().to_string();
     let lease_until = (now + Duration::minutes(10)).min(arm.coverage_until);
     let accepted = WaiterLink::AttachAccepted {
         schema: SCHEMA.to_owned(),
-        request_id,
+        request_id: request_id.clone(),
         link_id: link_id.clone(),
         arm_id: arm_id.clone(),
         generation,
@@ -109,12 +127,14 @@ pub fn admit_attach(
     };
     validate(&accepted)?;
     table.current = Some(AdmittedLink {
+        request_id,
         link_id,
         arm_id,
         generation,
         waiter_id,
         lease_until,
     });
+    table.last_accepted = Some(accepted.clone());
     Ok(accepted)
 }
 
@@ -137,8 +157,4 @@ fn format_time(instant: OffsetDateTime) -> String {
     instant
         .format(&Rfc3339)
         .unwrap_or_else(|_| instant.to_string())
-}
-
-fn next_ulid(seq: u64) -> String {
-    format!("01K{seq:023}")
 }

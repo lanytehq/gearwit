@@ -15,11 +15,12 @@ Initial boundaries:
 
 - `gearwit-domain`: platform-free facts, evidence, and state transitions.
 - `gearwit-protocol`: schema-backed daemon/client types. First slice: waiter-link
-  frames + length-prefixed codec pinned to Crucible `d121642`.
+  typed JSON payloads pinned to Crucible `d121642`. ipcprims owns length-prefixed
+  framing on the local socket.
 - `gearwit-platform`: host paths, process census, and OS capability traits.
 - `gearwit-host`: daemon plus internal registry, router, policy, adapter, and
-  persistence modules. First slice: owner-only waiter-link socket and one-link
-  admission.
+  persistence modules. First slice: canonical `~/.lanyte/gearwit` home,
+  ipcprims waiter-link socket, and one-link admission.
 - `gearwit-cli`: thin client and explicit in-process degraded wait path.
   First slice: `gearwit self who`, in-process `gearwit self wait-on`, and
   `gearwit self check`.

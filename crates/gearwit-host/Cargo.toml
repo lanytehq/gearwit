@@ -6,11 +6,14 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
-description = "Local gearwitd link admission and private socket"
+description = "Local gearwitd link admission and private ipcprims socket"
 
 [lints]
 workspace = true
 
 [dependencies]
 gearwit-protocol.workspace = true
+ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.4", default-features = false }
+rsfulmen = { version = "0.1.6", default-features = false, features = ["logging"] }
 time = { version = "0.3", default-features = false, features = ["parsing", "formatting"] }
+ulid = "1"

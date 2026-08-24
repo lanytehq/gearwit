@@ -1,17 +1,17 @@
-//! Pinned waiter-link contract: typed frames, no runtime JSON Schema crate.
+//! Pinned waiter-link contract: typed JSON payloads, no runtime JSON Schema crate.
 
 #![forbid(unsafe_code)]
 
 mod codec;
 mod messages;
 
-pub use codec::{FrameError, MAX_FRAME, decode_frame, decode_prefix, encode_frame};
+pub use codec::{MAX_PAYLOAD, PayloadError, decode_payload, encode_payload};
 pub use messages::{PIN_COMMIT, SCHEMA, WaiterLink, WaiterLinkError, parse_waiter_link, validate};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameError, PIN_COMMIT, WaiterLink, decode_frame, decode_prefix, encode_frame,
+        MAX_PAYLOAD, PIN_COMMIT, PayloadError, WaiterLink, decode_payload, encode_payload,
         parse_waiter_link,
     };
     use std::fs;
@@ -60,25 +60,22 @@ mod tests {
     }
 
     #[test]
-    fn length_prefix_round_trip_and_max() {
+    fn payload_round_trip_and_max() {
         let text = fs::read_to_string(fixture_root().join("conforming/attach-waiter.json"))
             .expect("fixture");
         let message = parse_waiter_link(&text).expect("parse");
-        let framed = encode_frame(&message).expect("encode");
-        let decoded = decode_frame(&framed).expect("decode");
+        let payload = encode_payload(&message).expect("encode");
+        let decoded = decode_payload(&payload).expect("decode");
         assert_eq!(decoded, message);
         assert!(matches!(
             message,
             WaiterLink::AttachWaiter { generation: 1, .. }
         ));
-        assert!(encode_frame_oversize_rejected());
-    }
-
-    fn encode_frame_oversize_rejected() -> bool {
-        matches!(
-            decode_frame(&[0xff, 0xff, 0xff, 0xff]),
-            Err(FrameError::TooLarge { .. })
-        )
+        let oversized = vec![b'x'; MAX_PAYLOAD + 1];
+        assert!(matches!(
+            decode_payload(&oversized),
+            Err(PayloadError::TooLarge { size }) if size == MAX_PAYLOAD + 1
+        ));
     }
 
     #[test]
@@ -89,32 +86,15 @@ mod tests {
         if let WaiterLink::AttachWaiter { generation, .. } = &mut message {
             *generation = 0;
         }
-        assert!(encode_frame(&message).is_err());
+        assert!(encode_payload(&message).is_err());
     }
 
     #[test]
-    fn decode_rejects_empty_truncated_utf8_and_trailing() {
-        assert!(matches!(decode_frame(&[]), Err(FrameError::Truncated)));
+    fn decode_rejects_empty_and_invalid_utf8() {
+        assert!(matches!(decode_payload(&[]), Err(PayloadError::Empty)));
         assert!(matches!(
-            decode_frame(&[0, 0, 0, 0]),
-            Err(FrameError::Empty)
-        ));
-        assert!(matches!(
-            decode_frame(&[0, 0, 0, 5, 1, 2]),
-            Err(FrameError::Truncated)
-        ));
-        let text = fs::read_to_string(fixture_root().join("conforming/attach-rejected.json"))
-            .expect("fixture");
-        let message = parse_waiter_link(&text).expect("parse");
-        let mut framed = encode_frame(&message).expect("encode");
-        framed.push(0);
-        assert!(matches!(decode_frame(&framed), Err(FrameError::Trailing)));
-        let (_decoded, consumed) = decode_prefix(&framed).expect("prefix");
-        assert_eq!(consumed, framed.len() - 1);
-        let invalid_utf8 = [0, 0, 0, 1, 0xff];
-        assert!(matches!(
-            decode_frame(&invalid_utf8),
-            Err(FrameError::InvalidUtf8)
+            decode_payload(&[0xff]),
+            Err(PayloadError::InvalidUtf8)
         ));
     }
 

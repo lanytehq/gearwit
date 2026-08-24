@@ -6,7 +6,7 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
-description = "Pinned waiter-link wire types and length-prefixed codec"
+description = "Pinned waiter-link wire types and validated JSON payloads"
 
 [lints]
 workspace = true
