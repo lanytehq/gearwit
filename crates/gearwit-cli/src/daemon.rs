@@ -660,27 +660,86 @@ impl CoverageChild for ChildSlot {
     }
 }
 
-/// Record-then-rearm coverage: one reap and one spawn, or neither on replay.
+/// What coverage does after an accepted ACK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RearmFollowup {
+    /// Duplicate ACK; no child change.
+    Unchanged,
+    /// Historical suffix claimed; no successor wait.
+    Paused,
+    /// Empty history; exactly one successor wait.
+    Waiting,
+}
+
+/// Inputs for [`restart_after_ack`].
+pub struct AckRearmPlan<'a, C: CoverageChild, D: EventDrain> {
+    /// Accepted ACK rearm.
+    pub rearm: &'a AckRearm,
+    /// Coverage spec; `after` is updated first.
+    pub spec: &'a mut WaitOnSpec,
+    /// Live arm; generation is updated first.
+    pub arm: &'a mut KnownArm,
+    /// Claim/ledger pipe.
+    pub pipe: &'a mut DaemonPipe,
+    /// Old-generation waiter, if any.
+    pub served: &'a mut Option<ServeAttach>,
+    /// Link table (caller must not hold this across socket I/O).
+    pub table: &'a mut LinkTable,
+    /// Coverage child slot.
+    pub children: &'a mut C,
+    /// Handled-cursor store.
+    pub acks: &'a mut AckStore,
+    /// Drain used **before** any successor spawn.
+    pub drain: &'a D,
+    /// Clock for a new claim.
+    pub now: OffsetDateTime,
+}
+
+/// Apply cursor/gen, reap the old child, drain, then spawn only if history is empty.
 ///
 /// # Errors
 ///
-/// Returns `2` when child kill or spawn fails. Kill is not followed by spawn
-/// on kill failure.
-pub fn restart_after_ack<C: CoverageChild>(
-    rearm: &AckRearm,
-    spec: &mut WaitOnSpec,
-    arm: &mut KnownArm,
-    pipe: &mut DaemonPipe,
-    served: &mut Option<ServeAttach>,
-    table: &mut LinkTable,
-    children: &mut C,
-) -> Result<(), i32> {
-    if !take_coverage_rearm(spec, arm, pipe, rearm) {
-        return Ok(());
+/// Returns `2` when reap, drain, spawn, or suffix ingest fails. A reap/drain
+/// failure does not spawn.
+pub fn restart_after_ack<C: CoverageChild, D: EventDrain>(
+    plan: &mut AckRearmPlan<'_, C, D>,
+) -> Result<RearmFollowup, i32> {
+    if !take_coverage_rearm(plan.spec, plan.arm, plan.pipe, plan.rearm) {
+        return Ok(RearmFollowup::Unchanged);
     }
-    revoke_older_generation(served, table, rearm.generation);
-    children.kill_and_reap()?;
-    children.spawn(spec)
+    revoke_older_generation(plan.served, plan.table, plan.rearm.generation);
+    drain_or_spawn(plan)
+}
+
+fn drain_or_spawn<C: CoverageChild, D: EventDrain>(
+    plan: &mut AckRearmPlan<'_, C, D>,
+) -> Result<RearmFollowup, i32> {
+    plan.children.kill_and_reap()?;
+    let events = plan.drain.drain_after(plan.spec).map_err(|_| 2)?;
+    if events.is_empty() {
+        plan.children.spawn(plan.spec)?;
+        return Ok(RearmFollowup::Waiting);
+    }
+    let outcome = ingest_match(
+        &IngestRequest {
+            spec: plan.spec,
+            wait: WaitResult::Matched,
+            drain: &OwnedDrain {
+                events: events.clone(),
+            },
+            arm: plan.arm,
+            link: None,
+            now: plan.now,
+        },
+        plan.pipe,
+        plan.acks,
+        None::<&mut LinkIo>,
+        || ulid::Ulid::new().to_string(),
+    );
+    match outcome.coverage {
+        DaemonCoverage::Halt { exit } => Err(exit),
+        _ => Ok(RearmFollowup::Paused),
+    }
 }
 
 fn halt(
@@ -1014,34 +1073,46 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
                 adopt_attached(next, &mut served, &table, &mut pipe, &acks, now);
             }
             Ok(DaemonEvent::CoverageRearm(rearm)) => {
-                let result = {
-                    let mut locked = lock_table(&table);
-                    restart_after_ack(
-                        &rearm,
-                        &mut spec,
-                        &mut arm,
-                        &mut pipe,
-                        &mut served,
-                        &mut locked,
-                        &mut children,
-                    )
-                };
-                if let Err(code) = result {
-                    return halt(&table, &mut children, &stop, &socket, &mut accept, code);
-                }
-                if let Some(code) = claim_historical_suffix(
-                    &mut LoopIo {
-                        children: &mut children,
-                        spec: &mut spec,
-                        arm: &arm,
-                        table: &table,
-                        pipe: &mut pipe,
-                        acks: &acks,
-                        served: &mut served,
-                    },
-                    now,
-                ) {
-                    return halt(&table, &mut children, &stop, &socket, &mut accept, code);
+                if take_coverage_rearm(&mut spec, &mut arm, &mut pipe, &rearm) {
+                    {
+                        let mut locked = lock_table(&table);
+                        revoke_older_generation(&mut served, &mut locked, rearm.generation);
+                    }
+                    let drained = {
+                        if children.kill_and_reap().is_err() {
+                            return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
+                        }
+                        match ChanvoyDrain.drain_after(&spec) {
+                            Ok(events) => events,
+                            Err(_) => {
+                                return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
+                            }
+                        }
+                    };
+                    if drained.is_empty() {
+                        if spawn_chanvoy(&mut children, &spec).is_err() {
+                            return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
+                        }
+                    } else {
+                        let mut acks = lock_acks(&acks);
+                        let outcome = ingest_match(
+                            &IngestRequest {
+                                spec: &spec,
+                                wait: WaitResult::Matched,
+                                drain: &OwnedDrain { events: drained },
+                                arm: &arm,
+                                link: None,
+                                now,
+                            },
+                            &mut pipe,
+                            &mut acks,
+                            None::<&mut LinkIo>,
+                            || ulid::Ulid::new().to_string(),
+                        );
+                        if let DaemonCoverage::Halt { exit } = outcome.coverage {
+                            return halt(&table, &mut children, &stop, &socket, &mut accept, exit);
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1155,43 +1226,6 @@ impl EventDrain for OwnedDrain {
     }
 }
 
-fn claim_historical_suffix(io: &mut LoopIo<'_>, now: OffsetDateTime) -> Option<i32> {
-    let events = match ChanvoyDrain.drain_after(io.spec) {
-        Ok(events) if events.is_empty() => return None,
-        Ok(events) => events,
-        Err(_) => return Some(2),
-    };
-    let link = current_link(io.table);
-    let outcome = {
-        let mut acks = lock_acks(io.acks);
-        ingest_match(
-            &IngestRequest {
-                spec: io.spec,
-                wait: WaitResult::Matched,
-                drain: &OwnedDrain { events },
-                arm: io.arm,
-                link: link.as_ref(),
-                now,
-            },
-            io.pipe,
-            &mut acks,
-            None::<&mut LinkIo>,
-            || ulid::Ulid::new().to_string(),
-        )
-    };
-    match outcome.coverage {
-        DaemonCoverage::Halt { exit } => Some(exit),
-        DaemonCoverage::Pause => {
-            let _ = io.children.kill_and_reap();
-            if flush_current(io.served, io.table, io.pipe, io.acks, now) {
-                revoke_exact(io.served, io.table, io.pipe, now, true);
-            }
-            None
-        }
-        DaemonCoverage::Rearm { .. } => None,
-    }
-}
-
 fn flush_current(
     served: &mut Option<ServeAttach>,
     table: &Mutex<LinkTable>,
@@ -1209,10 +1243,10 @@ fn flush_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimError, CoverageChild, DaemonCoverage, DeliveryIo, IngestOutcome, ResultApply,
-        apply_waiter_result, claim_or_reuse, ingest_match, lease_expired, on_transport_loss,
-        provider_events_from_drain, restart_after_ack, retain_live_attach, shutdown_daemon,
-        spawn_accept, take_coverage_rearm,
+        AckRearmPlan, ClaimError, CoverageChild, DaemonCoverage, DeliveryIo, IngestOutcome,
+        RearmFollowup, ResultApply, apply_waiter_result, claim_or_reuse, ingest_match,
+        lease_expired, on_transport_loss, provider_events_from_drain, restart_after_ack,
+        retain_live_attach, shutdown_daemon, spawn_accept, take_coverage_rearm,
     };
     use crate::child::ChildSlot;
     use crate::wait_on::{DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitResult};
@@ -1671,17 +1705,66 @@ mod tests {
         }
     }
 
+    struct ScriptedDrain {
+        events: Result<Vec<DrainedEvent>, DrainError>,
+    }
+
+    impl EventDrain for ScriptedDrain {
+        fn drain_after(&self, _spec: &WaitOnSpec) -> Result<Vec<DrainedEvent>, DrainError> {
+            self.events.clone()
+        }
+    }
+
+    fn empty_drain() -> ScriptedDrain {
+        ScriptedDrain {
+            events: Ok(Vec::new()),
+        }
+    }
+
+    fn suffix_drain() -> ScriptedDrain {
+        ScriptedDrain {
+            events: Ok(vec![event("post03", "suffix")]),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rearm(
+        rearm: &AckRearm,
+        spec: &mut WaitOnSpec,
+        live: &mut KnownArm,
+        pipe: &mut super::DaemonPipe,
+        served: &mut Option<gearwit_host::ServeAttach>,
+        table: &mut LinkTable,
+        children: &mut ScriptedChild,
+        acks: &mut AckStore,
+        drain: &ScriptedDrain,
+    ) -> Result<RearmFollowup, i32> {
+        restart_after_ack(&mut AckRearmPlan {
+            rearm,
+            spec,
+            arm: live,
+            pipe,
+            served,
+            table,
+            children,
+            acks,
+            drain,
+            now: now(),
+        })
+    }
+
     #[test]
-    fn restart_after_ack_reaps_once_and_spawns_after_cursor() {
+    fn empty_history_spawns_exactly_one_successor() {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
         let mut table = LinkTable::default();
         admit_attach(&mut table, fixture_attach(), now(), &[arm()]).expect("gen1");
-        assert_eq!(table.current().expect("live").generation, 1);
         let mut children = ScriptedChild::default();
         let mut served = None;
-        restart_after_ack(
+        let mut acks = AckStore::with_arm(arm());
+        let drain = empty_drain();
+        let followup = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
@@ -1689,13 +1772,16 @@ mod tests {
             &mut served,
             &mut table,
             &mut children,
+            &mut acks,
+            &drain,
         )
         .expect("rearm");
+        assert_eq!(followup, RearmFollowup::Waiting);
         assert_eq!(spec.after.as_deref(), Some("post02"));
         assert_eq!(children.kills, 1);
         assert_eq!(children.spawns, vec![Some("post02".to_owned())]);
         assert!(table.current().is_none());
-        restart_after_ack(
+        let again = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
@@ -1703,10 +1789,47 @@ mod tests {
             &mut served,
             &mut table,
             &mut children,
+            &mut acks,
+            &drain,
         )
         .expect("replay");
+        assert_eq!(again, RearmFollowup::Unchanged);
         assert_eq!(children.kills, 1);
         assert_eq!(children.spawns.len(), 1);
+    }
+
+    #[test]
+    fn historical_suffix_pauses_with_zero_successor_spawns() {
+        let mut spec = spec();
+        let mut live = arm();
+        let mut pipe = claimed_pipe();
+        let mut table = LinkTable::default();
+        let mut children = ScriptedChild::default();
+        let mut served = None;
+        let mut acks_arm = arm();
+        acks_arm.generation = 2;
+        let mut acks = AckStore::with_arm(acks_arm);
+        let drain = suffix_drain();
+        let followup = run_rearm(
+            &ack_rearm(),
+            &mut spec,
+            &mut live,
+            &mut pipe,
+            &mut served,
+            &mut table,
+            &mut children,
+            &mut acks,
+            &drain,
+        )
+        .expect("suffix");
+        assert_eq!(followup, RearmFollowup::Paused);
+        assert!(children.spawns.is_empty());
+        assert_eq!(children.kills, 1);
+        assert_eq!(
+            pipe.claim.as_ref().map(|claim| claim.event_refs.clone()),
+            Some(vec!["post03".to_owned()])
+        );
+        assert_eq!(live.generation, 2);
     }
 
     #[test]
@@ -1730,10 +1853,11 @@ mod tests {
         let mut successor_arm = arm();
         successor_arm.generation = 2;
         admit_attach(&mut table, gen2, now(), &[successor_arm]).expect("gen2");
-        assert_eq!(table.current().expect("live").generation, 2);
         let mut children = ScriptedChild::default();
         let mut served = None;
-        restart_after_ack(
+        let mut acks = AckStore::with_arm(arm());
+        let drain = empty_drain();
+        run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
@@ -1741,15 +1865,16 @@ mod tests {
             &mut served,
             &mut table,
             &mut children,
+            &mut acks,
+            &drain,
         )
         .expect("rearm");
         assert_eq!(table.current().expect("kept").generation, 2);
-        assert_eq!(children.kills, 1);
         assert_eq!(children.spawns, vec![Some("post02".to_owned())]);
     }
 
     #[test]
-    fn restart_after_ack_kill_failure_does_not_spawn() {
+    fn failure_before_spawn_leaves_none() {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
@@ -1759,7 +1884,9 @@ mod tests {
             ..ScriptedChild::default()
         };
         let mut served = None;
-        let error = restart_after_ack(
+        let mut acks = AckStore::with_arm(arm());
+        let drain = empty_drain();
+        let error = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
@@ -1767,6 +1894,8 @@ mod tests {
             &mut served,
             &mut table,
             &mut children,
+            &mut acks,
+            &drain,
         )
         .expect_err("kill");
         assert_eq!(error, 2);
@@ -1774,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_after_ack_spawn_failure_after_kill() {
+    fn spawn_failure_after_kill_leaves_none() {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
@@ -1784,7 +1913,9 @@ mod tests {
             ..ScriptedChild::default()
         };
         let mut served = None;
-        let error = restart_after_ack(
+        let mut acks = AckStore::with_arm(arm());
+        let drain = empty_drain();
+        let error = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
@@ -1792,6 +1923,8 @@ mod tests {
             &mut served,
             &mut table,
             &mut children,
+            &mut acks,
+            &drain,
         )
         .expect_err("spawn");
         assert_eq!(error, 2);
@@ -1800,14 +1933,17 @@ mod tests {
     }
 
     #[test]
-    fn prefix_rearm_then_ingest_recovers_suffix() {
+    fn next_suffix_ack_repeats_drain_before_spawn() {
         let mut spec = spec();
         let mut live = arm();
         let mut pipe = claimed_pipe();
         let mut table = LinkTable::default();
         let mut children = ScriptedChild::default();
         let mut served = None;
-        restart_after_ack(
+        let mut acks_arm = arm();
+        acks_arm.generation = 2;
+        let mut acks = AckStore::with_arm(acks_arm);
+        let first = run_rearm(
             &ack_rearm(),
             &mut spec,
             &mut live,
@@ -1815,37 +1951,35 @@ mod tests {
             &mut served,
             &mut table,
             &mut children,
+            &mut acks,
+            &suffix_drain(),
         )
-        .expect("rearm");
-        let drain = FixedDrain {
-            after: Mutex::new(None),
-            result: Ok(vec![event("post03", "suffix")]),
+        .expect("first");
+        assert_eq!(first, RearmFollowup::Paused);
+        assert!(children.spawns.is_empty());
+        live.generation = 2;
+        acks = AckStore::with_arm(live.clone());
+        let second_rearm = AckRearm {
+            after: "post03".to_owned(),
+            generation: 3,
+            signal_id: "01J00000000000000000000022".to_owned(),
         };
-        let mut next = super::DaemonPipe::default();
-        let outcome = ingest_match(
-            &super::IngestRequest {
-                spec: &spec,
-                wait: WaitResult::Matched,
-                drain: &drain,
-                arm: &live,
-                link: None,
-                now: now(),
-            },
-            &mut next,
-            &mut AckStore::with_arm(live.clone()),
-            None::<&mut ScriptedIo>,
-            || "01J00000000000000000000022".to_owned(),
-        );
-        assert_eq!(
-            drain.after.lock().expect("after").as_deref(),
-            Some("post02")
-        );
-        assert_eq!(
-            next.claim.as_ref().map(|claim| claim.event_refs.clone()),
-            Some(vec!["post03".to_owned()])
-        );
-        assert_eq!(outcome.coverage, DaemonCoverage::Pause);
-        assert_eq!(live.generation, 2);
+        let second = run_rearm(
+            &second_rearm,
+            &mut spec,
+            &mut live,
+            &mut pipe,
+            &mut served,
+            &mut table,
+            &mut children,
+            &mut acks,
+            &empty_drain(),
+        )
+        .expect("second");
+        assert_eq!(second, RearmFollowup::Waiting);
+        assert_eq!(children.kills, 2);
+        assert_eq!(children.spawns, vec![Some("post03".to_owned())]);
+        assert_eq!(spec.after.as_deref(), Some("post03"));
     }
 
     #[test]
