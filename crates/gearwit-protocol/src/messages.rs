@@ -26,7 +26,7 @@ pub enum WaiterLink {
         /// Arm being attached.
         arm_id: String,
         /// Arm generation.
-        generation: u32,
+        generation: u64,
         /// Seat token.
         seat_id: String,
         /// Attached return route.
@@ -46,7 +46,7 @@ pub enum WaiterLink {
         /// Arm id.
         arm_id: String,
         /// Arm generation.
-        generation: u32,
+        generation: u64,
         /// Admitted route.
         route: String,
         /// Admission time.
@@ -78,7 +78,7 @@ pub enum WaiterLink {
         /// Arm id.
         arm_id: String,
         /// Arm generation.
-        generation: u32,
+        generation: u64,
         /// Signal id.
         signal_id: String,
         /// Route.
@@ -157,7 +157,12 @@ pub fn parse_waiter_link(json: &str) -> Result<WaiterLink, WaiterLinkError> {
     Ok(message)
 }
 
-fn validate(message: &WaiterLink) -> Result<(), WaiterLinkError> {
+/// Semantically validate an already-deserialized message.
+///
+/// # Errors
+///
+/// Returns [`WaiterLinkError::Semantic`] when a pin rule fails.
+pub fn validate(message: &WaiterLink) -> Result<(), WaiterLinkError> {
     match message {
         WaiterLink::AttachWaiter {
             schema,
@@ -306,7 +311,7 @@ fn ulid_ok(value: &str) -> Result<(), WaiterLinkError> {
     }
 }
 
-fn generation_ok(generation: u32) -> Result<(), WaiterLinkError> {
+fn generation_ok(generation: u64) -> Result<(), WaiterLinkError> {
     if generation >= 1 {
         Ok(())
     } else {
@@ -360,7 +365,7 @@ fn outcome_ok(outcome: &str) -> Result<(), WaiterLinkError> {
 }
 
 fn token_ok(value: &str) -> Result<(), WaiterLinkError> {
-    if (1..=256).contains(&value.len())
+    if (1..=256).contains(&value.chars().count())
         && value
             .chars()
             .all(|character| character > '\u{0020}' && character != '\u{007F}')
@@ -372,7 +377,7 @@ fn token_ok(value: &str) -> Result<(), WaiterLinkError> {
 }
 
 fn body_ok(value: &str) -> Result<(), WaiterLinkError> {
-    if value.len() > 4096 {
+    if value.chars().count() > 4096 {
         return Err(WaiterLinkError::Semantic("body too long"));
     }
     if value.chars().any(|character| {

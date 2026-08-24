@@ -5,12 +5,15 @@
 mod codec;
 mod messages;
 
-pub use codec::{FrameError, MAX_FRAME, decode_frame, encode_frame};
-pub use messages::{PIN_COMMIT, SCHEMA, WaiterLink, WaiterLinkError, parse_waiter_link};
+pub use codec::{FrameError, MAX_FRAME, decode_frame, decode_prefix, encode_frame};
+pub use messages::{PIN_COMMIT, SCHEMA, WaiterLink, WaiterLinkError, parse_waiter_link, validate};
 
 #[cfg(test)]
 mod tests {
-    use super::{PIN_COMMIT, WaiterLink, decode_frame, encode_frame, parse_waiter_link};
+    use super::{
+        FrameError, PIN_COMMIT, WaiterLink, decode_frame, decode_prefix, encode_frame,
+        parse_waiter_link,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -73,8 +76,71 @@ mod tests {
 
     fn encode_frame_oversize_rejected() -> bool {
         matches!(
-            super::decode_frame(&[0xff, 0xff, 0xff, 0xff]),
-            Err(super::FrameError::TooLarge { .. })
+            decode_frame(&[0xff, 0xff, 0xff, 0xff]),
+            Err(FrameError::TooLarge { .. })
         )
+    }
+
+    #[test]
+    fn encode_rejects_invalid_constructed_messages() {
+        let text = fs::read_to_string(fixture_root().join("conforming/attach-waiter.json"))
+            .expect("fixture");
+        let mut message = parse_waiter_link(&text).expect("parse");
+        if let WaiterLink::AttachWaiter { generation, .. } = &mut message {
+            *generation = 0;
+        }
+        assert!(encode_frame(&message).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_empty_truncated_utf8_and_trailing() {
+        assert!(matches!(decode_frame(&[]), Err(FrameError::Truncated)));
+        assert!(matches!(
+            decode_frame(&[0, 0, 0, 0]),
+            Err(FrameError::Empty)
+        ));
+        assert!(matches!(
+            decode_frame(&[0, 0, 0, 5, 1, 2]),
+            Err(FrameError::Truncated)
+        ));
+        let text = fs::read_to_string(fixture_root().join("conforming/attach-rejected.json"))
+            .expect("fixture");
+        let message = parse_waiter_link(&text).expect("parse");
+        let mut framed = encode_frame(&message).expect("encode");
+        framed.push(0);
+        assert!(matches!(decode_frame(&framed), Err(FrameError::Trailing)));
+        let (_decoded, consumed) = decode_prefix(&framed).expect("prefix");
+        assert_eq!(consumed, framed.len() - 1);
+        let invalid_utf8 = [0, 0, 0, 1, 0xff];
+        assert!(matches!(
+            decode_frame(&invalid_utf8),
+            Err(FrameError::InvalidUtf8)
+        ));
+    }
+
+    #[test]
+    fn body_max_length_is_unicode_characters() {
+        let snowman = "☃".repeat(4096);
+        let json = format!(
+            r#"{{
+  "schema": "gearwit.interrupt.waiter-link.v0",
+  "type": "deliver_events",
+  "delivery_id": "01J00000000000000000000043",
+  "link_id": "01J00000000000000000000042",
+  "arm_id": "01J00000000000000000000010",
+  "generation": 1,
+  "signal_id": "01J00000000000000000000021",
+  "route": "complete_background_tool",
+  "events": [{{
+    "provider": "mattermost",
+    "event_ref": "post02",
+    "observed_at": "2026-01-15T12:05:00Z",
+    "body": "{snowman}"
+  }}],
+  "newest_event_ref": "post02",
+  "attempted_at": "2026-01-15T12:05:02Z"
+}}"#
+        );
+        parse_waiter_link(&json).expect("4096-char body must pass pin maxLength");
     }
 }
