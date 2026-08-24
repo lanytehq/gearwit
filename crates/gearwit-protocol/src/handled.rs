@@ -211,7 +211,7 @@ fn seat_ok(seat: &str) -> Result<(), HandledCursorError> {
 
 fn token_ok(value: &str) -> Result<(), HandledCursorError> {
     if (1..=256).contains(&value.chars().count())
-        && !value.chars().any(|ch| ch <= '\u{001F}' || ch == '\u{007F}')
+        && !value.chars().any(|ch| ch <= '\u{0020}' || ch == '\u{007F}')
     {
         Ok(())
     } else {

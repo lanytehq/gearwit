@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::admit::KnownArm;
+use crate::admit::{HISTORY_CAP, KnownArm};
 use gearwit_protocol::{HANDLED_SCHEMA, HandledCursor, HandledCursorError, validate_handled};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -23,6 +23,7 @@ struct HistoryEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SignalBatch {
+    generation: u64,
     delivered: Vec<String>,
     after_bound: Vec<String>,
     handled: Option<String>,
@@ -41,32 +42,44 @@ impl AckStore {
     }
 
     /// Record a delivered batch for `signal_id`.
+    ///
+    /// Exact replay of the same snapshots is idempotent. A different body for
+    /// the same signal is a hard conflict. Never resets handled/closed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandledCursorError`] when the snapshots are malformed or
+    /// conflict with an existing claim.
     pub fn note_delivered(
         &mut self,
         signal_id: String,
         delivered: Vec<String>,
-        drain_snapshot: Vec<String>,
-    ) {
-        let newest = delivered.last().cloned();
-        let after_bound = newest
+        drain_snapshot: &[String],
+    ) -> Result<(), HandledCursorError> {
+        let generation = self
+            .arm
             .as_ref()
-            .map(|bound| {
-                drain_snapshot
-                    .into_iter()
-                    .skip_while(|event_ref| event_ref != bound)
-                    .skip(1)
-                    .collect()
-            })
-            .unwrap_or_default();
+            .ok_or(HandledCursorError::Semantic("unknown_arm"))?
+            .generation;
+        validate_snapshots(&delivered, drain_snapshot)?;
+        let after_bound = after_bound_refs(&delivered, drain_snapshot);
+        if let Some(existing) = self.signals.get(&signal_id) {
+            if existing.delivered == delivered && existing.after_bound == after_bound {
+                return Ok(());
+            }
+            return Err(HandledCursorError::Semantic("signal conflict"));
+        }
         self.signals.insert(
             signal_id,
             SignalBatch {
+                generation,
                 delivered,
                 after_bound,
                 handled: None,
                 closed: false,
             },
         );
+        Ok(())
     }
 
     /// Live arm, if any.
@@ -97,6 +110,9 @@ pub fn record_handled(
         }
         return Err(HandledCursorError::Semantic("request_id conflict"));
     }
+    if store.history.len() >= HISTORY_CAP {
+        return Err(HandledCursorError::Semantic("request history full"));
+    }
 
     let reply = decide(store, &request, now);
     store.history.insert(
@@ -124,15 +140,60 @@ pub fn rearm_from_handled(
     let Some(batch) = store.signals.get_mut(signal_id) else {
         return Err(HandledCursorError::Semantic("unknown_signal"));
     };
+    if batch.generation != arm.generation {
+        return Err(HandledCursorError::Semantic("stale_generation"));
+    }
     let Some(cursor) = batch.handled.clone() else {
         return Err(HandledCursorError::Semantic("ack_before_delivery"));
     };
     if batch.closed {
         return Err(HandledCursorError::Semantic("stale_generation"));
     }
+    let next = arm
+        .generation
+        .checked_add(1)
+        .ok_or(HandledCursorError::Semantic("generation overflow"))?;
     batch.closed = true;
-    arm.generation = arm.generation.saturating_add(1);
+    arm.generation = next;
     Ok(cursor)
+}
+
+fn validate_snapshots(
+    delivered: &[String],
+    drain_snapshot: &[String],
+) -> Result<(), HandledCursorError> {
+    if delivered.is_empty() {
+        return Ok(());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for event_ref in delivered {
+        if !seen.insert(event_ref.as_str()) {
+            return Err(HandledCursorError::Semantic("duplicate event_ref"));
+        }
+    }
+    let mut drain_index = 0;
+    for event_ref in delivered {
+        let Some(found) = drain_snapshot[drain_index..]
+            .iter()
+            .position(|candidate| candidate == event_ref)
+        else {
+            return Err(HandledCursorError::Semantic("delivered not in drain"));
+        };
+        drain_index += found + 1;
+    }
+    Ok(())
+}
+
+fn after_bound_refs(delivered: &[String], drain_snapshot: &[String]) -> Vec<String> {
+    let Some(bound) = delivered.last() else {
+        return Vec::new();
+    };
+    drain_snapshot
+        .iter()
+        .skip_while(|event_ref| *event_ref != bound)
+        .skip(1)
+        .cloned()
+        .collect()
 }
 
 fn decide(store: &mut AckStore, request: &HandledCursor, now: OffsetDateTime) -> HandledCursor {
@@ -174,7 +235,7 @@ fn decide(store: &mut AckStore, request: &HandledCursor, now: OffsetDateTime) ->
     let Some(batch) = store.signals.get_mut(signal_id) else {
         return rejected("unknown_signal");
     };
-    if batch.closed {
+    if batch.closed || batch.generation != arm.generation {
         return rejected("stale_generation");
     }
     if batch.delivered.is_empty() {
@@ -245,15 +306,17 @@ mod tests {
 
     fn store_with_batch() -> AckStore {
         let mut store = AckStore::with_arm(arm());
-        store.note_delivered(
-            "01J00000000000000000000021".to_owned(),
-            vec!["post02".to_owned(), "post03".to_owned()],
-            vec![
-                "post02".to_owned(),
-                "post03".to_owned(),
-                "post04".to_owned(),
-            ],
-        );
+        store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &[
+                    "post02".to_owned(),
+                    "post03".to_owned(),
+                    "post04".to_owned(),
+                ],
+            )
+            .expect("note");
         store
     }
 
@@ -374,11 +437,9 @@ mod tests {
         ));
 
         let mut before = AckStore::with_arm(arm());
-        before.note_delivered(
-            "01J00000000000000000000021".to_owned(),
-            Vec::new(),
-            Vec::new(),
-        );
+        before
+            .note_delivered("01J00000000000000000000021".to_owned(), Vec::new(), &[])
+            .expect("empty");
         let reply = record_handled(
             &mut before,
             request("post03", "01J00000000000000000000053"),
@@ -448,5 +509,113 @@ mod tests {
             error,
             gearwit_protocol::HandledCursorError::Semantic("ack_before_delivery")
         ));
+    }
+
+    #[test]
+    fn space_cursor_is_rejected_by_the_pin() {
+        let text = include_str!(
+            "../../gearwit-protocol/fixtures/handled-cursor/negative/space-cursor.json"
+        );
+        assert!(parse_handled_cursor(text).is_err());
+    }
+
+    #[test]
+    fn note_delivered_is_idempotent_and_does_not_reset() {
+        let mut store = store_with_batch();
+        record_handled(
+            &mut store,
+            request("post03", "01J00000000000000000000050"),
+            now(),
+        )
+        .expect("ack");
+        store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &[
+                    "post02".to_owned(),
+                    "post03".to_owned(),
+                    "post04".to_owned(),
+                ],
+            )
+            .expect("replay");
+        let error = store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned()],
+                &["post02".to_owned()],
+            )
+            .expect_err("conflict");
+        assert!(matches!(
+            error,
+            gearwit_protocol::HandledCursorError::Semantic("signal conflict")
+        ));
+        let stale = record_handled(
+            &mut store,
+            request("post02", "01J00000000000000000000061"),
+            now(),
+        )
+        .expect("still newest");
+        assert!(matches!(
+            stale,
+            HandledCursor::Rejected { code, .. } if code == "stale_cursor"
+        ));
+    }
+
+    #[test]
+    fn rearm_does_not_advance_a_replaced_generation() {
+        let mut store = store_with_batch();
+        store
+            .note_delivered(
+                "01J00000000000000000000022".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &["post02".to_owned(), "post03".to_owned()],
+            )
+            .expect("second signal");
+        record_handled(
+            &mut store,
+            request("post03", "01J00000000000000000000050"),
+            now(),
+        )
+        .expect("ack a");
+        let mut other = request("post03", "01J00000000000000000000062");
+        if let HandledCursor::Request { signal_id, .. } = &mut other {
+            *signal_id = "01J00000000000000000000022".to_owned();
+        }
+        record_handled(&mut store, other, now()).expect("ack b");
+        rearm_from_handled(&mut store, "01J00000000000000000000021").expect("rearm a");
+        let error =
+            rearm_from_handled(&mut store, "01J00000000000000000000022").expect_err("stale b");
+        assert!(matches!(
+            error,
+            gearwit_protocol::HandledCursorError::Semantic("stale_generation")
+        ));
+        assert_eq!(store.arm().expect("arm").generation, 2);
+    }
+
+    #[test]
+    fn generation_overflow_does_not_close() {
+        let mut max = arm();
+        max.generation = u64::MAX;
+        let mut store = AckStore::with_arm(max);
+        store
+            .note_delivered(
+                "01J00000000000000000000021".to_owned(),
+                vec!["post02".to_owned(), "post03".to_owned()],
+                &["post02".to_owned(), "post03".to_owned()],
+            )
+            .expect("note");
+        let mut req = request("post03", "01J00000000000000000000050");
+        if let HandledCursor::Request { generation, .. } = &mut req {
+            *generation = u64::MAX;
+        }
+        record_handled(&mut store, req, now()).expect("ack");
+        let error =
+            rearm_from_handled(&mut store, "01J00000000000000000000021").expect_err("overflow");
+        assert!(matches!(
+            error,
+            gearwit_protocol::HandledCursorError::Semantic("generation overflow")
+        ));
+        assert_eq!(store.arm().expect("arm").generation, u64::MAX);
     }
 }

@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Crucible commit this crate conforms to.
-pub const PIN_COMMIT: &str = "c2c3c7c5325eb422d1b7a41ed1558d25495aa758";
+pub const PIN_COMMIT: &str = "219b4075f900e449de51dd106b9287a801bb6af2";
 /// Wire schema identifier.
 pub const SCHEMA: &str = "gearwit.interrupt.waiter-link.v0";
 
