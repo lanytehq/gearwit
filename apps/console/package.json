@@ -1,0 +1,13 @@
+{
+  "name": "@gearwit/console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot index.html",
+    "build": "bun build index.html --outdir dist --target browser",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "vitest run --config vitest.config.ts",
+    "check": "bun run typecheck && bun run test && bun run build"
+  }
+}

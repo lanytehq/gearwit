@@ -67,6 +67,10 @@ families:
 New records start Proposed. Accepted decisions are superseded, not silently
 rewritten.
 
+Record filenames use `<TYPE>-<NNNN>-<kebab-slug>.md`. Numbers are four-digit,
+monotonic, never reused, and repo-global per type. Storage folders do not start
+independent sequences.
+
 ## Quality gate
 
 ```bash

@@ -1,0 +1,9 @@
+# Schema sources consumed by this repository.
+#
+# Pins move only after the referenced contract passes its source repository
+# gate and compatibility review.
+
+[gearwit_interrupt_v0]
+repository = "https://github.com/lanytehq/lanyte-crucible"
+commit = "98199f78fa7b6796919b732bed0b81423525f68e"
+path = "schemas/agentic/gearwit/v0"

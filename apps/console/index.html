@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Gearwit squad console for honest agent-seat attention and status."
+    />
+    <title>Gearwit console</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+    <script type="module" src="./src/main.ts"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#attention">Skip to attention</a>
+    <main class="console-shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Gearwit / local squad</p>
+          <h1>Know what needs you.</h1>
+          <p class="lede">
+            An attention view for declared and observed seat state. Unknown stays unknown.
+          </p>
+        </div>
+        <div class="connection connection-fixture" aria-label="Development data source">
+          <div class="connection-status">
+            <span class="connection-mark" aria-hidden="true"></span>
+            <span>
+              <strong id="connection-title">Fixture mode</strong>
+              <small id="connection-detail">No daemon attached</small>
+            </span>
+          </div>
+          <label for="fixture-scenario">Fixture scenario</label>
+          <select id="fixture-scenario"></select>
+        </div>
+      </header>
+
+      <section class="summary-strip" aria-label="Squad summary">
+        <div><strong id="attention-count">0</strong><span>need attention</span></div>
+        <div><strong id="armed-count">0</strong><span>armed waits</span></div>
+        <div><strong id="unknown-count">0</strong><span>unknown facts</span></div>
+        <p id="snapshot-time">Development snapshot / no live claims</p>
+      </section>
+
+      <section class="doorbell-bench" aria-labelledby="doorbell-title">
+        <div class="bench-copy">
+          <p class="section-index">Return-path lab / Fixture only</p>
+          <h2 id="doorbell-title">Ring what is actually attached.</h2>
+          <p>
+            Choose a seat to inspect its available return path. Controller rings stay disabled
+            until an attachment is proven; foreground return remains agent-worn gear.
+          </p>
+        </div>
+        <div class="bench-controls">
+          <label for="doorbell-seat">Seat</label>
+          <select id="doorbell-seat"></select>
+          <div id="route-readout" class="route-readout" aria-live="polite"></div>
+          <button id="ring-test" class="ring-button" type="button">Ring test doorbell</button>
+          <p id="ring-guidance" class="ring-guidance"></p>
+          <p id="ring-result" class="ring-result" role="status"></p>
+        </div>
+      </section>
+
+      <div class="workspace">
+        <section id="attention" class="attention-pane" aria-labelledby="attention-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-index">01 / Attention</p>
+              <h2 id="attention-title">What changed</h2>
+            </div>
+            <div class="filters" role="group" aria-label="Filter attention events">
+              <button type="button" class="filter is-active" data-filter="all" aria-pressed="true">All</button>
+              <button type="button" class="filter" data-filter="act" aria-pressed="false">Act now</button>
+              <button type="button" class="filter" data-filter="watch" aria-pressed="false">Watch</button>
+            </div>
+          </div>
+          <ol id="event-list" class="event-list" aria-live="polite"></ol>
+          <p id="event-empty" class="empty-state" hidden>No events match this view.</p>
+        </section>
+
+        <aside class="roster-pane" aria-labelledby="roster-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-index">02 / Roster</p>
+              <h2 id="roster-title">Seats in view</h2>
+            </div>
+            <span class="seat-total" id="seat-count">0 seats</span>
+          </div>
+          <div id="roster-list" class="roster-list"></div>
+        </aside>
+      </div>
+
+      <footer class="legend" aria-label="Evidence legend">
+        <strong>Evidence</strong>
+        <span><i class="tier tier-proven">P</i> Controller-proven</span>
+        <span><i class="tier tier-proven">V</i> Provider-proven</span>
+        <span><i class="tier tier-simulated">F</i> Fixture-simulated</span>
+        <span><i class="tier tier-declared">D</i> Self-declared</span>
+        <span><i class="tier tier-inferred">I</i> Census-inferred</span>
+        <span><i class="tier tier-unknown">?</i> Unknown</span>
+      </footer>
+    </main>
+  </body>
+</html>

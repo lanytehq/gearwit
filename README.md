@@ -41,16 +41,30 @@ apps/console/           attached console projection; no second daemon
 docs/decisions/         architecture and product decision records
 ```
 
-Only `gearwit-domain` exists in the first scaffold. Other packages are added
-with their first working slice, rather than as empty roadmap directories.
+`gearwit-domain` and `gearwit-cli` exist. Other packages are added with their
+first working slice, rather than as empty roadmap directories.
 
 Cargo and Bun remain authoritative for their own dependency graphs. The root
 `Makefile` is the stable human and CI entry point.
+
+Public control-plane contracts are schema-first and pinned in
+[`schema-pins.toml`](schema-pins.toml). Domain code remains provider- and
+serialization-free; protocol bindings consume the pinned schema rather than
+becoming a second source of truth.
 
 ## Quick start
 
 ```bash
 make check
+cargo run -p gearwit-cli -- self who
+cargo run -p gearwit-cli -- self wait-on CHANNEL --after ID --timeout 20m \
+  --source chanvoy --return background-tool
+cargo run -p gearwit-cli -- self check
+cargo run -p gearwit-cli -- daemon wait-on CHANNEL --after ID --timeout 20m \
+  --source chanvoy --return notify-operator
 ```
 
-No production daemon, command surface, or console is implemented yet.
+`self who` is a census-safe local card with per-field evidence. `self wait-on`
+wraps `chanvoy wait` in-process. `--return` is a declared route, not proof that
+a harness turn started. `self check` reprints the last local receipt. These
+faces are not a public wire protocol. No daemon is implemented yet.

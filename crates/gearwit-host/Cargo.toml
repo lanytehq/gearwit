@@ -1,0 +1,20 @@
+[package]
+name = "gearwit-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Local gearwitd link admission and private ipcprims socket"
+
+[lints]
+workspace = true
+
+[dependencies]
+gearwit-protocol.workspace = true
+ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.4", default-features = false }
+nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
+rsfulmen = { version = "0.1.6", default-features = false, features = ["logging"] }
+time = { version = "0.3", default-features = false, features = ["parsing", "formatting"] }
+ulid = "1"
