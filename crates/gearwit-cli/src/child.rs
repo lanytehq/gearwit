@@ -99,22 +99,45 @@ impl ChildSlot {
                 reaped: false,
             });
         };
-        let kill_error = child.kill().err().filter(|error| {
-            error.kind() != io::ErrorKind::InvalidInput && error.kind() != io::ErrorKind::NotFound
-        });
-        match child.wait() {
-            Ok(_) => {
-                if let Some(error) = kill_error {
-                    return Err(error);
-                }
-                Ok(KillReap {
+        match child.kill() {
+            Ok(()) => child.wait().map(|_| KillReap {
+                killed: true,
+                reaped: true,
+            }),
+            Err(error) if already_exited(&error) => match child.try_wait() {
+                Ok(Some(_)) => Ok(KillReap {
                     killed: true,
                     reaped: true,
-                })
-            }
-            Err(error) => Err(kill_error.unwrap_or(error)),
+                }),
+                Ok(None) => {
+                    self.child = Some(child);
+                    Err(error)
+                }
+                Err(wait_error) => {
+                    self.child = Some(child);
+                    Err(wait_error)
+                }
+            },
+            Err(error) => match child.try_wait() {
+                Ok(Some(_)) => Ok(KillReap {
+                    killed: false,
+                    reaped: true,
+                }),
+                Ok(None) => {
+                    self.child = Some(child);
+                    Err(error)
+                }
+                Err(wait_error) => {
+                    self.child = Some(child);
+                    Err(wait_error)
+                }
+            },
         }
     }
+}
+
+fn already_exited(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidInput || error.kind() == io::ErrorKind::NotFound
 }
 
 impl Drop for ChildSlot {

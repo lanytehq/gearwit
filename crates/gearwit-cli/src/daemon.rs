@@ -172,30 +172,23 @@ pub fn retain_live_attach(served: &ServeAttach, table: &LinkTable, writer_occupi
     })
 }
 
-/// Mark the current attempt lost without consuming the batch, then drop the session.
-pub fn on_transport_loss(pipe: &mut DaemonPipe, table: &mut LinkTable, now: OffsetDateTime) {
+/// Mark the current attempt lost without consuming the batch, then drop `session`.
+pub fn on_transport_loss(
+    pipe: &mut DaemonPipe,
+    table: &mut LinkTable,
+    session: Option<&LinkSession>,
+    now: OffsetDateTime,
+) {
     if pipe.attempted
         && let Some(pending) = pipe.ledger.pending()
         && matches!(pending.attempt, DeliveryAttempt::Awaiting)
-    {
-        let WaiterLink::DeliverEvents {
+        && let WaiterLink::DeliverEvents {
             delivery_id,
             link_id,
             signal_id,
             ..
         } = &pending.message
-        else {
-            pipe.attempted = false;
-            if let Some(current) = table.current() {
-                let session = LinkSession {
-                    link_id: current.link_id.clone(),
-                    arm_id: current.arm_id.clone(),
-                    generation: current.generation,
-                };
-                drop_session(table, &session);
-            }
-            return;
-        };
+    {
         let lost = WaiterLink::DeliveryResult {
             schema: gearwit_protocol::SCHEMA.to_owned(),
             delivery_id: delivery_id.clone(),
@@ -209,14 +202,25 @@ pub fn on_transport_loss(pipe: &mut DaemonPipe, table: &mut LinkTable, now: Offs
         let _ = record_delivery_result(&mut pipe.ledger, &lost);
     }
     pipe.attempted = false;
-    if let Some(current) = table.current() {
-        let session = LinkSession {
-            link_id: current.link_id.clone(),
-            arm_id: current.arm_id.clone(),
-            generation: current.generation,
-        };
-        drop_session(table, &session);
+    if let Some(session) = session {
+        drop_session(table, session);
     }
+}
+
+/// True when `now` is at or past the admitted lease.
+#[must_use]
+pub fn lease_expired(lease_until: OffsetDateTime, now: OffsetDateTime) -> bool {
+    now >= lease_until
+}
+
+fn poll_timeout(lease_until: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    if lease_expired(lease_until, now) {
+        return None;
+    }
+    let remain = lease_until - now;
+    let millis = remain.whole_milliseconds().clamp(1, 50);
+    let millis = u64::try_from(millis).unwrap_or(50);
+    Some(Duration::from_millis(millis))
 }
 
 /// Inputs for one wait-interval ingest. Wait match is only a hint.
@@ -456,15 +460,20 @@ pub struct ShutdownReport {
     pub link_live: bool,
 }
 
-/// Kill the Chanvoy child, join the accept worker, and drop the live session.
-#[must_use]
+/// Wake and join the accept worker, then kill the child and drop the live session.
+///
+/// Stop/wake/join happen before any table lock so an in-flight accept cannot deadlock.
+///
+/// # Errors
+///
+/// Returns child kill/wait errors. The accept worker is still joined.
 pub fn shutdown_daemon(
     table: &mut LinkTable,
     children: &mut ChildSlot,
     stop: &AtomicBool,
     socket: Option<&std::path::Path>,
     accept: &mut Option<thread::JoinHandle<()>>,
-) -> ShutdownReport {
+) -> std::io::Result<ShutdownReport> {
     stop.store(true, Ordering::SeqCst);
     if let Some(path) = socket {
         let _ = UnixDomainSocket::connect(path);
@@ -472,16 +481,7 @@ pub fn shutdown_daemon(
     if let Some(handle) = accept.take() {
         let _ = handle.join();
     }
-    let child = match children.kill_and_reap() {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("gearwit: child terminate: {error}");
-            crate::child::KillReap {
-                killed: false,
-                reaped: false,
-            }
-        }
-    };
+    let child = children.kill_and_reap()?;
     if let Some(current) = table.current() {
         let session = LinkSession {
             link_id: current.link_id.clone(),
@@ -491,10 +491,10 @@ pub fn shutdown_daemon(
         drop_session(table, &session);
     }
     table.drop_current();
-    ShutdownReport {
+    Ok(ShutdownReport {
         child_reaped: child.reaped || !children.occupied(),
         link_live: table.current().is_some(),
-    }
+    })
 }
 
 enum DaemonEvent {
@@ -515,9 +515,25 @@ fn halt(
     accept: &mut Option<thread::JoinHandle<()>>,
     code: i32,
 ) -> i32 {
-    let mut table = lock_table(table);
-    let _ = shutdown_daemon(&mut table, children, stop, Some(socket), accept);
-    code
+    stop.store(true, Ordering::SeqCst);
+    let _ = UnixDomainSocket::connect(socket);
+    if let Some(handle) = accept.take() {
+        let _ = handle.join();
+    }
+    let child = children.kill_and_reap();
+    {
+        let mut table = lock_table(table);
+        if let Some(current) = table.current() {
+            let session = LinkSession {
+                link_id: current.link_id.clone(),
+                arm_id: current.arm_id.clone(),
+                generation: current.generation,
+            };
+            drop_session(&mut table, &session);
+        }
+        table.drop_current();
+    }
+    if child.is_err() { 2 } else { code }
 }
 
 fn spawn_chanvoy(slot: &mut ChildSlot, spec: &WaitOnSpec) -> Result<u32, i32> {
@@ -532,11 +548,21 @@ fn current_link(table: &Mutex<LinkTable>) -> Option<AdmittedLink> {
     lock_table(table).current().cloned()
 }
 
-fn set_poll_timeout(served: &mut ServeAttach) {
-    let _ = served
+fn set_poll_timeout(
+    served: &mut ServeAttach,
+    lease_until: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), LinkError> {
+    let timeout = poll_timeout(lease_until, now).ok_or(LinkError::Message(
+        gearwit_protocol::WaiterLinkError::Semantic("lease expired"),
+    ))?;
+    served
         .reader
         .get_mut()
-        .set_read_timeout(Some(Duration::from_millis(50)));
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| {
+            LinkError::Message(gearwit_protocol::WaiterLinkError::Semantic("timeout setup"))
+        })
 }
 
 fn is_read_idle(error: &LinkError) -> bool {
@@ -567,6 +593,9 @@ fn flush_attached(
     let Some(link) = current_link(table) else {
         return false;
     };
+    if lease_expired(link.lease_until, now) {
+        return true;
+    }
     let mut io = LinkIo { served };
     let outcome = deliver_claimed(
         live,
@@ -579,33 +608,82 @@ fn flush_attached(
     outcome.delivery_id.is_some() && !outcome.delivery_attempted
 }
 
+fn revoke_exact(
+    served: &mut Option<ServeAttach>,
+    table: &Mutex<LinkTable>,
+    pipe: &mut DaemonPipe,
+    now: OffsetDateTime,
+    mark_lost: bool,
+) {
+    let session = served.as_ref().and_then(|served| served.session.clone());
+    let mut table = lock_table(table);
+    if mark_lost {
+        on_transport_loss(pipe, &mut table, session.as_ref(), now);
+    } else if let Some(session) = session.as_ref() {
+        drop_session(&mut table, session);
+    }
+    drop(table);
+    *served = None;
+}
+
 fn poll_result(
     served: &mut Option<ServeAttach>,
     table: &Mutex<LinkTable>,
     pipe: &mut DaemonPipe,
     now: OffsetDateTime,
 ) {
-    let Some(current) = served.as_mut() else {
+    if served.is_none() {
         return;
+    }
+    let session = served.as_ref().and_then(|served| served.session.clone());
+    let lease_until = {
+        let locked = lock_table(table);
+        locked.current().and_then(|link| {
+            session.as_ref().and_then(|session| {
+                (link.link_id == session.link_id
+                    && link.arm_id == session.arm_id
+                    && link.generation == session.generation)
+                    .then_some(link.lease_until)
+            })
+        })
     };
-    match read_waiter_link(&mut current.reader) {
-        Ok(result) => {
+    if let Some(lease_until) = lease_until {
+        if lease_expired(lease_until, now) {
+            revoke_exact(served, table, pipe, now, true);
+            return;
+        }
+        let timeout_failed = served
+            .as_mut()
+            .is_some_and(|current| set_poll_timeout(current, lease_until, now).is_err());
+        if timeout_failed {
+            revoke_exact(served, table, pipe, now, true);
+            return;
+        }
+    } else if session.is_some() {
+        revoke_exact(served, table, pipe, now, true);
+        return;
+    }
+    let read = served
+        .as_mut()
+        .map(|current| read_waiter_link(&mut current.reader));
+    match read {
+        Some(Ok(result)) => {
             let _ = record_delivery_result(&mut pipe.ledger, &result);
-            if let WaiterLink::DeliveryResult {
-                outcome: ref token, ..
-            } = result
-                && token == "link_lost"
-            {
-                pipe.attempted = false;
+            match &result {
+                WaiterLink::DeliveryResult { outcome, .. } if outcome == "link_lost" => {
+                    pipe.attempted = false;
+                    revoke_exact(served, table, pipe, now, true);
+                }
+                WaiterLink::DeliveryResult { outcome, .. }
+                    if outcome == "return_completed" || outcome == "return_failed" =>
+                {
+                    revoke_exact(served, table, pipe, now, false);
+                }
+                _ => {}
             }
         }
-        Err(error) if is_read_idle(&error) => {}
-        Err(_) => {
-            let mut table = lock_table(table);
-            on_transport_loss(pipe, &mut table, now);
-            drop(table);
-            *served = None;
-        }
+        Some(Err(error)) if is_read_idle(&error) => {}
+        Some(Err(_)) | None => revoke_exact(served, table, pipe, now, true),
     }
 }
 
@@ -733,15 +811,27 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
                 };
                 if keep {
                     let mut next = next;
-                    set_poll_timeout(&mut next);
-                    served = Some(next);
-                    if let Some(current) = served.as_mut()
-                        && flush_attached(current, &table, &mut pipe, now)
-                    {
-                        let mut table = lock_table(&table);
-                        on_transport_loss(&mut pipe, &mut table, now);
-                        drop(table);
-                        served = None;
+                    let lease_until = {
+                        let locked = lock_table(&table);
+                        locked.current().map(|link| link.lease_until)
+                    };
+                    let timeout_failed = match lease_until {
+                        Some(lease_until) => {
+                            set_poll_timeout(&mut next, lease_until, now).is_err()
+                                || lease_expired(lease_until, now)
+                        }
+                        None => false,
+                    };
+                    if timeout_failed {
+                        served = Some(next);
+                        revoke_exact(&mut served, &table, &mut pipe, now, true);
+                    } else {
+                        served = Some(next);
+                        if let Some(current) = served.as_mut()
+                            && flush_attached(current, &table, &mut pipe, now)
+                        {
+                            revoke_exact(&mut served, &table, &mut pipe, now, true);
+                        }
                     }
                 }
             }
@@ -763,10 +853,7 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
                     if let Some(current) = served.as_mut()
                         && flush_attached(current, &table, &mut pipe, now)
                     {
-                        let mut table = lock_table(&table);
-                        on_transport_loss(&mut pipe, &mut table, now);
-                        drop(table);
-                        served = None;
+                        revoke_exact(&mut served, &table, &mut pipe, now, true);
                     }
                 }
                 DaemonCoverage::Halt { exit } => {
@@ -786,12 +873,14 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
 mod tests {
     use super::{
         ClaimError, DaemonCoverage, DeliveryIo, IngestOutcome, claim_or_reuse, ingest_match,
-        on_transport_loss, provider_events_from_drain, retain_live_attach, shutdown_daemon,
-        spawn_accept,
+        lease_expired, on_transport_loss, provider_events_from_drain, retain_live_attach,
+        shutdown_daemon, spawn_accept,
     };
     use crate::child::ChildSlot;
     use crate::wait_on::{DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitResult};
-    use gearwit_host::{DeliveryAttempt, GearwitPaths, KnownArm, LinkTable, admit_attach};
+    use gearwit_host::{
+        DeliveryAttempt, GearwitPaths, KnownArm, LinkSession, LinkTable, admit_attach,
+    };
     use gearwit_protocol::{ProviderEvent, SCHEMA, WaiterLink, parse_waiter_link};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1173,7 +1262,10 @@ mod tests {
             tx,
         );
         let mut accept = Some(handle);
-        let report = shutdown_daemon(&mut table, &mut children, &stop, Some(&socket), &mut accept);
+        let started = std::time::Instant::now();
+        let report = shutdown_daemon(&mut table, &mut children, &stop, Some(&socket), &mut accept)
+            .expect("shutdown");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(report.child_reaped);
         assert!(!report.link_live);
         assert!(!children.occupied());
@@ -1278,7 +1370,12 @@ mod tests {
         );
         assert!(pipe.claim.is_some());
         assert!(pipe.ledger.pending().is_none());
-        on_transport_loss(&mut pipe, &mut table, now());
+        let session = LinkSession {
+            link_id: table.current().expect("link").link_id.clone(),
+            arm_id: table.current().expect("link").arm_id.clone(),
+            generation: table.current().expect("link").generation,
+        };
+        on_transport_loss(&mut pipe, &mut table, Some(&session), now());
         assert!(table.current().is_none());
         assert!(pipe.claim.is_some());
         assert!(!pipe.attempted);
@@ -1307,7 +1404,12 @@ mod tests {
         );
         let id = first.delivery_id.clone().expect("id");
         assert!(first.delivery_attempted);
-        on_transport_loss(&mut pipe, &mut table, now());
+        let session = LinkSession {
+            link_id: table.current().expect("link").link_id.clone(),
+            arm_id: table.current().expect("link").arm_id.clone(),
+            generation: table.current().expect("link").generation,
+        };
+        on_transport_loss(&mut pipe, &mut table, Some(&session), now());
         assert!(table.current().is_none());
         assert!(pipe.ledger.should_redeliver());
         assert!(!pipe.attempted);
@@ -1317,6 +1419,52 @@ mod tests {
                 .map(|pending| pending.delivery_id.as_str()),
             Some(id.as_str())
         );
+    }
+
+    #[test]
+    fn stale_loss_does_not_revoke_successor() {
+        let (mut table, first) = admitted();
+        let old = LinkSession {
+            link_id: first.link_id,
+            arm_id: first.arm_id,
+            generation: first.generation,
+        };
+        table.drop_current();
+        admit_attach(
+            &mut table,
+            attach_with("01J00000000000000000000098"),
+            now(),
+            &[arm()],
+        )
+        .expect("successor");
+        let successor = table.current().expect("live").link_id.clone();
+        let mut pipe = super::DaemonPipe::default();
+        on_transport_loss(&mut pipe, &mut table, Some(&old), now());
+        assert_eq!(table.current().expect("still live").link_id, successor);
+    }
+
+    #[test]
+    fn expired_lease_drops_session_and_allows_successor() {
+        let (mut table, link) = admitted();
+        assert!(!lease_expired(link.lease_until, now()));
+        let later = now() + TimeDuration::minutes(11);
+        assert!(lease_expired(link.lease_until, later));
+        let session = LinkSession {
+            link_id: link.link_id,
+            arm_id: link.arm_id,
+            generation: link.generation,
+        };
+        let mut pipe = super::DaemonPipe::default();
+        on_transport_loss(&mut pipe, &mut table, Some(&session), later);
+        assert!(table.current().is_none());
+        admit_attach(
+            &mut table,
+            attach_with("01J00000000000000000000098"),
+            later,
+            &[arm()],
+        )
+        .expect("successor after expiry");
+        assert!(table.current().is_some());
     }
 
     #[test]
