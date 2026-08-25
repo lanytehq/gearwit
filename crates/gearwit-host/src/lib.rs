@@ -4,9 +4,13 @@
 
 mod ack;
 mod admit;
+mod authority;
+pub mod controller;
+pub mod coordinator;
 mod deliver;
 mod link;
 mod paths;
+pub mod persist;
 
 pub use ack::{
     AckRearm, AckStore, HandledServe, apply_handled_request, rearm_from_handled, record_handled,
@@ -14,6 +18,16 @@ pub use ack::{
 pub use admit::{
     AdmittedLink, HISTORY_CAP, KnownArm, LinkSession, LinkTable, admit_attach, drop_session,
 };
+pub use authority::{
+    AdmissionError, AdmissionReceipt, AdmissionResult, AuthorityRecovery, ClaimRequest,
+    DaemonAuthority, DispatchConclusion, DispatchError, DurableOutcome, MintedAttachment,
+    PrepareDispatchError, PreparedDispatch, ReconciliationWork,
+};
+pub use controller::{
+    Controller, ControllerAttachment, ControllerCommand, DispatchDisposition, FakeController,
+    LifecycleObservation, ManagedCapability, ReconciliationDisposition, SignalAction,
+};
+pub use coordinator::{HostCoordinator, PrepareError};
 pub use deliver::{
     DeliveryAttempt, DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result,
     redeliver_pending, send_delivery,
@@ -24,14 +38,18 @@ pub use link::{
     wait_disconnect, waiter_frame_config, write_handled, write_prepared_attach, write_waiter_link,
 };
 pub use paths::{BindError, BoundListener, GearwitPaths, SOCKET_FILE, canonical_root};
+pub use persist::{
+    AdmissionRecord, ClaimError, ClaimOutcome, DurabilityClass, DurableClaim, FakePersist, Persist,
+    RecoverySnapshot, Transition,
+};
 
 #[cfg(test)]
 mod tests {
     use super::{
         AcceptOutcome, AckStore, BindError, DeliveryLedger, GearwitPaths, HISTORY_CAP, KnownArm,
-        LinkError, LinkSession, LinkTable, SOCKET_FILE, admit_attach, drop_session,
-        prepare_delivery, record_delivery_result, redeliver_pending, send_delivery, serve_attach,
-        serve_connection, wait_disconnect,
+        LinkError, LinkSession, LinkTable, ManagedCapability, SOCKET_FILE, admit_attach,
+        drop_session, prepare_delivery, record_delivery_result, redeliver_pending, send_delivery,
+        serve_attach, serve_connection, wait_disconnect,
     };
     use gearwit_protocol::{
         HandledCursor, MAX_PAYLOAD, ProviderEvent, SCHEMA, WaiterLink, decode_handled_payload,
@@ -89,6 +107,7 @@ mod tests {
             generation: 1,
             seat_id: "example-devrev".to_owned(),
             route: "complete_background_tool".to_owned(),
+            capability: ManagedCapability::ManagedTurnStart,
             coverage_until: instant + TimeDuration::minutes(20),
         }
     }
