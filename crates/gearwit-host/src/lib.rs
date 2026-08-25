@@ -21,13 +21,13 @@ pub use admit::{
 pub use authority::{
     AdmissionError, AdmissionReceipt, AdmissionResult, AuthorityRecovery, ClaimRequest,
     DaemonAuthority, DispatchConclusion, DispatchError, DurableOutcome, MintedAttachment,
-    PreparedDispatch, ReconciliationWork,
+    PrepareDispatchError, PreparedDispatch, ReconciliationWork,
 };
 pub use controller::{
     Controller, ControllerAttachment, ControllerCommand, DispatchDisposition, FakeController,
     LifecycleObservation, ManagedCapability, ReconciliationDisposition, SignalAction,
 };
-pub use coordinator::HostCoordinator;
+pub use coordinator::{HostCoordinator, PrepareError};
 pub use deliver::{
     DeliveryAttempt, DeliveryLedger, PendingDelivery, prepare_delivery, record_delivery_result,
     redeliver_pending, send_delivery,

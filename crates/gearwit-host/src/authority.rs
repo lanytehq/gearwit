@@ -162,6 +162,15 @@ impl AdmissionReceipt {
     }
 }
 
+/// Pre-send preparation failure with the receipt retained for retry.
+#[derive(Debug)]
+pub struct PrepareDispatchError {
+    /// The exact admission receipt supplied to the failed preparation.
+    pub receipt: Box<AdmissionReceipt>,
+    /// Why preparation failed before any native controller I/O.
+    pub error: DispatchError,
+}
+
 /// Result of concluding a dispatch after native I/O and observations.
 ///
 /// All fields represent facts that have been durably persisted.
@@ -287,6 +296,8 @@ pub struct DaemonAuthority<P: Persist> {
     handled_cursors: BTreeMap<String, String>,
     /// Whether each arm is re-arming.
     rearm_positions: BTreeMap<String, bool>,
+    /// Admitted attempts recovered before any durable prepare marker.
+    recoverable_attempts: BTreeSet<String>,
 }
 
 impl<P: Persist + Default> Default for DaemonAuthority<P> {
@@ -300,6 +311,7 @@ impl<P: Persist + Default> Default for DaemonAuthority<P> {
             attempt_seq: 0,
             handled_cursors: BTreeMap::new(),
             rearm_positions: BTreeMap::new(),
+            recoverable_attempts: BTreeSet::new(),
         }
     }
 }
@@ -333,6 +345,7 @@ impl<P: Persist> DaemonAuthority<P> {
             attempt_seq: 0,
             handled_cursors: BTreeMap::new(),
             rearm_positions: BTreeMap::new(),
+            recoverable_attempts: BTreeSet::new(),
         }
     }
 
@@ -551,15 +564,16 @@ impl<P: Persist> DaemonAuthority<P> {
                 ClaimError::StorageFailure(msg) => AdmissionError::Storage(msg),
             })?;
 
-        // 4. Replay: no dispatch state, no receipt; restore the burned
-        //    attempt counter slot to the recorded value.
+        // 4. Replay: no dispatch state and no receipt. A replayed older
+        //    record must never lower the live counter or make an attempt id
+        //    reusable.
         if matches!(record.outcome, ClaimOutcome::Replay) {
             if let Some(seq) = record
                 .attempt_id
                 .strip_prefix("attempt-")
                 .and_then(|s| s.parse::<u64>().ok())
             {
-                self.attempt_seq = seq;
+                self.attempt_seq = self.attempt_seq.max(seq);
             }
             return Ok(AdmissionResult {
                 outcome: record.outcome,
@@ -602,16 +616,61 @@ impl<P: Persist> DaemonAuthority<P> {
     ///
     /// # Errors
     ///
-    /// Returns `DispatchError::PreSend` when rehydration, validation,
-    /// or persistence fails. The controller is never called in this
-    /// case.
-    // By-value consumption is deliberate: the receipt is a single-use
-    // admission ticket; a second prepare with the same receipt is
-    // impossible by construction.
+    /// Returns [`PrepareDispatchError`] when rehydration, validation, or
+    /// persistence fails. The controller is never called and the caller
+    /// retains the receipt for a safe retry.
     #[allow(clippy::needless_pass_by_value)]
     pub fn prepare_dispatch(
         &mut self,
         receipt: AdmissionReceipt,
+    ) -> Result<(PreparedDispatch, ControllerCommand), PrepareDispatchError> {
+        match self.prepare_dispatch_inner(&receipt) {
+            Ok(prepared) => {
+                self.recoverable_attempts.remove(receipt.attempt_id());
+                Ok(prepared)
+            }
+            Err(error) => Err(PrepareDispatchError {
+                receipt: Box::new(receipt),
+                error,
+            }),
+        }
+    }
+
+    /// Prepare one attempt discovered during recovery before it was ever
+    /// marked prepared. The authority reconstructs the receipt from its
+    /// durable claim record, so no caller-held receipt is required after a
+    /// daemon crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DispatchError::PreSend` when the attempt was not recovered as
+    /// admitted-but-unprepared or when atomic preparation fails. Failed
+    /// preparation remains recoverable for a later retry.
+    pub fn prepare_recovered(
+        &mut self,
+        attempt_id: &str,
+    ) -> Result<(PreparedDispatch, ControllerCommand), DispatchError> {
+        if !self.recoverable_attempts.contains(attempt_id) {
+            return Err(DispatchError::PreSend(
+                "attempt is not recoverable for preparation".to_owned(),
+            ));
+        }
+        let claim = self
+            .admitted_claims
+            .get(attempt_id)
+            .cloned()
+            .ok_or_else(|| DispatchError::PreSend("no recovered claim for attempt".to_owned()))?;
+        let prepared = self.prepare_dispatch_inner(&AdmissionReceipt {
+            attempt_id: attempt_id.to_owned(),
+            claim,
+        })?;
+        self.recoverable_attempts.remove(attempt_id);
+        Ok(prepared)
+    }
+
+    fn prepare_dispatch_inner(
+        &mut self,
+        receipt: &AdmissionReceipt,
     ) -> Result<(PreparedDispatch, ControllerCommand), DispatchError> {
         // 1. Rehydrate stored claim and stored attachment under authority;
         //    never trust caller-carried dimensions.
@@ -991,6 +1050,17 @@ impl<P: Persist> DaemonAuthority<P> {
                     .map(|(_, attempt_id)| (attempt_id.clone(), c.clone()))
             })
             .collect();
+        let recoverable_attempts: BTreeSet<String> = snapshot
+            .attempt_map
+            .values()
+            .filter(|attempt_id| {
+                !snapshot.prepared_set.contains_key(*attempt_id)
+                    && !snapshot.concluded_set.contains_key(*attempt_id)
+                    && admitted_claims.contains_key(*attempt_id)
+                    && attachments.contains_key(*attempt_id)
+            })
+            .cloned()
+            .collect();
 
         self.arms = arms.clone();
         self.attachments = attachments.clone();
@@ -998,6 +1068,7 @@ impl<P: Persist> DaemonAuthority<P> {
         self.handled_cursors = snapshot.handled_cursors.clone();
         self.rearm_positions = snapshot.rearm_positions.clone();
         self.attempt_seq = snapshot.attempt_seq;
+        self.recoverable_attempts.clone_from(&recoverable_attempts);
 
         Ok(AuthorityRecovery {
             snapshot,
@@ -1005,6 +1076,7 @@ impl<P: Persist> DaemonAuthority<P> {
             attachments,
             handled_cursors: self.handled_cursors.clone(),
             rearm_positions: self.rearm_positions.clone(),
+            recoverable_prepare_attempts: recoverable_attempts.into_iter().collect(),
         })
     }
 }
@@ -1068,6 +1140,8 @@ pub struct AuthorityRecovery {
     pub handled_cursors: BTreeMap<String, String>,
     /// Re-arm positions per arm.
     pub rearm_positions: BTreeMap<String, bool>,
+    /// Admitted attempts recoverable for one authority-owned preparation.
+    pub recoverable_prepare_attempts: Vec<String>,
 }
 
 impl AuthorityRecovery {
@@ -1377,7 +1451,7 @@ mod tests {
             .prepare_dispatch(receipt)
             .expect_err("stale generation must reject prepare");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("stale")),
+            matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("stale")),
             "expected stale-generation rejection, got {err:?}"
         );
     }
@@ -1397,7 +1471,7 @@ mod tests {
             .prepare_dispatch(receipt)
             .expect_err("tampered body must be rejected");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("does not match stored claim")),
+            matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("does not match stored claim")),
             "got {err:?}"
         );
         assert!(
@@ -1417,7 +1491,7 @@ mod tests {
             .prepare_dispatch(receipt)
             .expect_err("binding retarget must be rejected");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("record_prepared")),
+            matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("record_prepared")),
             "got {err:?}"
         );
         assert!(!auth.persist().prepared_set.contains_key(&attempt_id));
@@ -1442,7 +1516,7 @@ mod tests {
             .prepare_dispatch(receipt)
             .expect_err("unparseable route must be rejected");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("capability")),
+            matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("capability")),
             "got {err:?}"
         );
     }
@@ -1481,7 +1555,7 @@ mod tests {
             .prepare_dispatch(second_receipt)
             .expect_err("duplicate prepare");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("record_prepared")),
+            matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("record_prepared")),
             "got {err:?}"
         );
         assert_eq!(
@@ -1503,7 +1577,7 @@ mod tests {
         let err = auth
             .prepare_dispatch(receipt)
             .expect_err("atomic prepare failure");
-        assert!(matches!(err, DispatchError::PreSend(_)));
+        assert!(matches!(err.error, DispatchError::PreSend(_)));
         assert!(!auth.persist().prepared_set.contains_key(&attempt_id));
         assert!(
             !auth
@@ -1521,7 +1595,7 @@ mod tests {
         let err = auth
             .prepare_dispatch(receipt)
             .expect_err("revoked attachment must not prepare");
-        assert!(matches!(&err, DispatchError::PreSend(msg) if msg.contains("revoked")));
+        assert!(matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("revoked")));
 
         // Fresh restart: revocation is reconstructed exactly.
         let mut auth2 = restarted(auth.persist());
@@ -1582,7 +1656,7 @@ mod tests {
             .prepare_dispatch(receipt)
             .expect_err("expired lease must fail");
         assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("lease")),
+            matches!(&err.error, DispatchError::PreSend(msg) if msg.contains("lease")),
             "got {err:?}"
         );
     }
@@ -2053,6 +2127,67 @@ mod tests {
         assert_eq!(admission.attempt_id, "attempt-2");
     }
 
+    #[test]
+    fn replay_interleaves_with_new_generations_without_reusing_attempt_ids() {
+        let mut auth = sample_authority();
+        let mut arm2 = sample_arm();
+        arm2.arm_id = "arm-02".to_owned();
+        arm2.generation = 2;
+        auth.register_arm(arm2)
+            .expect("register generation two arm");
+        let mut arm3 = sample_arm();
+        arm3.arm_id = "arm-03".to_owned();
+        arm3.generation = 3;
+        auth.register_arm(arm3)
+            .expect("register generation three arm");
+        assert_eq!(admitted(&mut auth).0, "attempt-1");
+        let req2 = claim_req("arm-02", "req-2", "sig-2", vec![sample_event("two")]);
+        assert_eq!(
+            auth.admit_claim(&req2).expect("admit second").attempt_id,
+            "attempt-2"
+        );
+        let req3 = claim_req("arm-03", "req-3", "sig-3", vec![sample_event("three")]);
+        assert_eq!(
+            auth.admit_claim(&req3).expect("admit third").attempt_id,
+            "attempt-3"
+        );
+
+        // An old exact replay must not roll attempt_seq back from three to
+        // one, even with live claims at three registered generations.
+        assert_eq!(
+            auth.admit_claim(&std_req())
+                .expect("replay first")
+                .attempt_id,
+            "attempt-1"
+        );
+
+        // The same invariant holds after recovery when another older replay
+        // is interleaved before a fresh generation.
+        let mut recovered = restarted(auth.persist());
+        recovered.recover().expect("recover");
+        assert_eq!(
+            recovered
+                .admit_claim(&req2)
+                .expect("replay second")
+                .attempt_id,
+            "attempt-2"
+        );
+        let mut arm4 = sample_arm();
+        arm4.arm_id = "arm-04".to_owned();
+        arm4.generation = 4;
+        recovered
+            .register_arm(arm4)
+            .expect("register generation four arm");
+        let req4 = claim_req("arm-04", "req-4", "sig-4", vec![sample_event("four")]);
+        assert_eq!(
+            recovered
+                .admit_claim(&req4)
+                .expect("admit fourth")
+                .attempt_id,
+            "attempt-4"
+        );
+    }
+
     // -- Split-phase reconciliation --------------------------------------
 
     fn admit_prepare_ambiguous(auth: &mut DaemonAuthority<FakePersist>) -> String {
@@ -2167,6 +2302,23 @@ mod tests {
                 .derivable_ambiguous_attempts()
                 .contains(&attempt_id),
             "Unknown resolution must stay derivable"
+        );
+
+        // Unknown is provisional: a later probe can atomically resolve the
+        // same attempt, after which recovery no longer derives it.
+        let work = auth2
+            .prepare_reconciliation(&attempt_id)
+            .expect("prepare after unknown");
+        auth2
+            .commit_reconciliation(work, crate::controller::ReconciliationDisposition::Terminal)
+            .expect("terminal resolution after unknown");
+        let mut auth3 = restarted(auth2.persist());
+        let recovery = auth3.recover().expect("recover terminal resolution");
+        assert!(
+            !recovery
+                .derivable_ambiguous_attempts()
+                .contains(&attempt_id),
+            "a terminal upgrade from Unknown must resolve the attempt"
         );
     }
 

@@ -20,7 +20,7 @@ use crate::controller::ReconciliationDisposition;
 use crate::controller::{ControllerCommand, DispatchDisposition, LifecycleObservation};
 use crate::{
     AdmissionError, AdmissionReceipt, AdmissionResult, ClaimRequest, DaemonAuthority,
-    DispatchConclusion, DispatchError, Persist, PreparedDispatch,
+    DispatchConclusion, DispatchError, Persist, PrepareDispatchError, PreparedDispatch,
 };
 
 /// Split-phase host coordinator for the Gearwit dispatch lifecycle.
@@ -32,6 +32,17 @@ pub struct HostCoordinator<P: Persist> {
     authority: DaemonAuthority<P>,
     /// Opaque prepared token from phase 2, consumed in phase 4.
     pending: Option<PreparedDispatch>,
+}
+
+/// Failure while preparing a coordinator dispatch.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// Another dispatch is awaiting conclusion. The authority was not entered,
+    /// so the caller retains the untouched admission receipt for retry.
+    Busy(Box<AdmissionReceipt>),
+    /// The authority rejected preparation before native I/O and returned the
+    /// receipt for retry.
+    Dispatch(Box<PrepareDispatchError>),
 }
 
 impl<P: Persist> HostCoordinator<P> {
@@ -73,13 +84,41 @@ impl<P: Persist> HostCoordinator<P> {
     ///
     /// # Errors
     ///
-    /// Returns `DispatchError::PreSend` when rehydration, validation, or
-    /// persistence fails.
+    /// Returns [`PrepareError::Busy`] with the original receipt when another
+    /// dispatch awaits conclusion. Returns [`PrepareError::Dispatch`] when
+    /// authority rehydration, validation, or persistence fails.
     pub fn prepare(
         &mut self,
         receipt: AdmissionReceipt,
+    ) -> Result<ControllerCommand, PrepareError> {
+        if self.pending.is_some() {
+            return Err(PrepareError::Busy(Box::new(receipt)));
+        }
+        let (prepared, cmd) = self
+            .authority
+            .prepare_dispatch(receipt)
+            .map_err(|error| PrepareError::Dispatch(Box::new(error)))?;
+        self.pending = Some(prepared);
+        Ok(cmd)
+    }
+
+    /// Prepare one admitted-but-unprepared attempt discovered after daemon
+    /// recovery. The authority derives its receipt from durable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DispatchError::PreSend` when the attempt is not recoverable
+    /// or cannot be atomically prepared.
+    pub fn prepare_recovered(
+        &mut self,
+        attempt_id: &str,
     ) -> Result<ControllerCommand, DispatchError> {
-        let (prepared, cmd) = self.authority.prepare_dispatch(receipt)?;
+        if self.pending.is_some() {
+            return Err(DispatchError::PreSend(
+                "prepare called while another dispatch is pending conclusion".to_owned(),
+            ));
+        }
+        let (prepared, cmd) = self.authority.prepare_recovered(attempt_id)?;
         self.pending = Some(prepared);
         Ok(cmd)
     }
@@ -300,6 +339,176 @@ mod tests {
             matches!(&err, DispatchError::PreSend(msg) if msg.contains("no prepared dispatch")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn second_prepare_preserves_receipt_until_pending_dispatch_concludes() {
+        let mut coord = coordinated();
+        let first = coord
+            .admit(&req("req-1", "sig-1", "first"))
+            .expect("admit first");
+        let first_command = coord
+            .prepare(first.into_receipt().expect("receipt"))
+            .expect("prepare first");
+        assert_eq!(first_command.attempt_id(), "attempt-1");
+
+        let mut second_arm = arm();
+        second_arm.arm_id = "arm-02".to_owned();
+        coord
+            .authority_mut()
+            .register_arm(second_arm)
+            .expect("register second arm");
+        let second = coord
+            .admit(&ClaimRequest {
+                arm_id: "arm-02".to_owned(),
+                request_id: "req-2".to_owned(),
+                signal_id: "sig-2".to_owned(),
+                events: vec![sample_event("second")],
+            })
+            .expect("admit second");
+        let second_attempt = second.attempt_id.clone();
+        let err = coord
+            .prepare(second.into_receipt().expect("receipt"))
+            .expect_err("second prepare must not overwrite pending token");
+        let second_receipt = match err {
+            PrepareError::Busy(receipt) => *receipt,
+            PrepareError::Dispatch(err) => panic!("expected busy result, got {err:?}"),
+        };
+        assert!(coord.has_pending());
+        assert!(
+            !coord
+                .authority_mut()
+                .persist()
+                .prepared_set
+                .contains_key(&second_attempt),
+            "the rejected prepare must not record a second prepared marker"
+        );
+
+        // The first work completes, releasing the coordinator slot.
+        let mut first_controller = FakeController::new(vec![DispatchDisposition::Rejected]);
+        let first_disposition = first_command.dispatch(&mut first_controller);
+        coord
+            .conclude(first_disposition, vec![])
+            .expect("conclude first");
+
+        // Retry with the exact returned receipt. It must prepare and dispatch
+        // once rather than stranding the admitted second claim.
+        let second_command = coord.prepare(second_receipt).expect("retry second prepare");
+        assert_eq!(second_command.attempt_id(), second_attempt);
+        let mut second_controller = FakeController::new(vec![DispatchDisposition::Accepted {
+            correlation: "turn-2".to_owned(),
+        }]);
+        let second_disposition = second_command.dispatch(&mut second_controller);
+        coord
+            .conclude(second_disposition, vec![])
+            .expect("conclude second");
+        assert_eq!(second_controller.dispatch_count(), 1);
+
+        // Restart does not create a replacement dispatch grant for the
+        // already consumed second claim.
+        let mut recovered = restarted(coord.authority_mut().persist());
+        recovered.authority_mut().recover().expect("recover");
+        let replay = recovered
+            .admit(&ClaimRequest {
+                arm_id: "arm-02".to_owned(),
+                request_id: "req-2".to_owned(),
+                signal_id: "sig-2".to_owned(),
+                events: vec![sample_event("second")],
+            })
+            .expect("replay second after restart");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert!(replay.into_receipt().is_none());
+    }
+
+    #[test]
+    fn prepare_failure_preserves_receipt_for_retry_and_restart_replay() {
+        let mut coord = coordinated();
+        let admission = coord.admit(&req("req-1", "sig-1", "retry")).expect("admit");
+        let attempt_id = admission.attempt_id.clone();
+        coord.authority_mut().persist_mut().next_prepare_error = Some("write failed".to_owned());
+        let err = coord
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect_err("injected prepare write failure");
+        let receipt = match err {
+            PrepareError::Dispatch(err) => {
+                let err = *err;
+                assert!(matches!(err.error, DispatchError::PreSend(_)));
+                *err.receipt
+            }
+            PrepareError::Busy(_) => panic!("expected authority preparation failure"),
+        };
+        assert_eq!(receipt.attempt_id(), attempt_id);
+        assert!(
+            !coord
+                .authority_mut()
+                .persist()
+                .prepared_set
+                .contains_key(&attempt_id),
+            "failed atomic prepare must not leave a marker"
+        );
+
+        let command = coord.prepare(receipt).expect("retry prepare");
+        let mut controller = FakeController::new(vec![DispatchDisposition::Accepted {
+            correlation: "turn-1".to_owned(),
+        }]);
+        let disposition = command.dispatch(&mut controller);
+        coord.conclude(disposition, vec![]).expect("conclude");
+        assert_eq!(controller.dispatch_count(), 1);
+
+        let mut recovered = restarted(coord.authority_mut().persist());
+        recovered.authority_mut().recover().expect("recover");
+        let replay = recovered
+            .admit(&req("req-1", "sig-1", "retry"))
+            .expect("replay after restart");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert!(replay.into_receipt().is_none());
+    }
+
+    #[test]
+    fn recovery_prepares_unprepared_claim_once_without_a_caller_receipt() {
+        let mut original = coordinated();
+        let admission = original
+            .admit(&req("req-1", "sig-1", "crash before prepare"))
+            .expect("admit");
+        let attempt_id = admission.attempt_id.clone();
+        drop(admission); // Simulate crash: no caller-held receipt survives.
+
+        let mut recovered = restarted(original.authority_mut().persist());
+        let recovery = recovered.authority_mut().recover().expect("recover");
+        assert_eq!(
+            recovery.recoverable_prepare_attempts,
+            vec![attempt_id.clone()]
+        );
+
+        let command = recovered
+            .prepare_recovered(&attempt_id)
+            .expect("recoverable prepare");
+        let mut controller = FakeController::new(vec![DispatchDisposition::Accepted {
+            correlation: "turn-1".to_owned(),
+        }]);
+        let disposition = command.dispatch(&mut controller);
+        recovered.conclude(disposition, vec![]).expect("conclude");
+        assert_eq!(controller.dispatch_count(), 1);
+        assert!(matches!(
+            recovered.prepare_recovered(&attempt_id),
+            Err(DispatchError::PreSend(_))
+        ));
+
+        let mut restarted_again = restarted(recovered.authority_mut().persist());
+        let recovery = restarted_again
+            .authority_mut()
+            .recover()
+            .expect("recover again");
+        assert!(recovery.recoverable_prepare_attempts.is_empty());
+        assert!(matches!(
+            restarted_again.prepare_recovered(&attempt_id),
+            Err(DispatchError::PreSend(_))
+        ));
+        let replay = restarted_again
+            .admit(&req("req-1", "sig-1", "crash before prepare"))
+            .expect("replay after recovered dispatch");
+        assert_eq!(replay.outcome, ClaimOutcome::Replay);
+        assert!(replay.into_receipt().is_none());
     }
 
     #[test]

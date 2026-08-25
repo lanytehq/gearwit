@@ -195,7 +195,7 @@ impl ControllerCommand {
     /// After this call the command is gone — a duplicate dispatch cannot be
     /// assembled from the same command.
     pub fn dispatch(self, controller: &mut dyn Controller) -> DispatchDisposition {
-        controller.dispatch(&self.attachment, &self.action)
+        controller.dispatch(self)
     }
 }
 
@@ -283,12 +283,10 @@ pub enum LifecycleObservation {
 /// - No bearer or credential material is exposed through this port.
 pub trait Controller {
     /// Dispatch a claimed signal batch. The daemon guarantees that the
-    /// claim is durably recorded before calling this.
-    fn dispatch(
-        &mut self,
-        attachment: &ControllerAttachment,
-        action: &SignalAction,
-    ) -> DispatchDisposition;
+    /// claim is durably recorded before calling this. The sealed command is
+    /// consumed by value so a controller cannot be invoked repeatedly with
+    /// borrowed authority components from one admission.
+    fn dispatch(&mut self, command: ControllerCommand) -> DispatchDisposition;
 
     /// Poll for a correlated lifecycle observation from a prior dispatch.
     fn poll_observation(&mut self, attempt_id: &str) -> Option<LifecycleObservation>;
@@ -375,11 +373,7 @@ impl FakeController {
 }
 
 impl Controller for FakeController {
-    fn dispatch(
-        &mut self,
-        _attachment: &ControllerAttachment,
-        _action: &SignalAction,
-    ) -> DispatchDisposition {
+    fn dispatch(&mut self, _command: ControllerCommand) -> DispatchDisposition {
         let disposition = self
             .dispositions
             .get(self.disp_cursor)
@@ -444,8 +438,8 @@ mod tests {
             Some(LifecycleObservation::TurnTerminal("T1".to_owned(), true)),
             None, // no more observations
         ]);
-        controller.dispatch(
-            &ControllerAttachment::new(
+        controller.dispatch(ControllerCommand::new(
+            ControllerAttachment::new(
                 "01J00000000000000000000099".to_owned(),
                 "01J00000000000000000000010".to_owned(),
                 1,
@@ -454,12 +448,13 @@ mod tests {
                 ManagedCapability::ManagedTurnStart,
                 time::macros::datetime!(2026-01-15 12:20:00 UTC),
             ),
-            &SignalAction::new(
+            SignalAction::new(
                 "01J00000000000000000000021".to_owned(),
                 "mattermost".to_owned(),
                 1,
             ),
-        );
+            "01J00000000000000000000099".to_owned(),
+        ));
 
         let obs = controller.poll_observation("01J00000000000000000000099");
         assert_eq!(
@@ -477,7 +472,7 @@ mod tests {
 
     #[test]
     fn command_dispatch_is_single_use() {
-        // The command is consumed by dispatch: constructing the same fake
+        // The port consumes the sealed command: constructing the same fake
         // dispatch outcome twice is impossible without a second command, and
         // commands are not Clone (compile-time property).
         let mut controller = FakeController::new(vec![
@@ -519,7 +514,11 @@ mod tests {
     fn ambiguous_dispatch_then_reconcile() {
         let mut controller = FakeController::new(vec![DispatchDisposition::Ambiguous])
             .with_reconciliation(ReconciliationDisposition::Accepted);
-        let disposition = controller.dispatch(&sample_attachment(), &sample_action());
+        let disposition = controller.dispatch(ControllerCommand::new(
+            sample_attachment(),
+            sample_action(),
+            "01J00000000000000000000099".to_owned(),
+        ));
         assert_eq!(disposition, DispatchDisposition::Ambiguous);
         assert_eq!(
             controller.reconcile("01J00000000000000000000099"),

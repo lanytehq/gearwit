@@ -495,8 +495,10 @@ pub trait Persist {
     /// completed resolution transitions atomically. Fails closed when the
     /// persisted attempt→signal binding is absent or mismatched, when the
     /// attempt has no prior `ReconciliationRequired` transition, or when a
-    /// conflicting resolution is already recorded. Repeating the same
-    /// resolution is idempotent and appends no duplicate transitions.
+    /// conflicting terminal resolution is already recorded. `Unknown` is
+    /// provisional and may be atomically upgraded to a final resolution.
+    /// Repeating the same resolution is idempotent and appends no duplicate
+    /// transitions.
     ///
     /// # Errors
     ///
@@ -645,6 +647,17 @@ impl Persist for FakePersist {
         }
         let attachment = attachment
             .ok_or_else(|| ClaimError::StorageFailure("missing attachment".to_owned()))?;
+        if self
+            .persisted_attachments
+            .contains_key(&attachment.attempt_id)
+            || self.attempt_signals.contains_key(&attachment.attempt_id)
+            || self
+                .claim_attempts
+                .values()
+                .any(|attempt_id| attempt_id == &attachment.attempt_id)
+        {
+            return Err(ClaimError::Conflict);
+        }
         // Atomic admission: store claim, attempt map, attachment, exact
         // attempt→signal binding, verifier ref, and ClaimRecorded together.
         if let Some(seq) = attachment
@@ -901,14 +914,18 @@ impl Persist for FakePersist {
                 "no prior ReconciliationRequired transition for this attempt",
             ));
         }
-        // Idempotent repeat of the same resolution appends no transitions.
+        // Final resolutions are immutable. Unknown is a provisional result
+        // and can be atomically upgraded when a later probe reaches a final
+        // disposition.
         if let Some(existing) = self.reconciliations.get(attempt_id) {
             if *existing == state {
                 return Ok(());
             }
-            return Err(WaiterLinkError::Semantic(
-                "conflicting reconciliation resolution for attempt",
-            ));
+            if !matches!(existing, ReconciliationState::Unknown) {
+                return Err(WaiterLinkError::Semantic(
+                    "conflicting reconciliation resolution for attempt",
+                ));
+            }
         }
 
         // ---- Stage transitions through the shared monotonic validator ----
@@ -1188,6 +1205,19 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_attempt_id_for_new_claim_fails_closed() {
+        let mut persist = FakePersist::default();
+        let first = sample_claim("sig-1", 1, "req-1");
+        admit(&mut persist, &first, "attempt-1");
+        let second = sample_claim("sig-2", 2, "req-2");
+        assert_eq!(
+            persist.admit_claim(&second, Some(&sample_attachment("attempt-1", "sig-2"))),
+            Err(ClaimError::Conflict)
+        );
+        assert!(!persist.claims.contains_key("req-2"));
+    }
+
+    #[test]
     fn duplicate_transition_is_rejected() {
         let mut persist = FakePersist::default();
         assert!(
@@ -1307,6 +1337,39 @@ mod tests {
         assert!(
             persist
                 .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Terminal)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_reconciliation_can_upgrade_once_but_final_conflicts_fail() {
+        let mut persist = FakePersist::default();
+        let claim = sample_claim("sig-1", 1, "req-1");
+        admit(&mut persist, &claim, "attempt-1");
+        persist
+            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
+            .expect("prepare");
+        persist
+            .record_transition("sig-1", "attempt-1", Transition::ReconciliationRequired)
+            .expect("ambiguity");
+        persist
+            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Unknown)
+            .expect("unknown");
+        persist
+            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Terminal)
+            .expect("terminal upgrade");
+        assert_eq!(
+            persist.reconciliations.get("attempt-1"),
+            Some(&ReconciliationState::Terminal)
+        );
+        assert!(
+            persist
+                .get_transitions("sig-1", "attempt-1")
+                .contains(&Transition::ReconciliationResolved)
+        );
+        assert!(
+            persist
+                .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Accepted)
                 .is_err()
         );
     }
