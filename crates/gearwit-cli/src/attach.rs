@@ -272,8 +272,8 @@ mod tests {
         run_attach_session_to,
     };
     use gearwit_host::{
-        DeliveryLedger, GearwitPaths, KnownArm, LinkTable, ManagedCapability, prepare_delivery,
-        read_waiter_link, record_delivery_result, send_delivery, serve_attach,
+        DeliveryLedger, GearwitPaths, KnownArm, LinkTable, prepare_delivery, read_waiter_link,
+        record_delivery_result, send_delivery, serve_attach,
     };
     use gearwit_protocol::{ProviderEvent, SCHEMA, WaiterLink};
     use std::io::{self, Write};
@@ -422,7 +422,6 @@ mod tests {
                 generation: 1,
                 seat_id: "example-devrev".to_owned(),
                 route: "complete_background_tool".to_owned(),
-                capability: ManagedCapability::ManagedTurnStart,
                 coverage_until: instant + time::Duration::minutes(20),
             };
             let mut served = serve_attach(stream, &mut table, instant, &[arm]).expect("attach");
@@ -493,7 +492,6 @@ mod tests {
                 generation: 1,
                 seat_id: "example-devrev".to_owned(),
                 route: "complete_background_tool".to_owned(),
-                capability: ManagedCapability::ManagedTurnStart,
                 coverage_until: instant + time::Duration::minutes(20),
             };
             let mut served = serve_attach(stream, &mut table, instant, &[arm]).expect("attach");
@@ -553,7 +551,6 @@ mod tests {
                 generation: 1,
                 seat_id: "example-devrev".to_owned(),
                 route: "complete_background_tool".to_owned(),
-                capability: ManagedCapability::ManagedTurnStart,
                 coverage_until: instant + time::Duration::milliseconds(30),
             };
             let mut served = serve_attach(stream, &mut table, instant, &[arm]).expect("attach");

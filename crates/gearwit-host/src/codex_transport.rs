@@ -3,7 +3,8 @@
 
 //! Private, bounded stdio transport for one local Codex app-server process.
 
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json, value::RawValue};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -15,6 +16,19 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::authority::{ControllerBirthReservation, QuarantinedBirthReservation};
+use crate::controller::{
+    self, ActiveObservationPrehash, ActiveObservationProof, Controller, ControllerBirthBinding,
+    ControllerCommand, ControllerIdleGuard, ControllerProbeError, ControllerReconcileError,
+    ControllerWriteError, IdleProbeObservation, IdleProbeResult, IdleProbeScope,
+    NativeCoordinateScope, NativeMutationEpoch, NativeTurnFact, NativeWriteDisposition,
+    ObservationScope, PersistedTurnCorrelation, PrivateNativeRef, ReconciliationDisposition,
+    ReconciliationScope, RequestNonce, SecretNativeCoordinate,
+    TerminalClass as ControllerTerminalClass,
+};
+use crate::persist::{NativeWriteEvidence, Persist, PersistError, ThreadOwnershipState};
 
 #[cfg(unix)]
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -24,6 +38,7 @@ use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 
 const VERSION: &str = "codex-cli 0.149.1";
+const DIALECT: &str = "thread/read-v2";
 const CLIENT_NAME: &str = "gearwit";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_VERSION: usize = 1024;
@@ -83,17 +98,19 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Received {
     Initialized,
     ThreadStarted(NativeRef),
+    ThreadResumed(ThreadState),
+    ThreadRead(ThreadState),
     TurnStarted(NativeRef),
     Notification(Notification),
     ServerRequestRejected,
 }
 
 enum Inbound {
-    Response { id: u64, result: Value },
+    Response { id: u64 },
     NativeError(u64),
     Notification(Notification),
     ServerRequest(Value),
@@ -111,6 +128,10 @@ enum Notification {
         turn: NativeRef,
         class: TerminalClass,
     },
+    DegradedTerminal {
+        thread: NativeRef,
+        turn: NativeRef,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +142,7 @@ enum TerminalClass {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct NativeRef(String);
+struct NativeRef(Zeroizing<Vec<u8>>);
 
 impl fmt::Debug for NativeRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -130,33 +151,176 @@ impl fmt::Debug for NativeRef {
 }
 
 impl NativeRef {
-    fn parse(value: &Value) -> Result<Self, Error> {
-        let value = value.as_str().ok_or(Error::Malformed)?;
+    fn parse_borrowed(value: &str) -> Result<Self, Error> {
         (!value.is_empty() && value.len() <= MAX_NATIVE_REF)
-            .then(|| Self(value.to_owned()))
+            .then(|| Self(Zeroizing::new(value.as_bytes().to_vec())))
             .ok_or(Error::Bounds)
     }
+
+    fn from_validated(value: &str) -> Self {
+        debug_assert!(!value.is_empty() && value.len() <= MAX_NATIVE_REF);
+        Self(Zeroizing::new(value.as_bytes().to_vec()))
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("native references are parsed from UTF-8")
+    }
+}
+
+enum ThreadState {
+    Idle,
+    ActiveTurn(ActiveObservationPrehash),
+    Unproven,
+}
+
+impl fmt::Debug for ThreadState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Idle => "Idle",
+            Self::ActiveTurn(_) => "ActiveTurn([redacted proof prehash])",
+            Self::Unproven => "Unproven",
+        })
+    }
+}
+
+impl PartialEq for ThreadState {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Idle, Self::Idle)
+                | (Self::ActiveTurn(_), Self::ActiveTurn(_))
+                | (Self::Unproven, Self::Unproven)
+        )
+    }
+}
+
+impl Eq for ThreadState {}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ThreadToolAttachment {
+    helper: PathBuf,
+    identity: FileIdentity,
+}
+
+impl fmt::Debug for ThreadToolAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ThreadToolAttachment([redacted])")
+    }
+}
+
+impl ThreadToolAttachment {
+    fn at(helper: &Path) -> Result<Self, Error> {
+        let helper = resolve(helper)?;
+        if helper.as_os_str().len() > MAX_NATIVE_REF {
+            return Err(Error::Identity);
+        }
+        let identity = file_identity(&helper)?;
+        Ok(Self { helper, identity })
+    }
+}
+
+fn attached_thread_params(
+    attachment: &ThreadToolAttachment,
+    thread: Option<&NativeRef>,
+) -> Result<Value, Error> {
+    if file_identity(&attachment.helper)? != attachment.identity {
+        return Err(Error::Identity);
+    }
+    let helper = attachment.helper.to_str().ok_or(Error::Identity)?;
+    let mut params = json!({
+        "config": {
+            "mcp_servers": {
+                "gearwit_claimed_batch": {
+                    "command": helper,
+                    "args": []
+                }
+            }
+        }
+    });
+    if let Some(thread) = thread {
+        params
+            .as_object_mut()
+            .expect("attachment params are an object")
+            .insert(
+                "threadId".to_owned(),
+                Value::String(thread.as_str().to_owned()),
+            );
+    }
+    Ok(params)
+}
+
+#[derive(Serialize)]
+struct ClientRequest<'a, T: Serialize> {
+    id: u64,
+    method: &'a str,
+    params: &'a T,
+}
+
+#[derive(Serialize)]
+struct AttachedConfig<'a> {
+    mcp_servers: AttachedServers<'a>,
+}
+
+#[derive(Serialize)]
+struct AttachedServers<'a> {
+    gearwit_claimed_batch: AttachedServer<'a>,
+}
+
+#[derive(Serialize)]
+struct AttachedServer<'a> {
+    command: &'a str,
+    args: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeParams<'a> {
+    thread_id: &'a str,
+    config: AttachedConfig<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadParams<'a> {
+    thread_id: &'a str,
+    include_turns: bool,
+}
+
+#[derive(Serialize)]
+struct TurnInput<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnParams<'a> {
+    thread_id: &'a str,
+    input: [TurnInput<'a>; 1],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestKind {
     Initialize,
     ThreadStart,
+    ThreadResume,
+    ThreadRead,
     TurnStart,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     id: u64,
     kind: RequestKind,
+    thread: Option<NativeRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteReceipt {
-    Queued,
-    WriteAttemptStarted,
-    ZeroBytesRejected,
+    ProvenNotWritten,
     PossiblyWritten,
+    Written,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,18 +329,43 @@ struct WriteFailure {
     receipt: WriteReceipt,
 }
 
-struct FrameBuffer(Vec<u8>);
+fn failed_write_disposition(failure: WriteFailure) -> NativeWriteDisposition {
+    if failure.receipt == WriteReceipt::ProvenNotWritten {
+        NativeWriteDisposition::ProvenNotAccepted
+    } else {
+        NativeWriteDisposition::Unknown
+    }
+}
+
+#[derive(Debug)]
+struct PreparedTurn {
+    id: u64,
+}
+
+struct FrameBuffer(Zeroizing<Vec<u8>>);
 
 impl FrameBuffer {
     fn new() -> Self {
-        Self(Vec::with_capacity(MAX_FRAME))
+        Self(Zeroizing::new(Vec::with_capacity(MAX_FRAME)))
     }
 
-    fn encode(&mut self, value: &Value) -> Result<&[u8], Error> {
+    fn encode<T: Serialize>(&mut self, value: &T) -> Result<&[u8], Error> {
+        self.0.zeroize();
         self.0.clear();
         serde_json::to_writer(&mut *self, value).map_err(|_| Error::Bounds)?;
         self.write_all(b"\n").map_err(|_| Error::Bounds)?;
         Ok(&self.0)
+    }
+
+    fn wipe(&mut self) {
+        self.0.zeroize();
+        self.0.clear();
+    }
+}
+
+impl Drop for FrameBuffer {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -195,11 +384,11 @@ impl Write for FrameBuffer {
 }
 
 struct TransportState {
-    line: Vec<u8>,
+    line: Zeroizing<Vec<u8>>,
     frame: FrameBuffer,
     stdout: usize,
     pending: VecDeque<Pending>,
-    signals: VecDeque<Notification>,
+    notifications: VecDeque<Notification>,
     ambiguous: bool,
     initialized: bool,
     next_id: u64,
@@ -208,11 +397,11 @@ struct TransportState {
 impl TransportState {
     fn new() -> Self {
         Self {
-            line: Vec::with_capacity(MAX_LINE),
+            line: Zeroizing::new(Vec::with_capacity(MAX_LINE)),
             frame: FrameBuffer::new(),
             stdout: 0,
             pending: VecDeque::with_capacity(MAX_PENDING),
-            signals: VecDeque::with_capacity(MAX_QUEUE),
+            notifications: VecDeque::with_capacity(MAX_QUEUE),
             ambiguous: false,
             initialized: false,
             next_id: 2,
@@ -237,32 +426,162 @@ impl TransportState {
         self.pending.push_back(Pending {
             id: 1,
             kind: RequestKind::Initialize,
+            thread: None,
         });
         Ok(())
     }
 
     fn start_thread<W: Write>(&mut self, writer: &mut W) -> Result<(), Error> {
-        self.send_request(writer, RequestKind::ThreadStart, &json!({}))
+        self.send_request(writer, RequestKind::ThreadStart, &json!({}), None)
+    }
+
+    fn start_attached_thread<W: Write>(
+        &mut self,
+        writer: &mut W,
+        attachment: &ThreadToolAttachment,
+    ) -> Result<(), Error> {
+        self.send_request(
+            writer,
+            RequestKind::ThreadStart,
+            &attached_thread_params(attachment, None)?,
+            None,
+        )
+    }
+
+    fn resume_thread<W: Write>(
+        &mut self,
+        writer: &mut W,
+        thread: &NativeRef,
+        attachment: &ThreadToolAttachment,
+    ) -> Result<(), Error> {
+        if file_identity(&attachment.helper)? != attachment.identity {
+            return Err(Error::Identity);
+        }
+        let helper = attachment.helper.to_str().ok_or(Error::Identity)?;
+        self.send_request(
+            writer,
+            RequestKind::ThreadResume,
+            &ResumeParams {
+                thread_id: thread.as_str(),
+                config: AttachedConfig {
+                    mcp_servers: AttachedServers {
+                        gearwit_claimed_batch: AttachedServer {
+                            command: helper,
+                            args: &[],
+                        },
+                    },
+                },
+            },
+            Some(thread.clone()),
+        )
+    }
+
+    fn read_thread<W: Write>(&mut self, writer: &mut W, thread: &NativeRef) -> Result<(), Error> {
+        self.send_request(
+            writer,
+            RequestKind::ThreadRead,
+            &ReadParams {
+                thread_id: thread.as_str(),
+                include_turns: true,
+            },
+            Some(thread.clone()),
+        )
     }
 
     fn start_turn<W: Write>(
         &mut self,
         writer: &mut W,
         thread: &NativeRef,
-        managed_input: &Value,
+        managed_input: &str,
     ) -> Result<(), Error> {
         self.send_request(
             writer,
             RequestKind::TurnStart,
-            &json!({"threadId": thread.0, "input": managed_input}),
+            &TurnParams {
+                thread_id: thread.as_str(),
+                input: [TurnInput {
+                    kind: "text",
+                    text: managed_input,
+                }],
+            },
+            None,
         )
     }
 
-    fn send_request<W: Write>(
+    fn prepare_turn(
+        &mut self,
+        thread: &NativeRef,
+        managed_input: &str,
+    ) -> Result<PreparedTurn, Error> {
+        if self.ambiguous {
+            return Err(Error::Ambiguous);
+        }
+        if !self.initialized {
+            return Err(Error::Preflight);
+        }
+        if !self.pending.is_empty() {
+            return Err(Error::Bounds);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).ok_or(Error::Bounds)?;
+        if let Err(error) = self.frame.encode(&ClientRequest {
+            id,
+            method: "turn/start",
+            params: &TurnParams {
+                thread_id: thread.as_str(),
+                input: [TurnInput {
+                    kind: "text",
+                    text: managed_input,
+                }],
+            },
+        }) {
+            self.frame.wipe();
+            return Err(error);
+        }
+        Ok(PreparedTurn { id })
+    }
+
+    fn discard_prepared_turn(&mut self) {
+        self.frame.wipe();
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Consuming the permit prevents frame redispatch.
+    fn dispatch_prepared_turn<W: Write>(
+        &mut self,
+        writer: &mut W,
+        prepared: PreparedTurn,
+    ) -> Result<WriteReceipt, WriteFailure> {
+        let PreparedTurn { id } = prepared;
+        let result = write_all_until(writer, &self.frame.0, IO_DEADLINE);
+        self.frame.wipe();
+        match &result {
+            Ok(WriteReceipt::Written)
+            | Err(WriteFailure {
+                receipt: WriteReceipt::PossiblyWritten,
+                ..
+            }) => {
+                self.ambiguous = result.is_err();
+                self.pending.push_back(Pending {
+                    id,
+                    kind: RequestKind::TurnStart,
+                    thread: None,
+                });
+            }
+            Ok(WriteReceipt::ProvenNotWritten | WriteReceipt::PossiblyWritten)
+            | Err(WriteFailure {
+                receipt: WriteReceipt::ProvenNotWritten | WriteReceipt::Written,
+                ..
+            }) => {}
+        }
+        result
+    }
+
+    fn send_request<W: Write, T: Serialize>(
         &mut self,
         writer: &mut W,
         kind: RequestKind,
-        params: &Value,
+        params: &T,
+        thread: Option<NativeRef>,
     ) -> Result<(), Error> {
         if self.ambiguous {
             return Err(Error::Ambiguous);
@@ -278,13 +597,12 @@ impl TransportState {
         let method = match kind {
             RequestKind::Initialize => return Err(Error::Unsupported),
             RequestKind::ThreadStart => "thread/start",
+            RequestKind::ThreadResume => "thread/resume",
+            RequestKind::ThreadRead => "thread/read",
             RequestKind::TurnStart => "turn/start",
         };
-        self.send(
-            writer,
-            &json!({"id": id, "method": method, "params": params}),
-        )?;
-        self.pending.push_back(Pending { id, kind });
+        self.send(writer, &ClientRequest { id, method, params })?;
+        self.pending.push_back(Pending { id, kind, thread });
         Ok(())
     }
 
@@ -302,84 +620,105 @@ impl TransportState {
         writer: &mut W,
         deadline: Duration,
     ) -> Result<Received, Error> {
-        let consumed = match read_line_until(reader, &mut self.line, deadline) {
-            Ok(consumed) => consumed,
-            Err(error) if !self.pending.is_empty() => {
-                self.ambiguous = true;
-                let _ = error;
-                return Err(Error::Ambiguous);
+        if self.pending.is_empty()
+            && let Some(notification) = self.notifications.pop_front()
+        {
+            return Ok(Received::Notification(notification));
+        }
+        let until = Instant::now() + deadline;
+        loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            let consumed = match read_line_until(reader, &mut self.line, remaining) {
+                Ok(consumed) => consumed,
+                Err(error) if !self.pending.is_empty() => {
+                    self.ambiguous = true;
+                    let _ = error;
+                    return Err(Error::Ambiguous);
+                }
+                Err(error) => return Err(error),
+            };
+            self.stdout = self
+                .stdout
+                .checked_add(consumed)
+                .filter(|total| *total <= MAX_STDOUT)
+                .ok_or(Error::Bounds)?;
+            let inbound = match classify(&self.line) {
+                Ok(inbound) => inbound,
+                Err(error) if !self.pending.is_empty() => {
+                    self.ambiguous = true;
+                    self.line.zeroize();
+                    self.line.clear();
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.line.zeroize();
+                    self.line.clear();
+                    return Err(error);
+                }
+            };
+            let outcome = self.handle_inbound(writer, inbound);
+            self.line.zeroize();
+            self.line.clear();
+            match outcome {
+                Ok(Some(received)) => return Ok(received),
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        };
-        self.stdout = self
-            .stdout
-            .checked_add(consumed)
-            .filter(|total| *total <= MAX_STDOUT)
-            .ok_or(Error::Bounds)?;
-        let inbound = match classify(&self.line) {
-            Ok(inbound) => inbound,
-            Err(error) if !self.pending.is_empty() => {
-                self.ambiguous = true;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+        }
+    }
+
+    fn handle_inbound<W: Write>(
+        &mut self,
+        writer: &mut W,
+        inbound: Inbound,
+    ) -> Result<Option<Received>, Error> {
         match inbound {
-            Inbound::Response { id, result } => {
-                let Some(pending) = self.pending.front().copied() else {
+            Inbound::Response { id } => {
+                let Some(pending) = self.pending.front().cloned() else {
                     return Err(Error::Correlation);
                 };
-                if pending.id != id {
-                    if !self.pending.is_empty() {
-                        self.ambiguous = true;
-                    }
-                    return Err(Error::Correlation);
-                }
-                let received = match pending.kind {
-                    RequestKind::Initialize => {
-                        self.ambiguous = false;
+                if pending.id == id {
+                    let received = match parse_response(&self.line, &pending) {
+                        Ok(received) => received,
+                        Err(error) => {
+                            self.ambiguous = true;
+                            return Err(error);
+                        }
+                    };
+                    self.ambiguous = false;
+                    if matches!(received, Received::Initialized) {
                         self.send(writer, &json!({"method": "initialized", "params": {}}))?;
                         self.initialized = true;
-                        Received::Initialized
                     }
-                    RequestKind::ThreadStart => parse_result_ref(&result, "thread")
-                        .map(Received::ThreadStarted)
-                        .inspect_err(|_| {
-                            self.ambiguous = true;
-                        })?,
-                    RequestKind::TurnStart => parse_result_ref(&result, "turn")
-                        .map(Received::TurnStarted)
-                        .inspect_err(|_| {
-                            self.ambiguous = true;
-                        })?,
-                };
-                self.ambiguous = false;
-                self.pending.pop_front();
-                Ok(received)
+                    self.pending.pop_front();
+                    Ok(Some(received))
+                } else {
+                    self.ambiguous |= !self.pending.is_empty();
+                    Err(Error::Correlation)
+                }
             }
             Inbound::NativeError(id) => {
-                if self.pending.front().map(|pending| pending.id) != Some(id) {
-                    if !self.pending.is_empty() {
-                        self.ambiguous = true;
-                    }
-                    return Err(Error::Correlation);
+                if self.pending.front().map(|pending| pending.id) == Some(id) {
+                    self.ambiguous = false;
+                    self.pending.pop_front();
+                    Err(Error::Native)
+                } else {
+                    self.ambiguous |= !self.pending.is_empty();
+                    Err(Error::Correlation)
                 }
-                self.ambiguous = false;
-                self.pending.pop_front();
-                Err(Error::Native)
             }
             Inbound::Notification(notification) => {
                 if !self.initialized {
-                    if !self.pending.is_empty() {
-                        self.ambiguous = true;
-                    }
-                    return Err(Error::Correlation);
+                    self.ambiguous |= !self.pending.is_empty();
+                    Err(Error::Correlation)
+                } else if self.pending.is_empty() {
+                    Ok(Some(Received::Notification(notification)))
+                } else if self.notifications.len() == MAX_QUEUE {
+                    Err(Error::Degraded)
+                } else {
+                    self.notifications.push_back(notification);
+                    Ok(None)
                 }
-                if self.signals.len() == MAX_QUEUE {
-                    return Err(Error::Degraded);
-                }
-                self.signals.push_back(notification.clone());
-                Ok(Received::Notification(notification))
             }
             Inbound::ServerRequest(id) => {
                 self.send(
@@ -389,22 +728,26 @@ impl TransportState {
                         "error": {"code": -32601, "message": "server requests unsupported"}
                     }),
                 )?;
-                Ok(Received::ServerRequestRejected)
+                Ok(self
+                    .pending
+                    .is_empty()
+                    .then_some(Received::ServerRequestRejected))
             }
         }
     }
 
-    fn send<W: Write>(&mut self, writer: &mut W, value: &Value) -> Result<WriteReceipt, Error> {
+    fn send<W: Write, T: Serialize>(
+        &mut self,
+        writer: &mut W,
+        value: &T,
+    ) -> Result<WriteReceipt, Error> {
         if self.ambiguous {
             return Err(Error::Ambiguous);
         }
         match self.write(writer, value) {
             Ok(receipt) => Ok(receipt),
             Err(failure) => {
-                if matches!(
-                    failure.receipt,
-                    WriteReceipt::WriteAttemptStarted | WriteReceipt::PossiblyWritten
-                ) {
+                if matches!(failure.receipt, WriteReceipt::PossiblyWritten) {
                     self.ambiguous = true;
                     Err(Error::Ambiguous)
                 } else {
@@ -414,32 +757,24 @@ impl TransportState {
         }
     }
 
-    fn write<W: Write>(
+    fn write<W: Write, T: Serialize>(
         &mut self,
         writer: &mut W,
-        value: &Value,
+        value: &T,
     ) -> Result<WriteReceipt, WriteFailure> {
-        let receipt = WriteReceipt::Queued;
         let frame = self.frame.encode(value).map_err(|error| WriteFailure {
             error,
-            receipt: WriteReceipt::ZeroBytesRejected,
+            receipt: WriteReceipt::ProvenNotWritten,
         })?;
-        debug_assert_eq!(receipt, WriteReceipt::Queued);
-        let receipt = WriteReceipt::WriteAttemptStarted;
         let result = write_all_until(writer, frame, IO_DEADLINE);
-        if result.is_err() {
-            debug_assert_eq!(receipt, WriteReceipt::WriteAttemptStarted);
-            return Err(WriteFailure {
-                error: Error::Ambiguous,
-                receipt: WriteReceipt::PossiblyWritten,
-            });
-        }
-        let _ = receipt;
-        Ok(WriteReceipt::PossiblyWritten)
+        self.frame.wipe();
+        result
     }
+}
 
-    fn take_signal(&mut self) -> Option<Notification> {
-        self.signals.pop_front()
+impl Drop for TransportState {
+    fn drop(&mut self) {
+        self.line.zeroize();
     }
 }
 
@@ -452,6 +787,7 @@ fn read_line_until<R: Read>(
     line: &mut Vec<u8>,
     deadline: Duration,
 ) -> Result<usize, Error> {
+    line.zeroize();
     line.clear();
     let mut consumed = 0;
     let mut byte = [0_u8; 1];
@@ -481,113 +817,332 @@ fn write_all_until<W: Write>(
     writer: &mut W,
     mut frame: &[u8],
     deadline: Duration,
-) -> Result<(), Error> {
+) -> Result<WriteReceipt, WriteFailure> {
     let until = Instant::now() + deadline;
+    let mut wrote_bytes = false;
     while !frame.is_empty() {
         match writer.write(frame) {
-            Ok(0) => return Err(Error::Ambiguous),
-            Ok(written) => frame = &frame[written..],
+            Ok(0) => {
+                return Err(WriteFailure {
+                    error: Error::Ambiguous,
+                    receipt: if wrote_bytes {
+                        WriteReceipt::PossiblyWritten
+                    } else {
+                        WriteReceipt::ProvenNotWritten
+                    },
+                });
+            }
+            Ok(written) => {
+                wrote_bytes = true;
+                frame = &frame[written..];
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= until {
-                    return Err(Error::Deadline);
+                    return Err(WriteFailure {
+                        error: Error::Deadline,
+                        receipt: if wrote_bytes {
+                            WriteReceipt::PossiblyWritten
+                        } else {
+                            WriteReceipt::ProvenNotWritten
+                        },
+                    });
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return Err(Error::Ambiguous),
+            Err(_) => {
+                return Err(WriteFailure {
+                    error: Error::Closed,
+                    receipt: if wrote_bytes {
+                        WriteReceipt::PossiblyWritten
+                    } else {
+                        WriteReceipt::ProvenNotWritten
+                    },
+                });
+            }
         }
     }
     loop {
         match writer.flush() {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(WriteReceipt::Written),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= until {
-                    return Err(Error::Deadline);
+                    return Err(WriteFailure {
+                        error: Error::Deadline,
+                        receipt: WriteReceipt::PossiblyWritten,
+                    });
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return Err(Error::Ambiguous),
+            Err(_) => {
+                return Err(WriteFailure {
+                    error: Error::Ambiguous,
+                    receipt: WriteReceipt::PossiblyWritten,
+                });
+            }
         }
     }
 }
 
+#[derive(Deserialize)]
+struct BorrowedEnvelope<'a> {
+    #[serde(borrow)]
+    id: Option<&'a RawValue>,
+    #[serde(borrow)]
+    method: Option<&'a str>,
+    #[serde(borrow)]
+    result: Option<&'a RawValue>,
+    #[serde(borrow)]
+    error: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedId<'a> {
+    #[serde(borrow)]
+    id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct BorrowedThreadRefResult<'a> {
+    #[serde(borrow)]
+    thread: BorrowedId<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedTurnRefResult<'a> {
+    #[serde(borrow)]
+    turn: BorrowedId<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedThreadResult<'a> {
+    #[serde(borrow)]
+    thread: BorrowedThread<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedThread<'a> {
+    #[serde(borrow)]
+    id: &'a str,
+    #[serde(borrow)]
+    status: Option<BorrowedThreadStatus<'a>>,
+    #[serde(borrow)]
+    turns: Option<Vec<BorrowedTurn<'a>>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedThreadStatus<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    #[serde(rename = "activeFlags", borrow)]
+    active_flags: Option<Vec<&'a str>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedTurn<'a> {
+    #[serde(borrow)]
+    id: Option<&'a str>,
+    #[serde(borrow)]
+    status: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedNotification<'a> {
+    #[serde(borrow)]
+    method: &'a str,
+    #[serde(borrow)]
+    params: BorrowedNotificationParams<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedNotificationParams<'a> {
+    #[serde(rename = "threadId", borrow)]
+    thread_id: &'a str,
+    #[serde(borrow)]
+    turn: BorrowedTurn<'a>,
+}
+
+fn raw_object(value: &RawValue) -> bool {
+    value.get().trim_start().starts_with('{')
+}
+
 fn classify(line: &[u8]) -> Result<Inbound, Error> {
-    let value: Value = serde_json::from_slice(line).map_err(|_| Error::Malformed)?;
-    let object = value.as_object().ok_or(Error::Malformed)?;
-    if object.contains_key("method") {
-        return Ok(match object.get("id") {
-            Some(id) => Inbound::ServerRequest(id.clone()),
-            None => Inbound::Notification(classify_notification(object)?),
-        });
+    let envelope: BorrowedEnvelope<'_> =
+        serde_json::from_slice(line).map_err(|_| Error::Malformed)?;
+    if let Some(method) = envelope.method {
+        return if let Some(id) = envelope.id {
+            let id = serde_json::from_str(id.get()).map_err(|_| Error::Malformed)?;
+            Ok(Inbound::ServerRequest(id))
+        } else {
+            classify_notification(line, method).map(Inbound::Notification)
+        };
     }
-    let id = object
-        .get("id")
-        .and_then(Value::as_u64)
+    let id = envelope
+        .id
+        .and_then(|id| serde_json::from_str::<u64>(id.get()).ok())
         .filter(|id| *id > 0)
         .ok_or(Error::Malformed)?;
-    if object.get("result").is_some_and(Value::is_object) {
-        return Ok(Inbound::Response {
-            id,
-            result: object.get("result").cloned().ok_or(Error::Malformed)?,
-        });
+    if envelope.result.is_some_and(raw_object) {
+        return Ok(Inbound::Response { id });
     }
-    object
-        .get("error")
-        .filter(|error| error.is_object())
+    envelope
+        .error
+        .filter(|error| raw_object(error))
         .map(|_| Inbound::NativeError(id))
         .ok_or(Error::Malformed)
 }
 
-fn parse_result_ref(result: &Value, field: &str) -> Result<NativeRef, Error> {
-    result
-        .get(field)
-        .and_then(|value| value.get("id"))
-        .ok_or(Error::Malformed)
-        .and_then(NativeRef::parse)
+fn parse_response(line: &[u8], pending: &Pending) -> Result<Received, Error> {
+    let envelope: BorrowedEnvelope<'_> =
+        serde_json::from_slice(line).map_err(|_| Error::Malformed)?;
+    let result = envelope.result.ok_or(Error::Malformed)?;
+    let received = match pending.kind {
+        RequestKind::Initialize => Received::Initialized,
+        RequestKind::ThreadStart => {
+            let result: BorrowedThreadRefResult<'_> =
+                serde_json::from_str(result.get()).map_err(|_| Error::Malformed)?;
+            Received::ThreadStarted(NativeRef::parse_borrowed(result.thread.id)?)
+        }
+        RequestKind::ThreadResume | RequestKind::ThreadRead => {
+            let requested = pending.thread.as_ref().ok_or(Error::Correlation)?;
+            let state = parse_thread_state_raw(result, requested)?;
+            if pending.kind == RequestKind::ThreadResume {
+                Received::ThreadResumed(state)
+            } else {
+                Received::ThreadRead(state)
+            }
+        }
+        RequestKind::TurnStart => {
+            let result: BorrowedTurnRefResult<'_> =
+                serde_json::from_str(result.get()).map_err(|_| Error::Malformed)?;
+            Received::TurnStarted(NativeRef::parse_borrowed(result.turn.id)?)
+        }
+    };
+    Ok(received)
 }
 
-fn classify_notification(object: &serde_json::Map<String, Value>) -> Result<Notification, Error> {
-    let method = object.get("method").and_then(Value::as_str);
-    match method {
-        Some("turn/started") => {
-            let params = object.get("params").ok_or(Error::Malformed)?;
-            Ok(Notification::TurnStarted {
-                thread: params
-                    .get("threadId")
-                    .ok_or(Error::Malformed)
-                    .and_then(NativeRef::parse)?,
-                turn: params
-                    .get("turn")
-                    .and_then(|turn| turn.get("id"))
-                    .ok_or(Error::Malformed)
-                    .and_then(NativeRef::parse)?,
-            })
-        }
-        Some("turn/completed") => {
-            let params = object.get("params").ok_or(Error::Malformed)?;
-            let thread = params
-                .get("threadId")
-                .ok_or(Error::Malformed)
-                .and_then(NativeRef::parse)?;
-            let turn = params.get("turn").ok_or(Error::Malformed)?;
-            let turn_ref = turn
-                .get("id")
-                .ok_or(Error::Malformed)
-                .and_then(NativeRef::parse)?;
-            let class = match turn.get("status").and_then(Value::as_str) {
-                Some("completed") => TerminalClass::Succeeded,
-                Some("interrupted") => TerminalClass::Interrupted,
-                Some("failed") => TerminalClass::Failed,
-                _ => return Err(Error::InconsistentTerminal),
-            };
-            Ok(Notification::Terminal {
-                thread,
-                turn: turn_ref,
-                class,
-            })
-        }
-        Some(_) => Ok(Notification::Signal),
-        None => Err(Error::Malformed),
+fn parse_thread_state_raw(result: &RawValue, requested: &NativeRef) -> Result<ThreadState, Error> {
+    let result: BorrowedThreadResult<'_> =
+        serde_json::from_str(result.get()).map_err(|_| Error::Malformed)?;
+    let returned = NativeRef::parse_borrowed(result.thread.id)?;
+    if &returned != requested {
+        return Err(Error::Correlation);
     }
+    let Some(status) = result.thread.status.as_ref() else {
+        return Ok(ThreadState::Unproven);
+    };
+    match status.kind {
+        "idle" => Ok(parse_idle_thread(&result.thread)),
+        "active" => {
+            let Some(active_flags) = status.active_flags.as_deref() else {
+                return Ok(ThreadState::Unproven);
+            };
+            let Some(active_turn) = parse_active_thread(&result.thread, active_flags) else {
+                return Ok(ThreadState::Unproven);
+            };
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"gearwit.codex-exact-active.v1\0");
+            hash_field(&mut hasher, requested.as_str().as_bytes());
+            hash_field(&mut hasher, returned.as_str().as_bytes());
+            hash_field(&mut hasher, status.kind.as_bytes());
+            for flag in active_flags {
+                hash_field(&mut hasher, flag.as_bytes());
+            }
+            for turn in result.thread.turns.as_deref().unwrap_or_default() {
+                hash_field(
+                    &mut hasher,
+                    turn.id.expect("validated active id").as_bytes(),
+                );
+                hash_field(
+                    &mut hasher,
+                    turn.status.expect("validated active status").as_bytes(),
+                );
+            }
+            hash_field(&mut hasher, b"exactly-one-active-turn");
+            hash_field(&mut hasher, active_turn.as_bytes());
+            hash_field(&mut hasher, VERSION.as_bytes());
+            hash_field(&mut hasher, DIALECT.as_bytes());
+            Ok(ThreadState::ActiveTurn(ActiveObservationPrehash::new(
+                *hasher.finalize().as_bytes(),
+            )))
+        }
+        _ => Ok(ThreadState::Unproven),
+    }
+}
+
+#[cfg(test)]
+fn parse_thread_state(result: &Value, requested: &NativeRef) -> Result<ThreadState, Error> {
+    let encoded = serde_json::to_string(result).map_err(|_| Error::Malformed)?;
+    let raw = RawValue::from_string(encoded).map_err(|_| Error::Malformed)?;
+    parse_thread_state_raw(&raw, requested)
+}
+
+fn parse_idle_thread(thread: &BorrowedThread<'_>) -> ThreadState {
+    let Some(turns) = thread.turns.as_deref() else {
+        return ThreadState::Unproven;
+    };
+    if turns.len() > MAX_QUEUE
+        || turns.iter().any(|turn| {
+            turn.id
+                .and_then(|id| NativeRef::parse_borrowed(id).ok())
+                .is_none()
+                || !matches!(turn.status, Some("completed" | "interrupted" | "failed"))
+        })
+    {
+        ThreadState::Unproven
+    } else {
+        ThreadState::Idle
+    }
+}
+
+fn parse_active_thread<'a>(
+    thread: &'a BorrowedThread<'a>,
+    active_flags: &[&str],
+) -> Option<&'a str> {
+    if active_flags
+        .iter()
+        .any(|flag| !matches!(*flag, "waitingOnApproval" | "waitingOnUserInput"))
+    {
+        return None;
+    }
+    let turns = thread.turns.as_deref()?;
+    if turns.len() > MAX_QUEUE {
+        return None;
+    }
+    let mut active = None;
+    for turn in turns {
+        let id = turn.id?;
+        NativeRef::parse_borrowed(id).ok()?;
+        match turn.status {
+            Some("completed" | "interrupted" | "failed") => {}
+            Some("inProgress") if active.is_none() => active = Some(id),
+            _ => return None,
+        }
+    }
+    active
+}
+
+fn classify_notification(line: &[u8], method: &str) -> Result<Notification, Error> {
+    if !matches!(method, "turn/started" | "turn/completed") {
+        return Ok(Notification::Signal);
+    }
+    let notification: BorrowedNotification<'_> =
+        serde_json::from_slice(line).map_err(|_| Error::Malformed)?;
+    let thread = NativeRef::parse_borrowed(notification.params.thread_id)?;
+    let turn = NativeRef::parse_borrowed(notification.params.turn.id.ok_or(Error::Malformed)?)?;
+    if notification.method == "turn/started" {
+        return Ok(Notification::TurnStarted { thread, turn });
+    }
+    let class = match notification.params.turn.status {
+        Some("completed") => TerminalClass::Succeeded,
+        Some("interrupted") => TerminalClass::Interrupted,
+        Some("failed") => TerminalClass::Failed,
+        _ => return Ok(Notification::DegradedTerminal { thread, turn }),
+    };
+    Ok(Notification::Terminal {
+        thread,
+        turn,
+        class,
+    })
 }
 
 fn parse_version<R: Read>(reader: &mut R) -> Result<(), Error> {
@@ -1060,13 +1615,17 @@ impl CodexTransport {
     }
 
     fn receive(&mut self) -> Result<Received, Error> {
+        self.receive_until(IO_DEADLINE)
+    }
+
+    fn receive_until(&mut self, deadline: Duration) -> Result<Received, Error> {
         if self.stderr.as_ref().is_some_and(|stderr| {
             stderr.overflow.load(Ordering::Relaxed) || stderr.failed.load(Ordering::Relaxed)
         }) {
             return Err(Error::Bounds);
         }
         let input = self.input.as_mut().ok_or(Error::Closed)?;
-        self.state.next(&mut self.output, input)
+        self.state.next_until(&mut self.output, input, deadline)
     }
 
     fn start_thread(&mut self) -> Result<(), Error> {
@@ -1075,10 +1634,44 @@ impl CodexTransport {
         self.state.start_thread(input)
     }
 
-    fn start_turn(&mut self, thread: &NativeRef, managed_input: &Value) -> Result<(), Error> {
+    fn start_attached_thread(&mut self, attachment: &ThreadToolAttachment) -> Result<(), Error> {
+        self.ensure_child_live()?;
+        let input = self.input.as_mut().ok_or(Error::Closed)?;
+        self.state.start_attached_thread(input, attachment)
+    }
+
+    fn resume_thread(
+        &mut self,
+        thread: &NativeRef,
+        attachment: &ThreadToolAttachment,
+    ) -> Result<(), Error> {
+        self.ensure_child_live()?;
+        let input = self.input.as_mut().ok_or(Error::Closed)?;
+        self.state.resume_thread(input, thread, attachment)
+    }
+
+    fn read_thread(&mut self, thread: &NativeRef) -> Result<(), Error> {
+        self.ensure_child_live()?;
+        let input = self.input.as_mut().ok_or(Error::Closed)?;
+        self.state.read_thread(input, thread)
+    }
+
+    fn start_turn(&mut self, thread: &NativeRef, managed_input: &str) -> Result<(), Error> {
         self.ensure_child_live()?;
         let input = self.input.as_mut().ok_or(Error::Closed)?;
         self.state.start_turn(input, thread, managed_input)
+    }
+
+    fn prepare_turn_frame(
+        &mut self,
+        thread: &NativeRef,
+        managed_input: &str,
+    ) -> Result<PreparedTurn, Error> {
+        self.ensure_child_live()?;
+        if self.input.is_none() {
+            return Err(Error::Closed);
+        }
+        self.state.prepare_turn(thread, managed_input)
     }
 
     fn ensure_child_live(&mut self) -> Result<(), Error> {
@@ -1086,10 +1679,6 @@ impl CodexTransport {
             Some(_) => Err(Error::Closed),
             None => Ok(()),
         }
-    }
-
-    fn take_notification(&mut self) -> Option<Notification> {
-        self.state.take_signal()
     }
 
     fn cleanup(&mut self) -> Result<(), Error> {
@@ -1117,9 +1706,819 @@ impl Drop for CodexTransport {
     }
 }
 
+pub(crate) enum CodexCreateOutcome<P: Persist> {
+    Owned {
+        reservation: ControllerBirthReservation,
+        controller: Box<CodexController<P>>,
+    },
+    ProvenNotAccepted {
+        reservation: ControllerBirthReservation,
+        persist: P,
+    },
+    Unknown {
+        reservation: ControllerBirthReservation,
+        quarantine: Box<QuarantinedCreate<P>>,
+    },
+    NotReserved {
+        reservation: ControllerBirthReservation,
+        persist: P,
+    },
+}
+
+enum QuarantinedCreateState {
+    Pending,
+    ExactThread(NativeRef),
+}
+
+pub(crate) struct QuarantinedCreate<P: Persist> {
+    persist: P,
+    transport: CodexTransport,
+    attachment: ThreadToolAttachment,
+    birth: ControllerBirthBinding,
+    create_attempt_id: RequestNonce,
+    state: QuarantinedCreateState,
+}
+
+pub(crate) enum LateCreateOutcome<P: Persist> {
+    Owned {
+        reservation: QuarantinedBirthReservation,
+        controller: Box<CodexController<P>>,
+    },
+    ProvenNotAccepted {
+        reservation: QuarantinedBirthReservation,
+        persist: P,
+    },
+    StillUnknown {
+        reservation: QuarantinedBirthReservation,
+        quarantine: Box<QuarantinedCreate<P>>,
+    },
+}
+
+pub(crate) struct CodexController<P: Persist> {
+    persist: P,
+    transport: CodexTransport,
+    attachment: ThreadToolAttachment,
+    birth: ControllerBirthBinding,
+    create_attempt_id: RequestNonce,
+    thread_ref: PrivateNativeRef,
+    epoch: u64,
+    lane_probe: Option<RequestNonce>,
+    started_turn: Option<PrivateNativeRef>,
+    pending_terminal: Option<(PrivateNativeRef, TerminalClass)>,
+    reconciling: Option<PersistedTurnCorrelation>,
+    terminal: bool,
+    lost_reported: bool,
+    degraded_reported: bool,
+    #[cfg(test)]
+    final_check_injection: FinalCheckInjection,
+}
+
+#[cfg(test)]
+enum FinalCheckInjection {
+    None,
+    Mutation,
+    At(time::OffsetDateTime),
+}
+
+impl<P: Persist> QuarantinedCreate<P> {
+    pub(crate) fn receive_late(
+        mut self,
+        reservation: QuarantinedBirthReservation,
+    ) -> LateCreateOutcome<P> {
+        let (birth_id, create_attempt_id) = reservation.binding();
+        if birth_id != &self.birth.birth_id
+            || create_attempt_id != &self.create_attempt_id
+            || self
+                .persist
+                .thread_ownership_state(&self.birth.birth_id)
+                .ok()
+                != Some(ThreadOwnershipState::Unknown {
+                    create_attempt_id: self.create_attempt_id.clone(),
+                })
+        {
+            return LateCreateOutcome::StillUnknown {
+                reservation,
+                quarantine: Box::new(self),
+            };
+        }
+        let thread = match std::mem::replace(&mut self.state, QuarantinedCreateState::Pending) {
+            QuarantinedCreateState::ExactThread(thread) => thread,
+            QuarantinedCreateState::Pending => match self.transport.receive() {
+                Ok(Received::ThreadStarted(thread)) => thread,
+                Err(Error::Native) => {
+                    return LateCreateOutcome::ProvenNotAccepted {
+                        reservation,
+                        persist: self.persist,
+                    };
+                }
+                _ => {
+                    return LateCreateOutcome::StillUnknown {
+                        reservation,
+                        quarantine: Box::new(self),
+                    };
+                }
+            },
+        };
+        let scope = NativeCoordinateScope::Thread {
+            birth_id: self.birth.birth_id.clone(),
+            create_attempt_id: self.create_attempt_id.clone(),
+        };
+        let Ok(secret) = SecretNativeCoordinate::thread(thread.as_str()) else {
+            self.state = QuarantinedCreateState::ExactThread(thread);
+            return LateCreateOutcome::StillUnknown {
+                reservation,
+                quarantine: Box::new(self),
+            };
+        };
+        let Ok(thread_ref) = self.persist.seal_native_coordinate(&scope, &secret) else {
+            drop(secret);
+            self.state = QuarantinedCreateState::ExactThread(thread);
+            return LateCreateOutcome::StillUnknown {
+                reservation,
+                quarantine: Box::new(self),
+            };
+        };
+        LateCreateOutcome::Owned {
+            reservation,
+            controller: Box::new(CodexController::from_owned_parts(
+                self.persist,
+                self.transport,
+                self.attachment,
+                self.birth,
+                self.create_attempt_id,
+                thread_ref,
+            )),
+        }
+    }
+}
+
+impl<P: Persist> fmt::Debug for CodexController<P> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CodexController([redacted owned binding])")
+    }
+}
+
+impl<P: Persist> CodexController<P> {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn create_owned(
+        mut persist: P,
+        executable: &Path,
+        helper: &Path,
+        reservation: ControllerBirthReservation,
+    ) -> CodexCreateOutcome<P> {
+        let (birth, create_attempt_id) = reservation.binding();
+        let (birth, create_attempt_id) = (birth.clone(), create_attempt_id.clone());
+        if persist.thread_ownership_state(&birth.birth_id).ok()
+            != Some(ThreadOwnershipState::Reserved {
+                create_attempt_id: create_attempt_id.clone(),
+            })
+        {
+            return CodexCreateOutcome::NotReserved {
+                reservation,
+                persist,
+            };
+        }
+        let Ok(attachment) = ThreadToolAttachment::at(helper) else {
+            return CodexCreateOutcome::ProvenNotAccepted {
+                reservation,
+                persist,
+            };
+        };
+        let Ok(mut transport) = CodexTransport::start(executable) else {
+            return CodexCreateOutcome::ProvenNotAccepted {
+                reservation,
+                persist,
+            };
+        };
+        if transport.receive() != Ok(Received::Initialized) {
+            return CodexCreateOutcome::ProvenNotAccepted {
+                reservation,
+                persist,
+            };
+        }
+        if let Err(error) = transport.start_attached_thread(&attachment) {
+            return if matches!(error, Error::Ambiguous) {
+                CodexCreateOutcome::Unknown {
+                    reservation,
+                    quarantine: Box::new(QuarantinedCreate {
+                        persist,
+                        transport,
+                        attachment,
+                        birth,
+                        create_attempt_id,
+                        state: QuarantinedCreateState::Pending,
+                    }),
+                }
+            } else {
+                CodexCreateOutcome::ProvenNotAccepted {
+                    reservation,
+                    persist,
+                }
+            };
+        }
+        let thread = match transport.receive() {
+            Ok(Received::ThreadStarted(thread)) => thread,
+            Err(Error::Native) => {
+                return CodexCreateOutcome::ProvenNotAccepted {
+                    reservation,
+                    persist,
+                };
+            }
+            _ => {
+                return CodexCreateOutcome::Unknown {
+                    reservation,
+                    quarantine: Box::new(QuarantinedCreate {
+                        persist,
+                        transport,
+                        attachment,
+                        birth,
+                        create_attempt_id,
+                        state: QuarantinedCreateState::Pending,
+                    }),
+                };
+            }
+        };
+        let scope = NativeCoordinateScope::Thread {
+            birth_id: birth.birth_id.clone(),
+            create_attempt_id: create_attempt_id.clone(),
+        };
+        let Ok(secret) = SecretNativeCoordinate::thread(thread.as_str()) else {
+            return CodexCreateOutcome::Unknown {
+                reservation,
+                quarantine: Box::new(QuarantinedCreate {
+                    persist,
+                    transport,
+                    attachment,
+                    birth,
+                    create_attempt_id,
+                    state: QuarantinedCreateState::ExactThread(thread),
+                }),
+            };
+        };
+        let Ok(thread_ref) = persist.seal_native_coordinate(&scope, &secret) else {
+            return CodexCreateOutcome::Unknown {
+                reservation,
+                quarantine: Box::new(QuarantinedCreate {
+                    persist,
+                    transport,
+                    attachment,
+                    birth,
+                    create_attempt_id,
+                    state: QuarantinedCreateState::ExactThread(thread),
+                }),
+            };
+        };
+        CodexCreateOutcome::Owned {
+            reservation,
+            controller: Box::new(Self::from_owned_parts(
+                persist,
+                transport,
+                attachment,
+                birth,
+                create_attempt_id,
+                thread_ref,
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_owned_parts(
+        persist: P,
+        transport: CodexTransport,
+        attachment: ThreadToolAttachment,
+        birth: ControllerBirthBinding,
+        create_attempt_id: RequestNonce,
+        thread_ref: PrivateNativeRef,
+    ) -> Self {
+        Self {
+            persist,
+            transport,
+            attachment,
+            birth,
+            create_attempt_id,
+            thread_ref,
+            epoch: 0,
+            lane_probe: None,
+            started_turn: None,
+            pending_terminal: None,
+            reconciling: None,
+            terminal: false,
+            lost_reported: false,
+            degraded_reported: false,
+            #[cfg(test)]
+            final_check_injection: FinalCheckInjection::None,
+        }
+    }
+
+    fn resume_owned(
+        persist: P,
+        executable: &Path,
+        helper: &Path,
+        birth: ControllerBirthBinding,
+        create_attempt_id: RequestNonce,
+        thread_ref: PrivateNativeRef,
+    ) -> Result<Self, Error> {
+        if persist
+            .thread_ownership_state(&birth.birth_id)
+            .map_err(map_persist_error)?
+            != (ThreadOwnershipState::Owned {
+                create_attempt_id: create_attempt_id.clone(),
+                thread_ref: thread_ref.clone(),
+            })
+        {
+            return Err(Error::Correlation);
+        }
+        let attachment = ThreadToolAttachment::at(helper)?;
+        let mut transport = CodexTransport::start(executable)?;
+        if transport.receive()? != Received::Initialized {
+            return Err(Error::Correlation);
+        }
+        let scope = NativeCoordinateScope::Thread {
+            birth_id: birth.birth_id.clone(),
+            create_attempt_id: create_attempt_id.clone(),
+        };
+        let opened = persist
+            .open_native_coordinate(&scope, &thread_ref)
+            .map_err(map_persist_error)?;
+        let thread = NativeRef::from_validated(opened.as_str().map_err(|_| Error::Malformed)?);
+        transport.resume_thread(&thread, &attachment)?;
+        match transport.receive()? {
+            Received::ThreadResumed(_) => {}
+            _ => return Err(Error::Correlation),
+        }
+        drop(thread);
+        drop(opened);
+        Ok(Self {
+            persist,
+            transport,
+            attachment,
+            birth,
+            create_attempt_id,
+            thread_ref,
+            epoch: 0,
+            lane_probe: None,
+            started_turn: None,
+            pending_terminal: None,
+            reconciling: None,
+            terminal: false,
+            lost_reported: false,
+            degraded_reported: false,
+            #[cfg(test)]
+            final_check_injection: FinalCheckInjection::None,
+        })
+    }
+
+    fn thread_scope(&self) -> NativeCoordinateScope {
+        NativeCoordinateScope::Thread {
+            birth_id: self.birth.birth_id.clone(),
+            create_attempt_id: self.create_attempt_id.clone(),
+        }
+    }
+
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+    }
+
+    fn drain_before_mutation(&mut self) -> Result<(), Error> {
+        loop {
+            match self.transport.receive_until(Duration::ZERO) {
+                Err(Error::Deadline) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    self.bump_epoch();
+                }
+            }
+        }
+    }
+
+    fn opened_thread(&self) -> Result<crate::controller::OpenedNativeCoordinate, Error> {
+        self.persist
+            .open_native_coordinate(&self.thread_scope(), &self.thread_ref)
+            .map_err(map_persist_error)
+    }
+
+    fn seal_turn(
+        &mut self,
+        scope: &NativeCoordinateScope,
+        turn: &NativeRef,
+    ) -> Result<PrivateNativeRef, Error> {
+        let secret = SecretNativeCoordinate::turn(turn.as_str()).map_err(|_| Error::Bounds)?;
+        self.persist
+            .seal_native_coordinate(scope, &secret)
+            .map_err(map_persist_error)
+    }
+
+    fn exact_notification(
+        &mut self,
+        correlation: &PersistedTurnCorrelation,
+        scope: &NativeCoordinateScope,
+    ) -> Option<NativeTurnFact> {
+        let turn_ref = correlation.turn_ref.as_ref()?;
+        if self.started_turn.as_ref() == Some(turn_ref)
+            && let Some((pending_turn, class)) = self.pending_terminal.take()
+        {
+            if pending_turn == *turn_ref {
+                self.terminal = true;
+                return Some(NativeTurnFact::Terminal {
+                    turn_ref: pending_turn,
+                    class: terminal_class(class),
+                });
+            }
+            return self.degraded_once();
+        }
+        let Ok(thread) = self.opened_thread() else {
+            return self.degraded_once();
+        };
+        let Ok(expected_thread) = thread.as_str() else {
+            return self.degraded_once();
+        };
+        let Ok(opened_turn) = self.persist.open_native_coordinate(scope, turn_ref) else {
+            return self.degraded_once();
+        };
+        let Ok(expected_turn) = opened_turn.as_str() else {
+            return self.degraded_once();
+        };
+        loop {
+            let notification = match self.transport.receive_until(Duration::ZERO) {
+                Ok(Received::Notification(notification)) => notification,
+                Err(Error::Closed | Error::Ambiguous) if !self.lost_reported => {
+                    self.lost_reported = true;
+                    return Some(NativeTurnFact::ControllerLost);
+                }
+                Err(Error::Malformed | Error::Bounds | Error::Degraded | Error::Correlation) => {
+                    return self.degraded_once();
+                }
+                Err(Error::Deadline) => return None,
+                Err(_) => return self.unknown_once(),
+                Ok(_) => return self.degraded_once(),
+            };
+            self.bump_epoch();
+            match notification {
+                Notification::TurnStarted { thread, turn }
+                    if thread.as_str() == expected_thread && turn.as_str() == expected_turn =>
+                {
+                    if self.started_turn.as_ref() == Some(turn_ref) {
+                        continue;
+                    }
+                    self.started_turn = Some(turn_ref.clone());
+                    return Some(NativeTurnFact::Started {
+                        turn_ref: turn_ref.clone(),
+                    });
+                }
+                Notification::Terminal {
+                    thread,
+                    turn,
+                    class,
+                } if thread.as_str() == expected_thread && turn.as_str() == expected_turn => {
+                    if self.terminal {
+                        continue;
+                    }
+                    if self.started_turn.as_ref() != Some(turn_ref) {
+                        if self.pending_terminal.is_none() {
+                            self.pending_terminal = Some((turn_ref.clone(), class));
+                            continue;
+                        }
+                        return self.degraded_once();
+                    }
+                    self.terminal = true;
+                    return Some(NativeTurnFact::Terminal {
+                        turn_ref: turn_ref.clone(),
+                        class: terminal_class(class),
+                    });
+                }
+                Notification::DegradedTerminal { thread, turn }
+                    if thread.as_str() == expected_thread && turn.as_str() == expected_turn =>
+                {
+                    return Some(NativeTurnFact::DegradedTerminalObservation);
+                }
+                Notification::Signal
+                | Notification::TurnStarted { .. }
+                | Notification::Terminal { .. }
+                | Notification::DegradedTerminal { .. } => {}
+            }
+        }
+    }
+
+    fn degraded_once(&mut self) -> Option<NativeTurnFact> {
+        if self.degraded_reported {
+            None
+        } else {
+            self.degraded_reported = true;
+            Some(NativeTurnFact::DegradedTerminalObservation)
+        }
+    }
+
+    fn unknown_once(&mut self) -> Option<NativeTurnFact> {
+        if self.degraded_reported {
+            None
+        } else {
+            self.degraded_reported = true;
+            Some(NativeTurnFact::Unknown)
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_final_check_injection(&mut self) -> Option<time::OffsetDateTime> {
+        match std::mem::replace(&mut self.final_check_injection, FinalCheckInjection::None) {
+            FinalCheckInjection::None => None,
+            FinalCheckInjection::Mutation => {
+                self.transport
+                    .state
+                    .notifications
+                    .push_back(Notification::Signal);
+                None
+            }
+            FinalCheckInjection::At(now) => Some(now),
+        }
+    }
+}
+
+fn terminal_class(class: TerminalClass) -> ControllerTerminalClass {
+    match class {
+        TerminalClass::Succeeded => ControllerTerminalClass::Succeeded,
+        TerminalClass::Failed => ControllerTerminalClass::Failed,
+        TerminalClass::Interrupted => ControllerTerminalClass::NativeInterrupted,
+    }
+}
+
+fn map_persist_error(error: PersistError) -> Error {
+    match error {
+        PersistError::StorageUnavailable => Error::Closed,
+        PersistError::Conflict | PersistError::InvalidTransition | PersistError::Unauthorized => {
+            Error::Correlation
+        }
+    }
+}
+
+impl<P: Persist> controller::sealed::Sealed for CodexController<P> {}
+
+impl<P: Persist> Controller for CodexController<P> {
+    fn probe_idle(
+        &mut self,
+        scope: IdleProbeScope,
+    ) -> Result<IdleProbeResult, ControllerProbeError> {
+        let binding = scope.binding;
+        let probe_id = binding.challenge_id.clone();
+        let observed_at = time::OffsetDateTime::now_utc();
+        if binding.attachment.birth_id != self.birth.birth_id
+            || binding.thread_ref != self.thread_ref
+            || self.lane_probe.is_some()
+        {
+            return Err(ControllerProbeError::BindingRejected);
+        }
+        if self.drain_before_mutation().is_err() {
+            return Ok(IdleProbeResult::Unproven(IdleProbeObservation::Unproven {
+                binding,
+                probe_id,
+                observed_at,
+            }));
+        }
+        let state = (|| {
+            let opened = self.opened_thread()?;
+            let thread = NativeRef::from_validated(opened.as_str().map_err(|_| Error::Malformed)?);
+            self.transport.read_thread(&thread)?;
+            loop {
+                match self.transport.receive()? {
+                    Received::ThreadRead(ThreadState::ActiveTurn(prehash)) => {
+                        let response_epoch = self.epoch;
+                        drop(thread);
+                        drop(opened);
+                        return Ok((ThreadState::Unproven, Some(prehash), response_epoch));
+                    }
+                    Received::ThreadRead(state) => {
+                        let response_epoch = self.epoch;
+                        drop(thread);
+                        drop(opened);
+                        return Ok((state, None, response_epoch));
+                    }
+                    Received::Notification(_) | Received::ServerRequestRejected => {
+                        self.bump_epoch();
+                    }
+                    _ => return Err(Error::Correlation),
+                }
+            }
+        })();
+        if let Ok((_, _, response_epoch)) = &state {
+            let drain = self.drain_before_mutation();
+            if self.epoch != *response_epoch {
+                return Err(ControllerProbeError::EpochInvalidated);
+            }
+            if drain.is_err() {
+                return Ok(IdleProbeResult::Unproven(IdleProbeObservation::Unproven {
+                    binding,
+                    probe_id,
+                    observed_at,
+                }));
+            }
+        }
+        Ok(match state {
+            Ok((ThreadState::Idle, None, response_epoch)) => {
+                let epoch = NativeMutationEpoch {
+                    birth_id: self.birth.birth_id.clone(),
+                    sequence: response_epoch,
+                };
+                self.lane_probe = Some(probe_id.clone());
+                IdleProbeResult::Idle {
+                    observation: IdleProbeObservation::Idle {
+                        binding,
+                        probe_id: probe_id.clone(),
+                        epoch: epoch.clone(),
+                        observed_at,
+                    },
+                    lane: ControllerIdleGuard { probe_id, epoch },
+                }
+            }
+            Ok((_, Some(prehash), response_epoch)) => {
+                let epoch = NativeMutationEpoch {
+                    birth_id: self.birth.birth_id.clone(),
+                    sequence: response_epoch,
+                };
+                IdleProbeResult::Active(ActiveObservationProof::from_binding(
+                    binding,
+                    self.create_attempt_id.clone(),
+                    epoch,
+                    observed_at,
+                    prehash,
+                    VERSION,
+                    DIALECT,
+                ))
+            }
+            Ok((ThreadState::Unproven | ThreadState::ActiveTurn(_), None, _)) | Err(_) => {
+                IdleProbeResult::Unproven(IdleProbeObservation::Unproven {
+                    binding,
+                    probe_id,
+                    observed_at,
+                })
+            }
+        })
+    }
+
+    fn write_reserved_turn(
+        &mut self,
+        lane: ControllerIdleGuard,
+        command: ControllerCommand,
+    ) -> Result<NativeWriteDisposition, ControllerWriteError> {
+        let (expected_probe, expected_epoch) = command.expected_probe();
+        if self.lane_probe.as_ref() != Some(expected_probe)
+            || lane.probe_id != *expected_probe
+            || lane.epoch != *expected_epoch
+        {
+            self.lane_probe = None;
+            return Err(ControllerWriteError::BindingRejected);
+        }
+        let Ok(opened) = self.opened_thread() else {
+            self.lane_probe = None;
+            return Ok(NativeWriteDisposition::ProvenNotAccepted);
+        };
+        let Ok(thread) = opened.as_str() else {
+            self.lane_probe = None;
+            return Ok(NativeWriteDisposition::ProvenNotAccepted);
+        };
+        let thread = NativeRef::from_validated(thread);
+        let managed_input = command.fixed_turn();
+        let Ok(prepared_turn) = self.transport.prepare_turn_frame(&thread, &managed_input) else {
+            self.lane_probe = None;
+            return Ok(NativeWriteDisposition::ProvenNotAccepted);
+        };
+        drop(managed_input);
+        drop(thread);
+        drop(opened);
+        #[cfg(test)]
+        let injected_now = self.apply_final_check_injection();
+        if self.drain_before_mutation().is_err() {
+            self.transport.state.discard_prepared_turn();
+            self.lane_probe = None;
+            return Ok(NativeWriteDisposition::ProvenNotAccepted);
+        }
+        let observed_epoch = NativeMutationEpoch {
+            birth_id: self.birth.birth_id.clone(),
+            sequence: self.epoch,
+        };
+        if observed_epoch != *expected_epoch {
+            self.transport.state.discard_prepared_turn();
+            self.lane_probe = None;
+            return Ok(NativeWriteDisposition::IdleEpochInvalidated {
+                probe_id: expected_probe.clone(),
+                expected_epoch: expected_epoch.clone(),
+                observed_epoch,
+            });
+        }
+        let input = self
+            .transport
+            .input
+            .as_mut()
+            .expect("prepared turn retains its writer");
+        let transport_state = &mut self.transport.state;
+        #[cfg(test)]
+        let final_now = injected_now.unwrap_or_else(time::OffsetDateTime::now_utc);
+        #[cfg(not(test))]
+        let final_now = time::OffsetDateTime::now_utc();
+        if !command.validate_immutable_binding(&self.birth, &self.thread_ref) {
+            transport_state.discard_prepared_turn();
+            self.lane_probe = None;
+            return Err(ControllerWriteError::BindingRejected);
+        }
+        if !command.lease_is_current(&self.birth, final_now) {
+            transport_state.discard_prepared_turn();
+            self.lane_probe = None;
+            return Ok(NativeWriteDisposition::ProvenNotAccepted);
+        }
+        let send = transport_state.dispatch_prepared_turn(input, prepared_turn);
+        if let Err(failure) = send {
+            self.lane_probe = None;
+            let disposition = failed_write_disposition(failure);
+            if matches!(disposition, NativeWriteDisposition::Unknown) {
+                self.reconciling = Some(command.correlation().clone());
+            }
+            return Ok(disposition);
+        }
+        let disposition = match self.transport.receive() {
+            Ok(Received::TurnStarted(turn)) => self
+                .seal_turn(&command.turn_scope(), &turn)
+                .map_or(NativeWriteDisposition::Unknown, |turn_ref| {
+                    NativeWriteDisposition::Accepted { turn_ref }
+                }),
+            Err(Error::Native) => NativeWriteDisposition::ProvenNotAccepted,
+            _ => NativeWriteDisposition::Unknown,
+        };
+        if matches!(disposition, NativeWriteDisposition::Unknown) {
+            self.reconciling = Some(command.correlation().clone());
+        } else {
+            self.reconciling = None;
+        }
+        self.lane_probe = None;
+        Ok(disposition)
+    }
+
+    fn poll_exact_observation(&mut self, scope: &ObservationScope) -> Option<NativeTurnFact> {
+        let correlation = scope.correlation();
+        if correlation.birth_id != self.birth.birth_id || correlation.thread_ref != self.thread_ref
+        {
+            return None;
+        }
+        if self.lost_reported {
+            return None;
+        }
+        self.exact_notification(correlation, &scope.turn_scope())
+    }
+
+    fn reconcile_exact(
+        &mut self,
+        scope: &ReconciliationScope,
+    ) -> Result<ReconciliationDisposition, ControllerReconcileError> {
+        let correlation = scope.correlation();
+        let durable_binding = self
+            .persist
+            .recover_authority_state()
+            .ok()
+            .is_some_and(|state| {
+                state.native_write_evidence.iter().any(|evidence| {
+                    evidence.correlation == *correlation
+                        && evidence.evidence_ref == scope.evidence_ref
+                        && evidence.evidence == NativeWriteEvidence::Unknown
+                })
+            });
+        if self
+            .reconciling
+            .as_ref()
+            .is_some_and(|expected| expected != correlation)
+            || !durable_binding
+            || correlation.birth_id != self.birth.birth_id
+            || correlation.thread_ref != self.thread_ref
+        {
+            return Err(ControllerReconcileError::BindingRejected);
+        }
+        let received = self.transport.receive_until(Duration::ZERO);
+        Ok(match received {
+            Ok(Received::TurnStarted(turn)) => self
+                .seal_turn(&scope.turn_scope(), &turn)
+                .map_or(ReconciliationDisposition::Unknown, |turn_ref| {
+                    ReconciliationDisposition::Accepted { turn_ref }
+                }),
+            Err(Error::Native) => ReconciliationDisposition::ProvenNotAccepted,
+            _ => ReconciliationDisposition::Unknown,
+        })
+    }
+}
+
+fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::{CreateResolution, DaemonAuthority, ManagedArmRegistration};
+    use crate::controller::{
+        ArmId, AttemptId, ControllerAttachment, ControllerBirthId, SignalAction, SignalId,
+        VerifierRef,
+    };
+    use crate::coordinator::{CoordinatedProbe, HostCoordinator, ReservedControllerWrite};
+    use crate::persist::{
+        FakePersist, PersistedControllerBirth, PreparedDispatchCommit, ReserveBirthOutcome,
+        SharedFakePersist, ThreadCreateCommit, ThreadCreateReservation, ThreadCreateResolution,
+    };
     #[cfg(unix)]
     use nix::sys::stat::Mode;
     #[cfg(unix)]
@@ -1130,6 +2529,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn native(value: &str) -> NativeRef {
+        NativeRef::from_validated(value)
+    }
 
     #[cfg(unix)]
     fn test_executable(script: &str) -> PathBuf {
@@ -1143,6 +2546,892 @@ mod tests {
         permissions.set_mode(0o700);
         std::fs::set_permissions(&path, permissions).expect("executable fixture");
         path
+    }
+
+    #[cfg(unix)]
+    fn test_tool_attachment() -> (PathBuf, ThreadToolAttachment) {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let attachment = ThreadToolAttachment::at(&helper).expect("qualified attachment");
+        (helper, attachment)
+    }
+
+    fn reserved_store() -> (FakePersist, ControllerBirthBinding, RequestNonce) {
+        let mut persist = FakePersist::default();
+        let birth_id = ControllerBirthId::fixture(31);
+        let create_attempt_id = RequestNonce::fixture(32);
+        let verifier_ref = VerifierRef::fixture(33);
+        let lease_until = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let binding = ControllerBirthBinding {
+            birth_id: birth_id.clone(),
+            seat_id: controller::SeatId::new("seat-a").expect("seat"),
+            arm_id: ArmId::new("arm-a").expect("arm"),
+            generation: 1,
+            capability: controller::ManagedCapability::HandleClaimedSignal,
+            lease_until,
+            verifier_ref: verifier_ref.clone(),
+        };
+        assert_eq!(
+            persist.reserve_controller_birth(
+                &PersistedControllerBirth {
+                    birth_id: birth_id.clone(),
+                    seat_id: binding.seat_id.clone(),
+                    arm_id: binding.arm_id.clone(),
+                    generation: 1,
+                    capability: controller::ManagedCapability::HandleClaimedSignal,
+                    lease_until,
+                    verifier_ref: verifier_ref.clone(),
+                    created_at: time::OffsetDateTime::UNIX_EPOCH,
+                    revoked: false,
+                },
+                &ThreadCreateReservation {
+                    birth_id: birth_id.clone(),
+                    create_attempt_id: create_attempt_id.clone(),
+                    reserved_at: time::OffsetDateTime::UNIX_EPOCH,
+                },
+            ),
+            Ok(ReserveBirthOutcome::Reserved)
+        );
+        (persist, binding, create_attempt_id)
+    }
+
+    fn reserved_authority() -> (
+        DaemonAuthority<SharedFakePersist>,
+        SharedFakePersist,
+        ControllerBirthReservation,
+    ) {
+        let store = SharedFakePersist::default();
+        let now = time::OffsetDateTime::now_utc();
+        let mut authority = DaemonAuthority::new(store.clone(), now);
+        authority
+            .register_managed_arm(ManagedArmRegistration {
+                arm_id: "arm-a".to_owned(),
+                generation: 1,
+                seat_id: "seat-a".to_owned(),
+                coverage_until: now + time::Duration::hours(1),
+            })
+            .expect("arm");
+        let reservation = authority.reserve_controller_birth("arm-a").expect("birth");
+        (authority, store, reservation)
+    }
+
+    fn owned_store() -> (
+        FakePersist,
+        ControllerBirthBinding,
+        RequestNonce,
+        PrivateNativeRef,
+    ) {
+        let (mut persist, birth, create_attempt_id) = reserved_store();
+        let scope = NativeCoordinateScope::Thread {
+            birth_id: birth.birth_id.clone(),
+            create_attempt_id: create_attempt_id.clone(),
+        };
+        let thread_ref = persist
+            .seal_native_coordinate(
+                &scope,
+                &SecretNativeCoordinate::thread("thread-private").expect("secret"),
+            )
+            .expect("seal thread");
+        persist
+            .resolve_thread_create(ThreadCreateCommit {
+                birth_id: birth.birth_id.clone(),
+                create_attempt_id: create_attempt_id.clone(),
+                resolution: ThreadCreateResolution::Owned {
+                    thread_ref: thread_ref.clone(),
+                },
+                evidence_ref: VerifierRef::fixture(34),
+            })
+            .expect("owned");
+        (persist, birth, create_attempt_id, thread_ref)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn codex_controller_creation_is_exact_or_quarantined_without_replay() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let exact = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\"}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (mut authority, store, reservation) = reserved_authority();
+        let (birth, create_attempt_id) = reservation.binding();
+        let (birth_id, create_attempt_id) = (birth.birth_id.clone(), create_attempt_id.clone());
+        let CodexCreateOutcome::Owned {
+            reservation,
+            mut controller,
+        } = CodexController::create_owned(store, &exact, &helper, reservation)
+        else {
+            panic!("exact owned creation");
+        };
+        assert!(matches!(
+            authority
+                .resolve_thread_create(
+                    reservation,
+                    ThreadCreateResolution::Owned {
+                        thread_ref: controller.thread_ref.clone(),
+                    },
+                )
+                .expect("authority resolves owned"),
+            CreateResolution::Final(_)
+        ));
+        assert!(matches!(
+            controller
+                .persist
+                .thread_ownership_state(&birth_id)
+                .expect("ownership"),
+            ThreadOwnershipState::Owned {
+                create_attempt_id: ref stored_create,
+                ref thread_ref,
+            } if stored_create == &create_attempt_id && thread_ref == &controller.thread_ref
+        ));
+        let rendered = format!("{controller:?} {:?}", controller.persist);
+        assert!(!rendered.contains("thread-private"));
+        controller.transport.cleanup().expect("cleanup exact");
+
+        let ambiguous = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{malformed'\n",
+            "printf '%s\\n' '{malformed-again'\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-late\"}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (mut authority, store, reservation) = reserved_authority();
+        let CodexCreateOutcome::Unknown {
+            reservation,
+            quarantine,
+        } = CodexController::create_owned(store, &ambiguous, &helper, reservation)
+        else {
+            panic!("ambiguous create must quarantine");
+        };
+        let CreateResolution::Unknown { write, reservation } = authority
+            .resolve_thread_create(reservation, ThreadCreateResolution::Unknown)
+            .expect("durable unknown")
+        else {
+            panic!("unknown token");
+        };
+        assert_eq!(write, crate::persist::IdempotentWrite::Recorded);
+        let LateCreateOutcome::StillUnknown {
+            reservation,
+            quarantine,
+        } = (*quarantine).receive_late(reservation)
+        else {
+            panic!("first bounded retry remains unknown");
+        };
+        let LateCreateOutcome::Owned {
+            reservation,
+            mut controller,
+        } = (*quarantine).receive_late(reservation)
+        else {
+            panic!("late exact owned");
+        };
+        authority
+            .resolve_quarantined_thread_create(
+                reservation,
+                ThreadCreateResolution::Owned {
+                    thread_ref: controller.thread_ref.clone(),
+                },
+            )
+            .expect("refine unknown to owned");
+        controller.transport.cleanup().expect("cleanup late");
+
+        let rejected = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"error\":{\"code\":-32602}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (mut authority, store, reservation) = reserved_authority();
+        let (birth, create_attempt_id) = reservation.binding();
+        let (birth_id, create_attempt_id) = (birth.birth_id.clone(), create_attempt_id.clone());
+        let CodexCreateOutcome::ProvenNotAccepted {
+            reservation,
+            persist: rejected_store,
+        } = CodexController::create_owned(store, &rejected, &helper, reservation)
+        else {
+            panic!("exact rejection");
+        };
+        assert!(matches!(
+            authority
+                .resolve_thread_create(reservation, ThreadCreateResolution::ProvenNotAccepted)
+                .expect("authority resolves rejection"),
+            CreateResolution::Final(_)
+        ));
+        assert_eq!(
+            rejected_store
+                .thread_ownership_state(&birth_id)
+                .expect("rejected"),
+            ThreadOwnershipState::ProvenNotAccepted { create_attempt_id }
+        );
+
+        let late_rejected = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{malformed'\n",
+            "printf '%s\\n' '{\"id\":2,\"error\":{\"code\":-32602}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (mut authority, store, reservation) = reserved_authority();
+        let CodexCreateOutcome::Unknown {
+            reservation,
+            quarantine,
+        } = CodexController::create_owned(store, &late_rejected, &helper, reservation)
+        else {
+            panic!("late rejection starts unknown");
+        };
+        let CreateResolution::Unknown { write, reservation } = authority
+            .resolve_thread_create(reservation, ThreadCreateResolution::Unknown)
+            .expect("durable unknown before late rejection")
+        else {
+            panic!("unknown token");
+        };
+        assert_eq!(write, crate::persist::IdempotentWrite::Recorded);
+        let LateCreateOutcome::ProvenNotAccepted {
+            reservation,
+            persist: _,
+        } = (*quarantine).receive_late(reservation)
+        else {
+            panic!("late exact rejection");
+        };
+        authority
+            .resolve_quarantined_thread_create(
+                reservation,
+                ThreadCreateResolution::ProvenNotAccepted,
+            )
+            .expect("refine unknown to rejected");
+
+        let marker = std::env::temp_dir().join(format!(
+            "gearwit-create-before-reservation-{}",
+            SCRIPT_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let marker_executable =
+            test_executable(&format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()));
+        let (_authority, _reserved_store, reservation) = reserved_authority();
+        assert!(matches!(
+            CodexController::create_owned(
+                SharedFakePersist::default(),
+                &marker_executable,
+                &helper,
+                reservation,
+            ),
+            CodexCreateOutcome::NotReserved { .. }
+        ));
+        assert!(!marker.exists());
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(exact);
+        let _ = std::fs::remove_file(ambiguous);
+        let _ = std::fs::remove_file(rejected);
+        let _ = std::fs::remove_file(late_rejected);
+        let _ = std::fs::remove_file(marker_executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_store_composes_authority_coordinator_and_codex_controller() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-composed\"}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-composed\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn-composed\"}}}'\n",
+            "printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-composed\",\"turn\":{\"id\":\"turn-composed\"}}}'\n",
+            "printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-composed\",\"turn\":{\"id\":\"turn-composed\",\"status\":\"completed\"}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (mut authority, store, reservation) = reserved_authority();
+        let birth_verifier = reservation.binding().0.verifier_ref.clone();
+        let CodexCreateOutcome::Owned {
+            reservation,
+            mut controller,
+        } = CodexController::create_owned(store, &executable, &helper, reservation)
+        else {
+            panic!("owned controller");
+        };
+        let CreateResolution::Final(create_write) = authority
+            .resolve_thread_create(
+                reservation,
+                ThreadCreateResolution::Owned {
+                    thread_ref: controller.thread_ref.clone(),
+                },
+            )
+            .expect("authority resolves create")
+        else {
+            panic!("final create");
+        };
+        assert_eq!(create_write, crate::persist::IdempotentWrite::Recorded);
+        let admission = authority
+            .admit_claim(&crate::authority::ClaimRequest {
+                arm_id: "arm-a".to_owned(),
+                request_id: "claim-composed".to_owned(),
+                signal_id: "signal-composed".to_owned(),
+                events: vec![gearwit_protocol::ProviderEvent {
+                    provider: "test".to_owned(),
+                    event_ref: "event-composed".to_owned(),
+                    actor: None,
+                    observed_at: "2026-01-15T12:00:00Z".to_owned(),
+                    body: "untrusted".to_owned(),
+                }],
+            })
+            .expect("admit");
+        assert_ne!(
+            authority
+                .attachment_verifier(&admission.attempt_id)
+                .expect("attachment verifier"),
+            &birth_verifier
+        );
+        let mut coordinator = HostCoordinator::new(authority);
+        let scope = coordinator
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect("prepare");
+        let probe = controller.probe_idle(scope);
+        coordinator.set_now(time::OffsetDateTime::now_utc());
+        let CoordinatedProbe::Ready(write) = coordinator.authorize_probe(probe).expect("authorize")
+        else {
+            panic!("reserved write");
+        };
+        let ReservedControllerWrite { lane, command } = *write;
+        let disposition = controller
+            .write_reserved_turn(lane, command)
+            .expect("controller write");
+        assert!(matches!(
+            disposition,
+            NativeWriteDisposition::Accepted { .. }
+        ));
+        coordinator
+            .conclude_native_write(Ok(disposition))
+            .expect("commit accepted");
+        assert_eq!(
+            coordinator
+                .poll_and_record_exact(&mut *controller)
+                .expect("record started"),
+            Some(crate::persist::IdempotentWrite::Recorded)
+        );
+        assert_eq!(
+            coordinator
+                .poll_and_record_exact(&mut *controller)
+                .expect("record terminal"),
+            Some(crate::persist::IdempotentWrite::Recorded)
+        );
+        assert!(!coordinator.has_pending_native_authority());
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_active_probe_records_authority_hold_on_the_shared_store() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-active\"}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-active\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"turns\":[{\"id\":\"turn-active\",\"status\":\"inProgress\"}]}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (mut authority, store, reservation) = reserved_authority();
+        let mut inspection = store.clone();
+        let CodexCreateOutcome::Owned {
+            reservation,
+            mut controller,
+        } = CodexController::create_owned(store, &executable, &helper, reservation)
+        else {
+            panic!("owned controller");
+        };
+        authority
+            .resolve_thread_create(
+                reservation,
+                ThreadCreateResolution::Owned {
+                    thread_ref: controller.thread_ref.clone(),
+                },
+            )
+            .expect("resolve create");
+        let admission = authority
+            .admit_claim(&crate::authority::ClaimRequest {
+                arm_id: "arm-a".to_owned(),
+                request_id: "claim-active".to_owned(),
+                signal_id: "signal-active".to_owned(),
+                events: vec![gearwit_protocol::ProviderEvent {
+                    provider: "test".to_owned(),
+                    event_ref: "event-active".to_owned(),
+                    actor: None,
+                    observed_at: "2026-01-15T12:00:00Z".to_owned(),
+                    body: "untrusted".to_owned(),
+                }],
+            })
+            .expect("admit");
+        let mut coordinator = HostCoordinator::new(authority);
+        let scope = coordinator
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect("prepare");
+        let probe = controller.probe_idle(scope);
+        assert!(matches!(&probe, Ok(IdleProbeResult::Active(_))));
+        coordinator.set_now(time::OffsetDateTime::now_utc());
+        assert!(matches!(
+            coordinator
+                .authorize_probe(probe)
+                .expect("authorize active"),
+            CoordinatedProbe::HeldBeforeNativeWrite
+        ));
+        let snapshot = inspection.recover_authority_state().expect("snapshot");
+        assert_eq!(snapshot.active_observations.len(), 1);
+        assert_eq!(snapshot.prewrite_conclusions.len(), 1);
+        assert!(snapshot.reservations.is_empty());
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    fn reserved_command(
+        controller: &mut CodexController<FakePersist>,
+        probe_id: RequestNonce,
+        epoch: NativeMutationEpoch,
+        verifier_ref: VerifierRef,
+    ) -> (ControllerCommand, PersistedTurnCorrelation) {
+        let correlation = PersistedTurnCorrelation {
+            attempt_id: AttemptId::new("attempt-a").expect("attempt"),
+            signal_id: SignalId::new("signal-a").expect("signal"),
+            birth_id: controller.birth.birth_id.clone(),
+            thread_ref: controller.thread_ref.clone(),
+            turn_write_id: RequestNonce::fixture(41),
+            turn_ref: None,
+        };
+        let attachment = crate::persist::PersistedControllerAttachment {
+            attempt_id: correlation.attempt_id.clone(),
+            birth_id: correlation.birth_id.clone(),
+            seat_id: controller.birth.seat_id.clone(),
+            arm_id: controller.birth.arm_id.clone(),
+            generation: controller.birth.generation,
+            capability: controller.birth.capability,
+            lease_until: controller.birth.lease_until,
+            verifier_ref: verifier_ref.clone(),
+            revoked: false,
+        };
+        controller
+            .persist
+            .admit_claim(
+                &crate::persist::ClaimAdmission {
+                    record: crate::persist::PersistedClaimRecord {
+                        attempt_id: correlation.attempt_id.clone(),
+                        request_id: controller::ClaimRequestId::new("claim-a").expect("claim"),
+                        arm_id: attachment.arm_id.clone(),
+                        generation: 1,
+                        signal_id: correlation.signal_id.clone(),
+                        event_refs: vec!["event-a".to_owned()],
+                        claimed_at: time::OffsetDateTime::UNIX_EPOCH,
+                    },
+                    events: vec![gearwit_protocol::ProviderEvent {
+                        provider: "test".to_owned(),
+                        event_ref: "event-a".to_owned(),
+                        actor: None,
+                        observed_at: "1970-01-01T00:00:00Z".to_owned(),
+                        body: "test".to_owned(),
+                    }],
+                },
+                &attachment,
+            )
+            .expect("claim admission");
+        controller
+            .persist
+            .record_dispatch_prepared(PreparedDispatchCommit {
+                correlation: correlation.clone(),
+            })
+            .expect("prepared");
+        let reservation = controller
+            .persist
+            .reserve_native_turn_write(
+                controller::ValidatedIdlePermit {
+                    attempt_id: correlation.attempt_id.clone(),
+                    signal_id: correlation.signal_id.clone(),
+                    birth_id: correlation.birth_id.clone(),
+                    thread_ref: correlation.thread_ref.clone(),
+                    arm_id: attachment.arm_id.clone(),
+                    generation: attachment.generation,
+                    capability: attachment.capability,
+                    verifier_ref: attachment.verifier_ref.clone(),
+                    mutation_epoch: epoch,
+                    probe_id,
+                    observed_at: time::OffsetDateTime::now_utc(),
+                    valid_until: time::OffsetDateTime::now_utc() + time::Duration::seconds(1),
+                },
+                &correlation,
+            )
+            .expect("reserve write");
+        let command = ControllerCommand::from_reservation(
+            ControllerAttachment {
+                attempt_id: attachment.attempt_id,
+                birth_id: attachment.birth_id,
+                arm_id: attachment.arm_id,
+                generation: attachment.generation,
+                seat_id: attachment.seat_id,
+                capability: attachment.capability,
+                lease_until: attachment.lease_until,
+                verifier_ref,
+            },
+            SignalAction {
+                signal_id: correlation.signal_id.clone(),
+            },
+            reservation,
+        );
+        (command, correlation)
+    }
+
+    fn idle_probe_scope(
+        birth_id: ControllerBirthId,
+        thread_ref: PrivateNativeRef,
+        verifier_ref: VerifierRef,
+    ) -> IdleProbeScope {
+        IdleProbeScope {
+            binding: controller::ProbeBinding {
+                attachment: ControllerAttachment {
+                    attempt_id: AttemptId::new("attempt-a").expect("attempt"),
+                    birth_id,
+                    arm_id: ArmId::new("arm-a").expect("arm"),
+                    generation: 1,
+                    seat_id: controller::SeatId::new("seat-a").expect("seat"),
+                    capability: controller::ManagedCapability::HandleClaimedSignal,
+                    lease_until: time::OffsetDateTime::UNIX_EPOCH,
+                    verifier_ref,
+                },
+                signal_id: SignalId::new("signal-a").expect("signal"),
+                thread_ref,
+                challenge_id: RequestNonce::fixture(42),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_controller_resumes_only_owned_thread_and_fails_active_closed() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"turns\":[{\"id\":\"turn-unowned\",\"status\":\"inProgress\"}]}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (persist, birth, create_attempt_id, thread_ref) = owned_store();
+        let verifier_ref = VerifierRef::fixture(43);
+        assert!(matches!(
+            CodexController::resume_owned(
+                persist.clone(),
+                &executable,
+                &helper,
+                birth.clone(),
+                create_attempt_id.clone(),
+                PrivateNativeRef::fixture(99),
+            ),
+            Err(Error::Correlation)
+        ));
+        let mut controller = CodexController::resume_owned(
+            persist,
+            &executable,
+            &helper,
+            birth.clone(),
+            create_attempt_id,
+            thread_ref.clone(),
+        )
+        .expect("resume owned");
+        assert!(matches!(
+            controller.probe_idle(idle_probe_scope(
+                ControllerBirthId::fixture(99),
+                thread_ref.clone(),
+                verifier_ref.clone(),
+            )),
+            Err(ControllerProbeError::BindingRejected)
+        ));
+        assert_eq!(controller.transport.state.next_id, 3);
+        let probe =
+            controller.probe_idle(idle_probe_scope(birth.birth_id, thread_ref, verifier_ref));
+        assert!(matches!(probe, Ok(IdleProbeResult::Active(_))));
+        assert!(controller.transport.state.pending.is_empty());
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_controller_writes_once_and_filters_exact_turn_lifecycle() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r turn_request\n",
+            "case \"$turn_request\" in *'Handle the claimed Gearwit signal'*) ;; *) exit 7 ;; esac\n",
+            "printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-private\",\"status\":\"completed\"}}}'\n",
+            "printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-other\",\"turn\":{\"id\":\"turn-private\"}}}'\n",
+            "printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-private\"}}}'\n",
+            "printf '%s\\n' '{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn-private\"}}}'\n",
+            "printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-private\"}}}'\n",
+            "printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-other\",\"status\":\"failed\"}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (persist, birth, create_attempt_id, thread_ref) = owned_store();
+        let verifier_ref = VerifierRef::fixture(43);
+        let mut controller = CodexController::resume_owned(
+            persist,
+            &executable,
+            &helper,
+            birth.clone(),
+            create_attempt_id,
+            thread_ref.clone(),
+        )
+        .expect("resume");
+        let probe = controller.probe_idle(idle_probe_scope(
+            birth.birth_id.clone(),
+            thread_ref,
+            verifier_ref.clone(),
+        ));
+        let Ok(IdleProbeResult::Idle { lane, observation }) = probe else {
+            panic!("idle");
+        };
+        let IdleProbeObservation::Idle {
+            probe_id, epoch, ..
+        } = observation
+        else {
+            panic!("idle observation");
+        };
+        let (command, mut correlation) =
+            reserved_command(&mut controller, probe_id, epoch, verifier_ref);
+        let disposition = controller
+            .write_reserved_turn(lane, command)
+            .expect("controller write");
+        let NativeWriteDisposition::Accepted { turn_ref } = disposition else {
+            panic!("accepted: {disposition:?}");
+        };
+        correlation.turn_ref = Some(turn_ref.clone());
+        controller
+            .persist
+            .record_native_turn_fact(crate::persist::NativeTurnFactCommit {
+                correlation: correlation.clone(),
+                fact: NativeTurnFact::Accepted {
+                    turn_ref: turn_ref.clone(),
+                },
+                evidence_ref: VerifierRef::fixture(44),
+            })
+            .expect("authority-style accepted commit");
+        let scope = ObservationScope {
+            correlation,
+            evidence_ref: VerifierRef::fixture(43),
+        };
+        assert_eq!(
+            controller.poll_exact_observation(&scope),
+            Some(NativeTurnFact::Started {
+                turn_ref: turn_ref.clone()
+            })
+        );
+        assert_eq!(
+            controller.poll_exact_observation(&scope),
+            Some(NativeTurnFact::Terminal {
+                turn_ref,
+                class: ControllerTerminalClass::Succeeded,
+            })
+        );
+        assert_eq!(controller.poll_exact_observation(&scope), None);
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_idle_followed_by_event_cannot_establish_an_idle_lane() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "printf '%s\\n' '{\"method\":\"notice\"}'\n",
+            "while IFS= read -r _; do exit 9; done\n"
+        ));
+        let (persist, birth, create_attempt_id, thread_ref) = owned_store();
+        let mut controller = CodexController::resume_owned(
+            persist,
+            &executable,
+            &helper,
+            birth.clone(),
+            create_attempt_id,
+            thread_ref.clone(),
+        )
+        .expect("resume");
+
+        assert!(matches!(
+            controller.probe_idle(idle_probe_scope(
+                birth.birth_id,
+                thread_ref,
+                VerifierRef::fixture(43),
+            )),
+            Err(ControllerProbeError::EpochInvalidated)
+        ));
+        assert!(controller.lane_probe.is_none());
+        assert_eq!(controller.transport.state.next_id, 4);
+        assert!(controller.transport.state.pending.is_empty());
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_controller_intervening_notification_invalidates_before_turn_bytes() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "while IFS= read -r _; do exit 9; done\n"
+        ));
+        let (persist, birth, create_attempt_id, thread_ref) = owned_store();
+        let verifier_ref = VerifierRef::fixture(43);
+        let mut controller = CodexController::resume_owned(
+            persist,
+            &executable,
+            &helper,
+            birth.clone(),
+            create_attempt_id,
+            thread_ref.clone(),
+        )
+        .expect("resume");
+        let probe = controller.probe_idle(idle_probe_scope(
+            birth.birth_id,
+            thread_ref,
+            verifier_ref.clone(),
+        ));
+        let Ok(IdleProbeResult::Idle { lane, observation }) = probe else {
+            panic!("idle");
+        };
+        let IdleProbeObservation::Idle {
+            probe_id, epoch, ..
+        } = observation
+        else {
+            panic!("idle observation");
+        };
+        let (command, _) = reserved_command(&mut controller, probe_id, epoch, verifier_ref);
+        controller.final_check_injection = FinalCheckInjection::Mutation;
+        let Ok(NativeWriteDisposition::IdleEpochInvalidated {
+            expected_epoch,
+            observed_epoch,
+            ..
+        }) = controller.write_reserved_turn(lane, command)
+        else {
+            panic!("notification invalidates idle epoch");
+        };
+        assert_eq!(observed_epoch.sequence, expected_epoch.sequence + 1);
+        assert_eq!(controller.transport.state.next_id, 5);
+        assert!(controller.transport.state.pending.is_empty());
+        assert!(controller.transport.state.frame.0.is_empty());
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_expiry_at_final_write_check_emits_no_turn_bytes() {
+        let helper = test_executable("#!/bin/sh\nexit 0\n");
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "while IFS= read -r _; do exit 9; done\n"
+        ));
+        let (persist, birth, create_attempt_id, thread_ref) = owned_store();
+        let verifier_ref = VerifierRef::fixture(43);
+        let mut controller = CodexController::resume_owned(
+            persist,
+            &executable,
+            &helper,
+            birth.clone(),
+            create_attempt_id,
+            thread_ref.clone(),
+        )
+        .expect("resume");
+        let Ok(IdleProbeResult::Idle { lane, observation }) = controller.probe_idle(
+            idle_probe_scope(birth.birth_id, thread_ref, verifier_ref.clone()),
+        ) else {
+            panic!("idle");
+        };
+        let IdleProbeObservation::Idle {
+            probe_id, epoch, ..
+        } = observation
+        else {
+            panic!("idle observation");
+        };
+        let (command, _) = reserved_command(&mut controller, probe_id, epoch, verifier_ref);
+        controller.final_check_injection = FinalCheckInjection::At(controller.birth.lease_until);
+
+        assert_eq!(
+            controller.write_reserved_turn(lane, command),
+            Ok(NativeWriteDisposition::ProvenNotAccepted)
+        );
+        assert_eq!(controller.transport.state.next_id, 5);
+        assert!(controller.transport.state.pending.is_empty());
+        assert!(controller.transport.state.frame.0.is_empty());
+        controller.transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
     }
 
     #[test]
@@ -1317,7 +3606,10 @@ mod tests {
         );
         assert_eq!(
             write_all_until(&mut BlockedWriter, b"frame", deadline),
-            Err(Error::Deadline)
+            Err(WriteFailure {
+                error: Error::Deadline,
+                receipt: WriteReceipt::ProvenNotWritten,
+            })
         );
 
         let mut state = TransportState::new();
@@ -1336,6 +3628,118 @@ mod tests {
         assert_eq!(
             read_line_until(&mut delayed, &mut line, deadline),
             Ok(b"frame\n".len())
+        );
+    }
+
+    #[test]
+    fn raw_transport_buffers_zeroize_in_place() {
+        let mut state = TransportState::new();
+        state.line.extend_from_slice(b"private-native-line");
+        state.line.zeroize();
+        assert!(state.line.iter().all(|byte| *byte == 0));
+
+        state.frame.0.extend_from_slice(b"private-native-frame");
+        state.frame.0.zeroize();
+        assert!(state.frame.0.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn prepared_turn_frame_is_consumed_and_wiped_immediately_after_dispatch() {
+        let mut state = TransportState::new();
+        state.initialized = true;
+        let prepared = state
+            .prepare_turn(&native("thread-private"), "fixed input")
+            .expect("prepare turn");
+        assert!(!state.frame.0.is_empty());
+        let mut output = Vec::new();
+
+        assert_eq!(
+            state.dispatch_prepared_turn(&mut output, prepared),
+            Ok(WriteReceipt::Written)
+        );
+        assert!(state.frame.0.is_empty());
+        assert_eq!(state.pending.len(), 1);
+    }
+
+    #[test]
+    fn active_response_line_is_erased_before_receive_returns() {
+        let mut state = TransportState::new();
+        state.initialized = true;
+        let mut output = Vec::new();
+        state
+            .read_thread(&mut output, &native("thread-private"))
+            .expect("thread read request");
+        let response = b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"turns\":[{\"id\":\"turn-private\",\"status\":\"inProgress\"}]}}}\n";
+
+        assert!(matches!(
+            state.next(&mut Cursor::new(response), &mut output),
+            Ok(Received::ThreadRead(ThreadState::ActiveTurn(_)))
+        ));
+        assert!(state.line.is_empty());
+    }
+
+    #[test]
+    fn pending_response_retains_notifications_and_rejects_escaped_native_ids() {
+        let mut state = TransportState::new();
+        state.initialized = true;
+        let mut output = Vec::new();
+        state
+            .start_turn(&mut output, &native("thread-private"), "test")
+            .expect("turn request");
+        let frames = concat!(
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-private\",\"status\":\"completed\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-private\"}}}\n",
+            "{\"id\":2,\"result\":{\"turn\":{\"id\":\"turn-private\"}}}\n"
+        );
+        assert_eq!(
+            state.next(&mut Cursor::new(frames.as_bytes()), &mut output),
+            Ok(Received::TurnStarted(native("turn-private")))
+        );
+        assert!(matches!(
+            state.next(&mut Silent, &mut output),
+            Ok(Received::Notification(Notification::Terminal { .. }))
+        ));
+        assert!(matches!(
+            state.next(&mut Silent, &mut output),
+            Ok(Received::Notification(Notification::TurnStarted { .. }))
+        ));
+
+        let mut unknown = TransportState::new();
+        unknown.initialized = true;
+        unknown
+            .start_turn(&mut output, &native("thread-private"), "test")
+            .expect("unknown turn request");
+        assert_eq!(
+            unknown.next(
+                &mut Cursor::new(b"{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-private\",\"turn\":{\"id\":\"turn-private\"}}}\n"),
+                &mut output,
+            ),
+            Err(Error::Ambiguous)
+        );
+        assert_eq!(unknown.notifications.len(), 1);
+        assert_eq!(
+            unknown.next(
+                &mut Cursor::new(b"{\"id\":2,\"result\":{\"turn\":{\"id\":\"turn-private\"}}}\n"),
+                &mut output,
+            ),
+            Ok(Received::TurnStarted(native("turn-private")))
+        );
+        assert!(matches!(
+            unknown.next(&mut Silent, &mut output),
+            Ok(Received::Notification(Notification::TurnStarted { .. }))
+        ));
+
+        let mut escaped = TransportState::new();
+        escaped.initialized = true;
+        escaped.start_thread(&mut output).expect("thread request");
+        assert_eq!(
+            escaped.next(
+                &mut Cursor::new(
+                    b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread\\u002dprivate\"}}}\n"
+                ),
+                &mut output,
+            ),
+            Err(Error::Malformed)
         );
     }
 
@@ -1419,11 +3823,7 @@ mod tests {
         let mut turn_state = TransportState::new();
         turn_state.initialized = true;
         turn_state
-            .start_turn(
-                &mut output,
-                &NativeRef("thread-private".to_owned()),
-                &json!([]),
-            )
+            .start_turn(&mut output, &native("thread-private"), "test")
             .expect("turn request");
         let oversized = "x".repeat(MAX_NATIVE_REF + 1);
         let response = format!("{{\"id\":2,\"result\":{{\"turn\":{{\"id\":\"{oversized}\"}}}}}}\n");
@@ -1433,11 +3833,7 @@ mod tests {
         );
         assert!(turn_state.ambiguous && !turn_state.pending.is_empty());
         assert_eq!(
-            turn_state.start_turn(
-                &mut output,
-                &NativeRef("thread-private".to_owned()),
-                &json!([])
-            ),
+            turn_state.start_turn(&mut output, &native("thread-private"), "test"),
             Err(Error::Ambiguous)
         );
     }
@@ -1448,11 +3844,7 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(state.start_thread(&mut output), Err(Error::Preflight));
         assert_eq!(
-            state.start_turn(
-                &mut output,
-                &NativeRef("thread-private".to_owned()),
-                &json!([])
-            ),
+            state.start_turn(&mut output, &native("thread-private"), "test"),
             Err(Error::Preflight)
         );
         state.initialize(&mut output).expect("initialize");
@@ -1473,9 +3865,7 @@ mod tests {
                 ),
                 &mut output
             ),
-            Ok(Received::ThreadStarted(NativeRef(
-                "thread-private".to_owned()
-            )))
+            Ok(Received::ThreadStarted(native("thread-private")))
         );
         state.start_thread(&mut output).expect("second request");
         assert_eq!(state.pending.front().map(|pending| pending.id), Some(3));
@@ -1513,29 +3903,249 @@ mod tests {
         }
         assert!(matches!(
             classify(b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"inProgress\"}}}"),
-            Err(Error::InconsistentTerminal)
+            Ok(Inbound::Notification(Notification::DegradedTerminal { .. }))
         ));
 
         let mut state = TransportState::new();
         state.initialized = true;
         let mut output = Vec::new();
-        for _ in 0..MAX_QUEUE {
+        for _ in 0..=MAX_QUEUE {
             assert_eq!(
                 state.next(&mut Cursor::new(b"{\"method\":\"notice\"}\n"), &mut output),
                 Ok(Received::Notification(Notification::Signal))
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_create_and_exact_resume_share_only_the_thread_override() {
+        let (helper, attachment) = test_tool_attachment();
         assert_eq!(
-            state.next(&mut Cursor::new(b"{\"method\":\"notice\"}\n"), &mut output),
-            Err(Error::Degraded)
+            format!("{attachment:?}"),
+            "ThreadToolAttachment([redacted])"
         );
-        for _ in 0..MAX_QUEUE {
-            assert_eq!(state.take_signal(), Some(Notification::Signal));
-        }
-        assert_eq!(state.take_signal(), None);
+
+        let thread = native("thread-private");
+        let mut state = TransportState::new();
+        let mut output = Vec::new();
+        state.initialize(&mut output).expect("initialize");
+        state
+            .next(&mut Cursor::new(b"{\"id\":1,\"result\":{}}\n"), &mut output)
+            .expect("initialized");
+        state
+            .start_attached_thread(&mut output, &attachment)
+            .expect("attached start");
+        state
+            .next(
+                &mut Cursor::new(
+                    b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\"}}}\n",
+                ),
+                &mut output,
+            )
+            .expect("started");
+        state
+            .resume_thread(&mut output, &thread, &attachment)
+            .expect("exact resume");
+        state
+            .next(
+                &mut Cursor::new(
+                    b"{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}\n",
+                ),
+                &mut output,
+            )
+            .expect("resumed");
+        state.read_thread(&mut output, &thread).expect("exact read");
+        state
+            .next(
+                &mut Cursor::new(
+                    b"{\"id\":4,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}\n",
+                ),
+                &mut output,
+            )
+            .expect("read");
+        state
+            .start_turn(&mut output, &thread, "test")
+            .expect("turn start");
+
+        let frames: Vec<Value> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice(frame).expect("json frame"))
+            .collect();
+        let initialize = &frames[0];
+        let create = &frames[2];
+        let resume = &frames[3];
+        let read = &frames[4];
+        let turn = &frames[5];
+        let helper_text = attachment.helper.to_string_lossy();
+        assert!(initialize["params"].get("config").is_none());
+        assert!(!initialize.to_string().contains(helper_text.as_ref()));
+        assert_eq!(create["params"]["config"], resume["params"]["config"]);
+        assert_eq!(create["params"].as_object().expect("params").len(), 1);
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "thread-private");
+        assert_eq!(resume["params"].as_object().expect("params").len(), 2);
+        assert!(resume["params"].get("history").is_none());
+        assert!(resume["params"].get("path").is_none());
         assert_eq!(
-            state.next(&mut Cursor::new(b"{\"method\":\"notice\"}\n"), &mut output),
-            Ok(Received::Notification(Notification::Signal))
+            read,
+            &json!({
+                "id": 4,
+                "method": "thread/read",
+                "params": {"threadId": "thread-private", "includeTurns": true}
+            })
+        );
+        assert_eq!(
+            turn["params"]["input"],
+            json!([{"type": "text", "text": "test"}])
+        );
+        assert!(!turn.to_string().contains(helper_text.as_ref()));
+        let _ = std::fs::remove_file(helper);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_attachment_fails_before_request_bytes() {
+        let (helper, attachment) = test_tool_attachment();
+        let replacement = test_executable("#!/bin/sh\nexit 1\n");
+        std::fs::rename(&replacement, &helper).expect("replace helper");
+
+        let mut state = TransportState::new();
+        state.initialized = true;
+        let mut output = Vec::new();
+        assert_eq!(
+            state.resume_thread(&mut output, &native("thread-private"), &attachment,),
+            Err(Error::Identity)
+        );
+        assert!(output.is_empty());
+        assert!(state.pending.is_empty());
+        let _ = std::fs::remove_file(helper);
+    }
+
+    #[test]
+    fn exact_thread_state_mapping_is_closed_and_correlated() {
+        let requested = native("thread-private");
+        assert_eq!(
+            parse_thread_state(
+                &json!({"thread": {
+                    "id": "thread-private",
+                    "status": {"type": "idle"},
+                    "turns": [{"id": "turn-old", "status": "completed"}]
+                }}),
+                &requested,
+            ),
+            Ok(ThreadState::Idle)
+        );
+        assert!(matches!(
+            parse_thread_state(
+                &json!({"thread": {
+                    "id": "thread-private",
+                    "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+                    "turns": [
+                        {"id": "turn-old", "status": "completed"},
+                        {"id": "turn-exact", "status": "inProgress"}
+                    ]
+                }}),
+                &requested,
+            ),
+            Ok(ThreadState::ActiveTurn(_))
+        ));
+        let first = parse_thread_state(
+            &json!({"thread": {
+                "id": "thread-private",
+                "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+                "turns": [{"id": "turn-exact", "status": "inProgress"}]
+            }}),
+            &requested,
+        )
+        .expect("first active");
+        let second = parse_thread_state(
+            &json!({"thread": {
+                "id": "thread-private",
+                "status": {"type": "active", "activeFlags": ["waitingOnUserInput"]},
+                "turns": [{"id": "turn-exact", "status": "inProgress"}]
+            }}),
+            &requested,
+        )
+        .expect("second active");
+        let (ThreadState::ActiveTurn(first), ThreadState::ActiveTurn(second)) = (first, second)
+        else {
+            panic!("active prehashes");
+        };
+        assert_ne!(first.bytes(), second.bytes());
+        assert_eq!(
+            parse_thread_state(
+                &json!({"thread": {
+                    "id": "thread-unrelated",
+                    "status": {"type": "idle"},
+                    "turns": []
+                }}),
+                &requested,
+            ),
+            Err(Error::Correlation)
+        );
+
+        for thread in [
+            json!({"id": "thread-private"}),
+            json!({"id": "thread-private", "status": {"type": "idle"}}),
+            json!({"id": "thread-private", "status": {"type": "idle"}, "turns": [{"id": "turn-1", "status": "inProgress"}]}),
+            json!({"id": "thread-private", "status": {"type": "idle"}, "turns": [{"id": "turn-1", "status": "future"}]}),
+            json!({"id": "thread-private", "status": {"type": "idle"}, "turns": [{"status": "completed"}]}),
+            json!({"id": "thread-private", "status": {"type": "future"}, "turns": []}),
+            json!({"id": "thread-private", "status": {"type": "notLoaded"}, "turns": []}),
+            json!({"id": "thread-private", "status": {"type": "systemError"}, "turns": []}),
+            json!({"id": "thread-private", "status": {"type": "active"}, "turns": []}),
+            json!({"id": "thread-private", "status": {"type": "active", "activeFlags": ["future"]}, "turns": [{"id": "turn-1", "status": "inProgress"}]}),
+            json!({"id": "thread-private", "status": {"type": "active", "activeFlags": []}, "turns": []}),
+            json!({"id": "thread-private", "status": {"type": "active", "activeFlags": []}, "turns": [{"status": "completed"}, {"id": "turn-1", "status": "inProgress"}]}),
+            json!({"id": "thread-private", "status": {"type": "active", "activeFlags": []}, "turns": [{"id": "turn-1", "status": "future"}]}),
+            json!({"id": "thread-private", "status": {"type": "active", "activeFlags": []}, "turns": [{"id": "turn-1", "status": "inProgress"}, {"id": "turn-2", "status": "inProgress"}]}),
+        ] {
+            assert_eq!(
+                parse_thread_state(&json!({"thread": thread}), &requested),
+                Ok(ThreadState::Unproven)
+            );
+        }
+    }
+
+    #[test]
+    fn active_response_requires_explicit_active_flags_array() {
+        let response = |status: Value| {
+            let mut state = TransportState::new();
+            state.initialized = true;
+            let mut output = Vec::new();
+            state
+                .read_thread(&mut output, &native("thread-private"))
+                .expect("thread read");
+            let mut frame = serde_json::to_vec(&json!({
+                "id": 2,
+                "result": {"thread": {
+                    "id": "thread-private",
+                    "status": status,
+                    "turns": [{"id": "turn-private", "status": "inProgress"}]
+                }}
+            }))
+            .expect("response");
+            frame.push(b'\n');
+            state.next(&mut Cursor::new(frame), &mut output)
+        };
+
+        assert_eq!(
+            response(json!({"type": "active"})),
+            Ok(Received::ThreadRead(ThreadState::Unproven))
+        );
+        assert!(matches!(
+            response(json!({"type": "active", "activeFlags": []})),
+            Ok(Received::ThreadRead(ThreadState::ActiveTurn(_)))
+        ));
+        assert_eq!(
+            response(json!({"type": "active", "activeFlags": null})),
+            Ok(Received::ThreadRead(ThreadState::Unproven))
+        );
+        assert_eq!(
+            response(json!({"type": "active", "activeFlags": {}})),
+            Err(Error::Malformed)
         );
     }
 
@@ -1568,6 +4178,18 @@ mod tests {
         }
     }
 
+    struct WritesZero;
+
+    impl Write for WritesZero {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn all_write_boundaries_preserve_no_replay_disposition() {
         let oversized = json!({"value": "x".repeat(MAX_FRAME)});
@@ -1575,12 +4197,33 @@ mod tests {
         assert_eq!(state.send(&mut Vec::new(), &oversized), Err(Error::Bounds));
         assert!(!state.ambiguous);
 
-        let mut state = TransportState::new();
+        let immediate = write_all_until(&mut FailsImmediately, b"frame", IO_DEADLINE)
+            .expect_err("initial error");
+        assert_eq!(immediate.receipt, WriteReceipt::ProvenNotWritten);
         assert_eq!(
-            state.initialize(&mut FailsImmediately),
-            Err(Error::Ambiguous)
+            failed_write_disposition(immediate),
+            NativeWriteDisposition::ProvenNotAccepted
         );
-        assert!(state.ambiguous);
+
+        let initial_zero =
+            write_all_until(&mut WritesZero, b"frame", IO_DEADLINE).expect_err("initial zero");
+        assert_eq!(initial_zero.receipt, WriteReceipt::ProvenNotWritten);
+        assert_eq!(
+            failed_write_disposition(initial_zero),
+            NativeWriteDisposition::ProvenNotAccepted
+        );
+
+        let partial = write_all_until(&mut PartialThenFails(false), b"frame", IO_DEADLINE)
+            .expect_err("partial write");
+        assert_eq!(partial.receipt, WriteReceipt::PossiblyWritten);
+        assert_eq!(
+            failed_write_disposition(partial),
+            NativeWriteDisposition::Unknown
+        );
+
+        let mut state = TransportState::new();
+        assert_eq!(state.initialize(&mut FailsImmediately), Err(Error::Closed));
+        assert!(!state.ambiguous);
 
         let mut state = TransportState::new();
         assert_eq!(
@@ -1588,6 +4231,7 @@ mod tests {
             Err(Error::Ambiguous)
         );
         assert!(state.ambiguous);
+        assert!(state.frame.0.is_empty());
 
         let mut line = Vec::new();
         assert_eq!(
@@ -1674,21 +4318,17 @@ mod tests {
             Received::ThreadStarted(thread_ref) => thread_ref,
             other => panic!("unexpected thread response {other:?}"),
         };
-        assert_eq!(thread_ref, NativeRef("thread-private".to_owned()));
+        assert_eq!(thread_ref, native("thread-private"));
         transport
-            .start_turn(&thread_ref, &json!([]))
+            .start_turn(&thread_ref, "test")
             .expect("turn request");
         assert_eq!(
             transport.receive(),
-            Ok(Received::TurnStarted(NativeRef("turn-private".to_owned())))
+            Ok(Received::TurnStarted(native("turn-private")))
         );
         assert!(matches!(
             transport.receive(),
             Ok(Received::Notification(Notification::TurnStarted { .. }))
-        ));
-        assert!(matches!(
-            transport.take_notification(),
-            Some(Notification::TurnStarted { .. })
         ));
         assert!(matches!(
             transport.receive(),
@@ -1697,16 +4337,159 @@ mod tests {
                 ..
             }))
         ));
-        assert!(matches!(
-            transport.take_notification(),
-            Some(Notification::Terminal {
-                class: TerminalClass::Succeeded,
-                ..
-            })
-        ));
         transport.cleanup().expect("cleanup");
         transport.cleanup().expect("idempotent cleanup");
         let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_transport_qualifies_exact_resume_read_and_reordered_notifications() {
+        let executable = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\"}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}'\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"method\":\"thread/status/changed\",\"params\":{}}'\n",
+            "printf '%s\\n' '{\"id\":4,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"turns\":[{\"id\":\"turn-old\",\"status\":\"completed\"},{\"id\":\"turn-exact\",\"status\":\"inProgress\"}]}}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let (helper, attachment) = test_tool_attachment();
+        let thread = native("thread-private");
+        let mut transport = CodexTransport::start(&executable).expect("transport");
+        assert_eq!(transport.receive(), Ok(Received::Initialized));
+        transport
+            .start_attached_thread(&attachment)
+            .expect("attached start");
+        assert_eq!(
+            transport.receive(),
+            Ok(Received::ThreadStarted(thread.clone()))
+        );
+        transport
+            .resume_thread(&thread, &attachment)
+            .expect("exact resume");
+        assert_eq!(
+            transport.receive(),
+            Ok(Received::ThreadResumed(ThreadState::Idle))
+        );
+        transport.read_thread(&thread).expect("exact read");
+        assert!(matches!(
+            transport.receive(),
+            Ok(Received::ThreadRead(ThreadState::ActiveTurn(_)))
+        ));
+        assert_eq!(
+            transport.receive(),
+            Ok(Received::Notification(Notification::Signal))
+        );
+        transport.cleanup().expect("cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_resume_rejects_unrelated_thread_and_unproven_state() {
+        let (helper, attachment) = test_tool_attachment();
+        let requested = native("thread-private");
+        for (response, expected) in [
+            (
+                "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-unrelated\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}",
+                Err(Error::Correlation),
+            ),
+            (
+                "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"active\"},\"turns\":[]}}}",
+                Ok(Received::ThreadResumed(ThreadState::Unproven)),
+            ),
+            (
+                "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-private\",\"status\":{\"type\":\"future\"},\"turns\":[]}}}",
+                Ok(Received::ThreadResumed(ThreadState::Unproven)),
+            ),
+        ] {
+            let executable = test_executable(&format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\nIFS= read -r _\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r _\nIFS= read -r _\nprintf '%s\\n' '{response}'\nwhile IFS= read -r _; do :; done\n"
+            ));
+            let mut transport = CodexTransport::start(&executable).expect("transport");
+            assert_eq!(transport.receive(), Ok(Received::Initialized));
+            transport
+                .resume_thread(&requested, &attachment)
+                .expect("exact resume");
+            assert_eq!(transport.receive(), expected);
+            transport.cleanup().expect("cleanup");
+            let _ = std::fs::remove_file(executable);
+        }
+        let _ = std::fs::remove_file(helper);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_resume_native_error_timeout_and_process_loss_are_typed() {
+        let (helper, attachment) = test_tool_attachment();
+        let requested = native("thread-private");
+
+        let native_error = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":2,\"error\":{\"code\":-32602,\"message\":\"invalid params\"}}'\n",
+            "while IFS= read -r _; do :; done\n"
+        ));
+        let mut transport = CodexTransport::start(&native_error).expect("native transport");
+        assert_eq!(transport.receive(), Ok(Received::Initialized));
+        transport
+            .resume_thread(&requested, &attachment)
+            .expect("resume request");
+        assert_eq!(transport.receive(), Err(Error::Native));
+        transport.cleanup().expect("native cleanup");
+        let _ = std::fs::remove_file(native_error);
+
+        let timeout = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "while :; do sleep 1; done\n"
+        ));
+        let mut transport = CodexTransport::start(&timeout).expect("timeout transport");
+        assert_eq!(transport.receive(), Ok(Received::Initialized));
+        transport
+            .resume_thread(&requested, &attachment)
+            .expect("resume request");
+        assert_eq!(
+            transport.receive_until(Duration::from_millis(20)),
+            Err(Error::Ambiguous)
+        );
+        transport.cleanup().expect("timeout cleanup");
+        let _ = std::fs::remove_file(timeout);
+
+        let process_loss = test_executable(concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+            "IFS= read -r _\n",
+            "IFS= read -r _\n",
+            "exit 0\n"
+        ));
+        let mut transport = CodexTransport::start(&process_loss).expect("loss transport");
+        assert_eq!(transport.receive(), Ok(Received::Initialized));
+        transport
+            .resume_thread(&requested, &attachment)
+            .expect("resume request");
+        assert_eq!(transport.receive(), Err(Error::Ambiguous));
+        transport.cleanup().expect("loss cleanup");
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(process_loss);
     }
 
     #[cfg(unix)]

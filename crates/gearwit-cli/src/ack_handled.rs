@@ -184,9 +184,7 @@ fn correlate(request: &HandledCursor, reply: &HandledCursor) -> Result<u8, Strin
 #[cfg(test)]
 mod tests {
     use super::{AckHandledSpec, EXIT_ACCEPTED, EXIT_REJECTED, run_ack_handled_to};
-    use gearwit_host::{
-        AckStore, GearwitPaths, KnownArm, LinkTable, ManagedCapability, serve_connection,
-    };
+    use gearwit_host::{AckStore, GearwitPaths, KnownArm, LinkTable, serve_connection};
     use gearwit_protocol::HandledCursor;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,7 +206,6 @@ mod tests {
             generation: 1,
             seat_id: "example-devrev".to_owned(),
             route: "complete_background_tool".to_owned(),
-            capability: ManagedCapability::ManagedTurnStart,
             coverage_until: now() + time::Duration::minutes(20),
         }
     }

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 /// Maximum distinct `request_id` outcomes retained in founder v0.
 pub const HISTORY_CAP: usize = 1024;
 
-use crate::controller::ManagedCapability;
 use gearwit_protocol::{SCHEMA, WaiterLink, WaiterLinkError, validate};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -24,11 +23,6 @@ pub struct KnownArm {
     pub seat_id: String,
     /// Attached route the arm admits.
     pub route: String,
-    /// Closed capability this arm grants to controller dispatches.
-    ///
-    /// Independent of the wire-facing `route` string; every controller
-    /// grant is validated against this closed set.
-    pub capability: ManagedCapability,
     /// Coverage end.
     pub coverage_until: OffsetDateTime,
 }

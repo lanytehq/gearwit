@@ -1,683 +1,571 @@
-//! Host coordinator — split-phase state machine for dispatch lifecycle.
-//!
-//! Lives one level outside `DaemonAuthority`. Exercises the three-phase
-//! sequence required by the cxotech option-(c) ruling:
-//!
-//! 1. Enter authority → `prepare_dispatch` → exit with opaque token +
-//!    sealed `ControllerCommand`.
-//! 2. Caller performs native I/O via `Controller` outside authority
-//!    (the command is consumed by the native-I/O adapter).
-//! 3. Re-enter authority → `conclude_dispatch` consuming the opaque token
-//!    by value.
-//!
-//! The coordinator does NOT hold a controller reference. It emits bounded
-//! controller work; the caller drives provider I/O independently. No
-//! authority borrow or lock survives across provider I/O, and no
-//! coordinator method panics — every misuse returns a typed error.
+//! Split-phase coordinator for idle-only managed native writes.
 
-use crate::authority::ReconciliationWork;
-use crate::controller::ReconciliationDisposition;
-use crate::controller::{ControllerCommand, DispatchDisposition, LifecycleObservation};
-use crate::{
-    AdmissionError, AdmissionReceipt, AdmissionResult, ClaimRequest, DaemonAuthority,
-    DispatchConclusion, DispatchError, Persist, PrepareDispatchError, PreparedDispatch,
+#![allow(clippy::missing_errors_doc)]
+
+use crate::authority::{
+    AdmissionResult, AuthorityError, ClaimRequest, ControllerBirthReservation, CreateResolution,
+    DaemonAuthority, PreparedDispatch, ProbeAuthorization, QuarantinedBirthReservation,
+    ReconciliationPhase,
 };
+use crate::controller::{
+    ControllerCommand, ControllerIdleGuard, ControllerProbeError, ControllerWriteError,
+    IdleProbeResult, IdleProbeScope, NativeWriteDisposition, ObservationScope, ReconciliationScope,
+};
+use crate::persist::{IdempotentWrite, Persist, ThreadCreateResolution};
 
-/// Split-phase host coordinator for the Gearwit dispatch lifecycle.
-///
-/// Owns the authority only. Emits a sealed `ControllerCommand` on
-/// prepare; accepts disposition + observations on conclude. The pending
-/// token is consumed by value at conclusion.
-pub struct HostCoordinator<P: Persist> {
-    authority: DaemonAuthority<P>,
-    /// Opaque prepared token from phase 2, consumed in phase 4.
-    pending: Option<PreparedDispatch>,
+/// Controller work that can cross the authority borrow only after a durable
+/// reservation. The coordinator retains the non-remintable commit metadata.
+#[derive(Debug)]
+pub struct ReservedControllerWrite {
+    pub lane: ControllerIdleGuard,
+    pub command: ControllerCommand,
 }
 
-/// Failure while preparing a coordinator dispatch.
 #[derive(Debug)]
-pub enum PrepareError {
-    /// Another dispatch is awaiting conclusion. The authority was not entered,
-    /// so the caller retains the untouched admission receipt for retry.
-    Busy(Box<AdmissionReceipt>),
-    /// The authority rejected preparation before native I/O and returned the
-    /// receipt for retry.
-    Dispatch(Box<PrepareDispatchError>),
+pub enum CoordinatedProbe {
+    Ready(Box<ReservedControllerWrite>),
+    HeldBeforeNativeWrite,
+    IdleStateUnproven,
+}
+
+pub struct HostCoordinator<P: Persist> {
+    authority: DaemonAuthority<P>,
+    probing: Option<PreparedDispatch>,
+    writing: Option<PreparedDispatch>,
+    observing: Option<ObservationScope>,
+    reconciling: Option<ReconciliationScope>,
 }
 
 impl<P: Persist> HostCoordinator<P> {
-    /// Create a new coordinator with the given authority.
     #[must_use]
     pub fn new(authority: DaemonAuthority<P>) -> Self {
         Self {
             authority,
-            pending: None,
+            probing: None,
+            writing: None,
+            observing: None,
+            reconciling: None,
         }
     }
 
-    /// Mutable access to the authority (for re-arm between phases).
-    /// The authority lock is released after every phase — the provider
-    /// does not dispatch while this handle exists.
-    #[must_use]
-    pub fn authority_mut(&mut self) -> &mut DaemonAuthority<P> {
+    pub fn recover(mut authority: DaemonAuthority<P>) -> Result<Self, AuthorityError> {
+        let (mut observing, mut reconciling) = authority.recover()?.into_followup_scopes();
+        if observing.len() + reconciling.len() > 1 {
+            return Err(AuthorityError::Conflict);
+        }
+        Ok(Self {
+            authority,
+            probing: None,
+            writing: None,
+            observing: observing.pop(),
+            reconciling: reconciling.pop(),
+        })
+    }
+
+    #[cfg(test)]
+    fn authority_mut(&mut self) -> &mut DaemonAuthority<P> {
         &mut self.authority
     }
 
-    // -- Phase 1: admit claim (entered authority, exits immediately) --
-
-    /// Admit a claim under authority. Returns the admission result,
-    /// which carries the opaque admission receipt for `prepare`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AdmissionError` when admission fails.
-    pub fn admit(&mut self, req: &ClaimRequest) -> Result<AdmissionResult, AdmissionError> {
-        self.authority.admit_claim(req)
+    pub fn admit(&mut self, request: &ClaimRequest) -> Result<AdmissionResult, AuthorityError> {
+        self.authority.admit_claim(request)
     }
 
-    // -- Phase 2: prepare dispatch (entered authority, exits with command) --
+    pub fn reserve_controller_birth(
+        &mut self,
+        arm_id: &str,
+    ) -> Result<ControllerBirthReservation, AuthorityError> {
+        self.authority.reserve_controller_birth(arm_id)
+    }
 
-    /// Prepare a dispatch: the opaque `AdmissionReceipt` is consumed by
-    /// value; the authority rehydrates the claim and attachment from
-    /// stored state and durably records the prepare. Returns the sealed
-    /// `ControllerCommand` for native I/O. The authority borrow ends here.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PrepareError::Busy`] with the original receipt when another
-    /// dispatch awaits conclusion. Returns [`PrepareError::Dispatch`] when
-    /// authority rehydration, validation, or persistence fails.
+    pub fn resolve_thread_create(
+        &mut self,
+        reservation: ControllerBirthReservation,
+        resolution: ThreadCreateResolution,
+    ) -> Result<CreateResolution, AuthorityError> {
+        self.authority
+            .resolve_thread_create(reservation, resolution)
+    }
+
+    pub fn resolve_quarantined_thread_create(
+        &mut self,
+        reservation: QuarantinedBirthReservation,
+        resolution: ThreadCreateResolution,
+    ) -> Result<IdempotentWrite, AuthorityError> {
+        self.authority
+            .resolve_quarantined_thread_create(reservation, resolution)
+    }
+
+    pub(crate) fn set_now(&mut self, now: time::OffsetDateTime) {
+        self.authority.set_now(now);
+    }
+
+    /// Record dispatch preparation and return only an exact sealed probe scope.
     pub fn prepare(
         &mut self,
-        receipt: AdmissionReceipt,
-    ) -> Result<ControllerCommand, PrepareError> {
-        if self.pending.is_some() {
-            return Err(PrepareError::Busy(Box::new(receipt)));
+        receipt: crate::authority::AdmissionReceipt,
+    ) -> Result<IdleProbeScope, AuthorityError> {
+        if self.probing.is_some() || self.writing.is_some() {
+            return Err(AuthorityError::Conflict);
         }
-        let (prepared, cmd) = self
+        let (prepared, scope) = self.authority.prepare_handle_claimed_signal(receipt)?;
+        self.probing = Some(prepared);
+        Ok(scope)
+    }
+
+    /// Validate one exact probe. Active and unproven results clear the pending
+    /// action after a durable zero-write conclusion.
+    pub fn authorize_probe(
+        &mut self,
+        result: Result<IdleProbeResult, ControllerProbeError>,
+    ) -> Result<CoordinatedProbe, AuthorityError> {
+        let prepared = self.probing.take().ok_or(AuthorityError::Conflict)?;
+        match self.authority.authorize_probe(prepared, result)? {
+            ProbeAuthorization::Ready(authorized) => {
+                let (prepared, lane, command) = (*authorized).into_parts();
+                self.writing = Some(prepared);
+                Ok(CoordinatedProbe::Ready(Box::new(ReservedControllerWrite {
+                    lane,
+                    command,
+                })))
+            }
+            ProbeAuthorization::HeldBeforeNativeWrite => {
+                Ok(CoordinatedProbe::HeldBeforeNativeWrite)
+            }
+            ProbeAuthorization::IdleStateUnproven => Ok(CoordinatedProbe::IdleStateUnproven),
+        }
+    }
+
+    pub fn conclude_native_write(
+        &mut self,
+        disposition: Result<NativeWriteDisposition, ControllerWriteError>,
+    ) -> Result<(), AuthorityError> {
+        let prepared = self.writing.take().ok_or(AuthorityError::Conflict)?;
+        let conclusion = self
             .authority
-            .prepare_dispatch(receipt)
-            .map_err(|error| PrepareError::Dispatch(Box::new(error)))?;
-        self.pending = Some(prepared);
-        Ok(cmd)
+            .conclude_native_write(prepared, disposition)?;
+        let (observing, reconciling) = conclusion.into_scopes();
+        self.observing = observing;
+        self.reconciling = reconciling;
+        Ok(())
     }
 
-    /// Prepare one admitted-but-unprepared attempt discovered after daemon
-    /// recovery. The authority derives its receipt from durable state.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DispatchError::PreSend` when the attempt is not recoverable
-    /// or cannot be atomically prepared.
-    pub fn prepare_recovered(
+    pub fn poll_and_record_exact<C: crate::controller::Controller>(
         &mut self,
-        attempt_id: &str,
-    ) -> Result<ControllerCommand, DispatchError> {
-        if self.pending.is_some() {
-            return Err(DispatchError::PreSend(
-                "prepare called while another dispatch is pending conclusion".to_owned(),
-            ));
+        controller: &mut C,
+    ) -> Result<Option<IdempotentWrite>, AuthorityError> {
+        let scope = self.observing.as_ref().ok_or(AuthorityError::Conflict)?;
+        let Some(fact) = controller.poll_exact_observation(scope) else {
+            return Ok(None);
+        };
+        let terminal = matches!(fact, crate::controller::NativeTurnFact::Terminal { .. });
+        let record = self.authority.record_exact_observation(scope, fact)?;
+        if terminal || record.reconciliation.is_some() {
+            self.observing = None;
         }
-        let (prepared, cmd) = self.authority.prepare_recovered(attempt_id)?;
-        self.pending = Some(prepared);
-        Ok(cmd)
+        self.reconciling = record.reconciliation;
+        Ok(Some(record.write))
     }
 
-    // -- Phase 3: native I/O (no authority guard; caller drives) --
-
-    // No methods — the caller drives `command.dispatch(controller)` and
-    // `controller.poll_observation(command.attempt_id())` outside
-    // authority. `ControllerCommand::dispatch` consumes the command, so
-    // a second I/O pass cannot be assembled from the same work.
-
-    // -- Phase 4: conclude (re-entered authority, consumes token) --
-
-    /// Conclude a dispatch: atomically record disposition, first
-    /// transition, and the durable consumption marker under authority.
-    /// The prepared token is consumed by value.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DispatchError::PreSend` when no prepare is pending;
-    /// `DispatchError::PostSend` when the atomic conclusion cannot be
-    /// persisted.
-    pub fn conclude(
+    pub fn reconcile_and_record<C: crate::controller::Controller>(
         &mut self,
-        disposition: DispatchDisposition,
-        observations: Vec<LifecycleObservation>,
-    ) -> Result<DispatchConclusion, DispatchError> {
-        let prepared = self.pending.take().ok_or_else(|| {
-            DispatchError::PreSend(
-                "conclude called with no prepared dispatch — call prepare first".to_owned(),
-            )
-        })?;
-        self.authority
-            .conclude_dispatch(prepared, disposition, observations)
+        controller: &mut C,
+    ) -> Result<IdempotentWrite, AuthorityError> {
+        let scope = self.reconciling.as_ref().ok_or(AuthorityError::Conflict)?;
+        let disposition = controller.reconcile_exact(scope);
+        let (result, phase) = self.authority.record_reconciliation(scope, disposition)?;
+        match phase {
+            ReconciliationPhase::Reconciling => {}
+            ReconciliationPhase::Observing(scope) => {
+                self.reconciling = None;
+                self.observing = Some(*scope);
+            }
+            ReconciliationPhase::Closed => self.reconciling = None,
+        }
+        Ok(result)
     }
 
-    /// True if a prepared token is pending (between phases 2 and 4).
     #[must_use]
-    pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    // -- Split-phase reconciliation (authority | probe | authority) ------
-
-    /// Authority phase 1: produce reconciliation work. The caller probes
-    /// the controller strictly outside any authority borrow between this
-    /// call and `commit_reconciliation`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DispatchError::PostSend` when the attempt has no
-    /// persisted binding or is already resolved. Fails closed.
-    pub fn prepare_reconciliation(
-        &mut self,
-        attempt_id: &str,
-    ) -> Result<ReconciliationWork, DispatchError> {
-        self.authority.prepare_reconciliation(attempt_id)
-    }
-
-    /// Authority phase 3: commit the provider probe's resolution
-    /// durably. Consumes the reconciliation work by value.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DispatchError::PostSend` when the resolution cannot be
-    /// persisted, conflicts, or no prior ambiguity exists.
-    pub fn commit_reconciliation(
-        &mut self,
-        work: ReconciliationWork,
-        disposition: ReconciliationDisposition,
-    ) -> Result<ReconciliationDisposition, DispatchError> {
-        self.authority.commit_reconciliation(work, disposition)
+    pub fn has_pending_native_authority(&self) -> bool {
+        self.probing.is_some()
+            || self.writing.is_some()
+            || self.observing.is_some()
+            || self.reconciling.is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{Controller, FakeController, ManagedCapability};
-    use crate::persist::FakePersist;
-    use crate::{ClaimOutcome, KnownArm, Transition};
-    use gearwit_protocol::ProviderEvent;
-    use time::Duration as TimeDuration;
-    use time::OffsetDateTime;
+    use crate::authority::ManagedArmRegistration;
+    use crate::controller::{
+        Controller, FakeController, FakeIdleState, NativeTurnFact, NativeWriteDisposition,
+        PrivateNativeRef, ReconciliationDisposition, SecretNativeCoordinate,
+    };
+    use crate::persist::{SharedFakePersist, ThreadCreateResolution};
+    use time::{Duration, OffsetDateTime};
 
     fn now() -> OffsetDateTime {
         time::macros::datetime!(2026-01-15 12:00:00 UTC)
     }
 
-    fn sample_event(body: &str) -> ProviderEvent {
-        ProviderEvent {
-            provider: "test".to_owned(),
-            event_ref: format!("event-{body}"),
-            actor: Some("example-devlead".to_owned()),
-            observed_at: "2026-01-15T12:00:00Z".to_owned(),
-            body: body.to_owned(),
-        }
-    }
-
-    fn arm() -> KnownArm {
-        KnownArm {
-            arm_id: "arm-01".to_owned(),
-            generation: 1,
-            seat_id: "example-devrev".to_owned(),
-            route: ManagedCapability::MANAGED_TURN_START_ROUTE.to_owned(),
-            capability: ManagedCapability::ManagedTurnStart,
-            coverage_until: now() + TimeDuration::hours(24),
-        }
-    }
-
-    fn req(rid: &str, sid: &str, body: &str) -> ClaimRequest {
-        ClaimRequest {
-            arm_id: "arm-01".to_owned(),
-            request_id: rid.to_owned(),
-            signal_id: sid.to_owned(),
-            events: vec![sample_event(body)],
-        }
-    }
-
-    fn coordinated() -> HostCoordinator<FakePersist> {
-        let mut authority = DaemonAuthority::new(FakePersist::default(), now());
-        authority.register_arm(arm()).expect("register");
+    fn coordinator() -> HostCoordinator<SharedFakePersist> {
+        let mut authority = DaemonAuthority::new(SharedFakePersist::default(), now());
+        authority
+            .register_managed_arm(ManagedArmRegistration {
+                arm_id: "arm-a".to_owned(),
+                generation: 1,
+                seat_id: "seat-a".to_owned(),
+                coverage_until: now() + Duration::hours(1),
+            })
+            .expect("arm");
+        let birth = authority.reserve_controller_birth("arm-a").expect("birth");
+        authority
+            .resolve_thread_create(
+                birth,
+                ThreadCreateResolution::Owned {
+                    thread_ref: PrivateNativeRef([7; 32]),
+                },
+            )
+            .expect("owned");
         HostCoordinator::new(authority)
     }
 
-    fn restarted(persist: &FakePersist) -> HostCoordinator<FakePersist> {
-        HostCoordinator::new(DaemonAuthority::new(persist.clone(), now()))
-    }
-
-    /// Accepting controller scripted for a specific attempt id (so the
-    /// poll correlation is checked) with started + terminal observations.
-    fn accepting_controller_for(attempt: &str) -> FakeController {
-        FakeController::new(vec![DispatchDisposition::Accepted {
-            correlation: "turn-X".to_owned(),
-        }])
-        .with_observations(vec![
-            Some(LifecycleObservation::TurnStarted("T1".to_owned())),
-            Some(LifecycleObservation::TurnTerminal("T1".to_owned(), true)),
-        ])
-        .with_expected_attempt_id(attempt)
-    }
-
-    /// Admit → prepare → consume sealed command → poll → conclude.
-    /// Returns the attempt id.
-    fn drive_full_cycle(coord: &mut HostCoordinator<FakePersist>, rid: &str, sid: &str) -> String {
-        let admission = coord.admit(&req(rid, sid, "hello")).expect("admit");
-        let attempt_id = admission.attempt_id.clone();
-        let receipt = admission.into_receipt().expect("receipt");
-        let command = coord.prepare(receipt).expect("prepare");
-        let attempt = command.attempt_id().to_owned();
-        // The sealed command is consumed by the native-I/O adapter;
-        // the provider I/O happens strictly outside authority.
-        let mut controller = accepting_controller_for(&attempt);
-        let disposition = command.dispatch(&mut controller);
-        let observations: Vec<_> = std::iter::once(controller.poll_observation(&attempt))
-            .chain(std::iter::once(controller.poll_observation(&attempt)))
-            .flatten()
-            .collect();
-        coord.conclude(disposition, observations).expect("conclude");
-        attempt_id
-    }
-
-    #[test]
-    fn full_sequence_through_coordinator_with_fake_controller() {
-        let mut coord = coordinated();
-        let attempt_id = drive_full_cycle(&mut coord, "req-1", "sig-1");
-        assert_eq!(attempt_id, "attempt-1");
-        assert!(!coord.has_pending());
-        let persist = coord.authority_mut().persist();
-        let ts = persist.get_transitions("sig-1", "attempt-1");
-        assert!(ts.contains(&Transition::DispatchPrepared));
-        assert!(ts.contains(&Transition::NativeAccepted));
-        assert!(ts.contains(&Transition::ExactTurnStart));
-        assert!(ts.contains(&Transition::ExactTurnTerminal));
-    }
-
-    #[test]
-    fn authority_is_available_while_provider_work_is_outstanding() {
-        let mut coord = coordinated();
-        let admission = coord.admit(&req("req-1", "sig-1", "hello")).expect("admit");
-        let receipt = admission.into_receipt().expect("receipt");
-        let command = coord.prepare(receipt).expect("prepare");
-        assert!(coord.has_pending());
-
-        // Provider work is outstanding (command not yet dispatched).
-        // The authority remains usable: register and re-arm a peer arm.
-        let mut peer = arm();
-        peer.arm_id = "arm-02".to_owned();
-        peer.route = "managed_turn_start".to_owned();
-        coord
-            .authority_mut()
-            .register_arm(peer)
-            .expect("register peer while work outstanding");
-        coord
-            .authority_mut()
-            .advance_generation("arm-02")
-            .expect("re-arm peer while work outstanding");
-
-        // Then the provider I/O happens strictly outside authority.
-        let attempt = command.attempt_id().to_owned();
-        let mut controller = accepting_controller_for(&attempt);
-        let disposition = command.dispatch(&mut controller);
-        let observations: Vec<_> = std::iter::once(controller.poll_observation(&attempt))
-            .chain(std::iter::once(controller.poll_observation(&attempt)))
-            .flatten()
-            .collect();
-        coord.conclude(disposition, observations).expect("conclude");
-        assert_eq!(controller.dispatch_count(), 1);
-    }
-
-    #[test]
-    fn conclude_before_prepare_returns_typed_error_not_panic() {
-        let mut coord = coordinated();
-        let err = coord
-            .conclude(DispatchDisposition::Rejected, vec![])
-            .expect_err("conclude without prepare");
-        assert!(
-            matches!(&err, DispatchError::PreSend(msg) if msg.contains("no prepared dispatch")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn second_prepare_preserves_receipt_until_pending_dispatch_concludes() {
-        let mut coord = coordinated();
-        let first = coord
-            .admit(&req("req-1", "sig-1", "first"))
-            .expect("admit first");
-        let first_command = coord
-            .prepare(first.into_receipt().expect("receipt"))
-            .expect("prepare first");
-        assert_eq!(first_command.attempt_id(), "attempt-1");
-
-        let mut second_arm = arm();
-        second_arm.arm_id = "arm-02".to_owned();
-        coord
-            .authority_mut()
-            .register_arm(second_arm)
-            .expect("register second arm");
-        let second = coord
-            .admit(&ClaimRequest {
-                arm_id: "arm-02".to_owned(),
-                request_id: "req-2".to_owned(),
-                signal_id: "sig-2".to_owned(),
-                events: vec![sample_event("second")],
-            })
-            .expect("admit second");
-        let second_attempt = second.attempt_id.clone();
-        let err = coord
-            .prepare(second.into_receipt().expect("receipt"))
-            .expect_err("second prepare must not overwrite pending token");
-        let second_receipt = match err {
-            PrepareError::Busy(receipt) => *receipt,
-            PrepareError::Dispatch(err) => panic!("expected busy result, got {err:?}"),
-        };
-        assert!(coord.has_pending());
-        assert!(
-            !coord
-                .authority_mut()
-                .persist()
-                .prepared_set
-                .contains_key(&second_attempt),
-            "the rejected prepare must not record a second prepared marker"
-        );
-
-        // The first work completes, releasing the coordinator slot.
-        let mut first_controller = FakeController::new(vec![DispatchDisposition::Rejected]);
-        let first_disposition = first_command.dispatch(&mut first_controller);
-        coord
-            .conclude(first_disposition, vec![])
-            .expect("conclude first");
-
-        // Retry with the exact returned receipt. It must prepare and dispatch
-        // once rather than stranding the admitted second claim.
-        let second_command = coord.prepare(second_receipt).expect("retry second prepare");
-        assert_eq!(second_command.attempt_id(), second_attempt);
-        let mut second_controller = FakeController::new(vec![DispatchDisposition::Accepted {
-            correlation: "turn-2".to_owned(),
-        }]);
-        let second_disposition = second_command.dispatch(&mut second_controller);
-        coord
-            .conclude(second_disposition, vec![])
-            .expect("conclude second");
-        assert_eq!(second_controller.dispatch_count(), 1);
-
-        // Restart does not create a replacement dispatch grant for the
-        // already consumed second claim.
-        let mut recovered = restarted(coord.authority_mut().persist());
-        recovered.authority_mut().recover().expect("recover");
-        let replay = recovered
-            .admit(&ClaimRequest {
-                arm_id: "arm-02".to_owned(),
-                request_id: "req-2".to_owned(),
-                signal_id: "sig-2".to_owned(),
-                events: vec![sample_event("second")],
-            })
-            .expect("replay second after restart");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert!(replay.into_receipt().is_none());
-    }
-
-    #[test]
-    fn prepare_failure_preserves_receipt_for_retry_and_restart_replay() {
-        let mut coord = coordinated();
-        let admission = coord.admit(&req("req-1", "sig-1", "retry")).expect("admit");
-        let attempt_id = admission.attempt_id.clone();
-        coord.authority_mut().persist_mut().next_prepare_error = Some("write failed".to_owned());
-        let err = coord
-            .prepare(admission.into_receipt().expect("receipt"))
-            .expect_err("injected prepare write failure");
-        let receipt = match err {
-            PrepareError::Dispatch(err) => {
-                let err = *err;
-                assert!(matches!(err.error, DispatchError::PreSend(_)));
-                *err.receipt
-            }
-            PrepareError::Busy(_) => panic!("expected authority preparation failure"),
-        };
-        assert_eq!(receipt.attempt_id(), attempt_id);
-        assert!(
-            !coord
-                .authority_mut()
-                .persist()
-                .prepared_set
-                .contains_key(&attempt_id),
-            "failed atomic prepare must not leave a marker"
-        );
-
-        let command = coord.prepare(receipt).expect("retry prepare");
-        let mut controller = FakeController::new(vec![DispatchDisposition::Accepted {
-            correlation: "turn-1".to_owned(),
-        }]);
-        let disposition = command.dispatch(&mut controller);
-        coord.conclude(disposition, vec![]).expect("conclude");
-        assert_eq!(controller.dispatch_count(), 1);
-
-        let mut recovered = restarted(coord.authority_mut().persist());
-        recovered.authority_mut().recover().expect("recover");
-        let replay = recovered
-            .admit(&req("req-1", "sig-1", "retry"))
-            .expect("replay after restart");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert!(replay.into_receipt().is_none());
-    }
-
-    #[test]
-    fn recovery_prepares_unprepared_claim_once_without_a_caller_receipt() {
-        let mut original = coordinated();
-        let admission = original
-            .admit(&req("req-1", "sig-1", "crash before prepare"))
-            .expect("admit");
-        let attempt_id = admission.attempt_id.clone();
-        drop(admission); // Simulate crash: no caller-held receipt survives.
-
-        let mut recovered = restarted(original.authority_mut().persist());
-        let recovery = recovered.authority_mut().recover().expect("recover");
-        assert_eq!(
-            recovery.recoverable_prepare_attempts,
-            vec![attempt_id.clone()]
-        );
-
-        let command = recovered
-            .prepare_recovered(&attempt_id)
-            .expect("recoverable prepare");
-        let mut controller = FakeController::new(vec![DispatchDisposition::Accepted {
-            correlation: "turn-1".to_owned(),
-        }]);
-        let disposition = command.dispatch(&mut controller);
-        recovered.conclude(disposition, vec![]).expect("conclude");
-        assert_eq!(controller.dispatch_count(), 1);
-        assert!(matches!(
-            recovered.prepare_recovered(&attempt_id),
-            Err(DispatchError::PreSend(_))
-        ));
-
-        let mut restarted_again = restarted(recovered.authority_mut().persist());
-        let recovery = restarted_again
-            .authority_mut()
-            .recover()
-            .expect("recover again");
-        assert!(recovery.recoverable_prepare_attempts.is_empty());
-        assert!(matches!(
-            restarted_again.prepare_recovered(&attempt_id),
-            Err(DispatchError::PreSend(_))
-        ));
-        let replay = restarted_again
-            .admit(&req("req-1", "sig-1", "crash before prepare"))
-            .expect("replay after recovered dispatch");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert!(replay.into_receipt().is_none());
-    }
-
-    #[test]
-    fn command_is_single_use_across_restart_and_replay() {
-        // One dispatch ever: replay and restart cannot re-assemble work.
-        let mut coord = coordinated();
-        let attempt_id = drive_full_cycle(&mut coord, "req-1", "sig-1");
-
-        // Exact replay: Replay outcome, no receipt, no new dispatch.
-        let replay = coord
-            .admit(&req("req-1", "sig-1", "hello"))
-            .expect("replay");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert!(replay.into_receipt().is_none());
-
-        // Restart: fresh authority from the same backend; the durable
-        // consumption markers survive and gates stay closed.
-        let mut coord2 = restarted(coord.authority_mut().persist());
-        let recovery = coord2.authority_mut().recover().expect("recover");
-        assert!(
-            !recovery
-                .derivable_ambiguous_attempts()
-                .contains(&attempt_id)
-        );
-        let replay2 = coord2
-            .admit(&req("req-1", "sig-1", "hello"))
-            .expect("replay after restart");
-        assert_eq!(replay2.outcome, ClaimOutcome::Replay);
-        assert!(replay2.into_receipt().is_none());
-    }
-
-    #[test]
-    fn conclusion_failure_leaves_attempt_recoverable() {
-        // Session 1: prepare + dispatch + atomic conclusion failure.
-        let persist = FakePersist {
-            next_conclusion_error: Some("commit failed".to_owned()),
-            ..Default::default()
-        };
-        let mut authority = DaemonAuthority::new(persist, now());
-        authority.register_arm(arm()).expect("register");
-        let mut coord = HostCoordinator::new(authority);
-
-        let admission = coord.admit(&req("req-1", "sig-1", "hello")).expect("admit");
-        let receipt = admission.into_receipt().expect("receipt");
-        let command = coord.prepare(receipt).expect("prepare");
-        let attempt = command.attempt_id().to_owned();
-        let mut controller = accepting_controller_for(&attempt);
-        let disposition = command.dispatch(&mut controller);
-        let observations: Vec<_> = std::iter::once(controller.poll_observation(&attempt))
-            .chain(std::iter::once(controller.poll_observation(&attempt)))
-            .flatten()
-            .collect();
-        let err = coord
-            .conclude(disposition, observations)
-            .expect_err("atomic conclusion failure");
-        assert!(matches!(err, DispatchError::PostSend(_)));
-        assert_eq!(
-            controller.dispatch_count(),
-            1,
-            "exactly one native dispatch"
-        );
-
-        // Nothing durable recorded; the attempt survives restart as
-        // ambiguous and the token was not consumed.
-        let snapshot = coord
-            .authority_mut()
-            .persist_mut()
-            .recover()
-            .expect("snapshot");
-        assert!(!snapshot.concluded_set.contains_key("attempt-1"));
-
-        let mut coord2 = restarted(coord.authority_mut().persist());
-        let recovery = coord2.authority_mut().recover().expect("recover");
-        assert!(
-            recovery
-                .derivable_ambiguous_attempts()
-                .contains(&"attempt-1".to_owned())
-        );
-
-        // Re-admitting the same request yields Replay — never a second
-        // dispatch-capable grant. The provider saw exactly one dispatch.
-        let replay = coord2
-            .admit(&req("req-1", "sig-1", "hello"))
-            .expect("replay");
-        assert_eq!(replay.outcome, ClaimOutcome::Replay);
-        assert!(replay.into_receipt().is_none());
-        assert_eq!(controller.dispatch_count(), 1);
-    }
-
-    #[test]
-    fn coordinator_split_phase_reconcile_probes_outside_authority() {
-        let mut coord = coordinated();
-        // Ambiguous lifecycle through the coordinator.
-        {
-            let admission = coord.admit(&req("req-1", "sig-1", "hello")).expect("admit");
-            let receipt = admission.into_receipt().expect("receipt");
-            let command = coord.prepare(receipt).expect("prepare");
-            let mut controller = FakeController::new(vec![DispatchDisposition::Ambiguous]);
-            let disposition = command.dispatch(&mut controller);
-            coord.conclude(disposition, vec![]).expect("conclude");
+    fn request() -> ClaimRequest {
+        ClaimRequest {
+            arm_id: "arm-a".to_owned(),
+            request_id: "claim-a".to_owned(),
+            signal_id: "signal-a".to_owned(),
+            events: vec![gearwit_protocol::ProviderEvent {
+                provider: "example".to_owned(),
+                event_ref: "event-a".to_owned(),
+                actor: None,
+                observed_at: "2026-01-15T12:00:00Z".to_owned(),
+                body: "untrusted".to_owned(),
+            }],
         }
-        let attempt_id = "attempt-1";
+    }
 
-        // Phase 1: authority only.
-        let work = coord
-            .prepare_reconciliation(attempt_id)
-            .expect("prepare reconciliation");
+    fn recovered_unknown() -> HostCoordinator<SharedFakePersist> {
+        let mut coordinator = coordinator();
+        let admission = coordinator.admit(&request()).expect("admit");
+        let scope = coordinator
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect("prepare");
+        let mut controller = FakeController::new(
+            vec![FakeIdleState::Idle(1)],
+            vec![NativeWriteDisposition::Unknown],
+        )
+        .with_now(now());
+        let probe = controller.probe_idle(scope);
+        let CoordinatedProbe::Ready(write) = coordinator.authorize_probe(probe).expect("authorize")
+        else {
+            panic!("ready");
+        };
+        let ReservedControllerWrite { lane, command } = *write;
+        let disposition = controller.write_reserved_turn(lane, command);
+        coordinator
+            .conclude_native_write(disposition)
+            .expect("unknown");
+        let backend = coordinator.authority_mut().inspect_persist().clone();
+        HostCoordinator::recover(DaemonAuthority::new(backend, now())).expect("recover")
+    }
 
-        // Between phases the authority is free for other production use.
-        coord
-            .authority_mut()
-            .advance_generation("arm-01")
-            .expect("re-arm between reconciliation phases");
-
-        // Phase 2: provider probe strictly outside authority.
-        let controller = FakeController::new(vec![])
-            .with_reconciliation(ReconciliationDisposition::ProvenNotAccepted);
-        let disposition = controller.reconcile(work.attempt_id());
-
-        // Phase 3: authority commit.
-        let result = coord
-            .commit_reconciliation(work, disposition)
-            .expect("commit");
-        assert_eq!(result, ReconciliationDisposition::ProvenNotAccepted);
-
-        let mut coord2 = restarted(coord.authority_mut().persist());
-        let recovery = coord2.authority_mut().recover().expect("recover");
-        assert!(
-            !recovery
-                .derivable_ambiguous_attempts()
-                .contains(&attempt_id.to_owned()),
-            "resolved attempt must not be derivable"
-        );
+    fn durable_conclusion_counts(
+        coordinator: &mut HostCoordinator<SharedFakePersist>,
+    ) -> (usize, usize, usize) {
+        let mut backend = coordinator.authority_mut().inspect_persist().clone();
+        let snapshot = backend.recover_authority_state().expect("snapshot");
+        (
+            snapshot.native_write_evidence.len(),
+            snapshot.native_turn_facts.len(),
+            snapshot.reconciliations.len(),
+        )
     }
 
     #[test]
-    fn refreshed_coordinator_after_restart_serves_full_lifecycle() {
-        // Proves recovered authority state is usable — not just
-        // reconstructed — by running a complete fresh cycle.
-        let mut coord = coordinated();
-        let _ = drive_full_cycle(&mut coord, "req-1", "sig-1");
-        coord
-            .authority_mut()
-            .set_rearmed("arm-01")
-            .expect("rearm persisting");
+    fn one_idle_probe_reserves_and_writes_one_fixed_turn() {
+        let mut coordinator = coordinator();
+        let admission = coordinator.admit(&request()).expect("admit");
+        let scope = coordinator
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect("prepare");
+        let mut controller = FakeController::new(
+            vec![FakeIdleState::Idle(4)],
+            vec![NativeWriteDisposition::Accepted {
+                turn_ref: PrivateNativeRef([8; 32]),
+            }],
+        )
+        .with_now(now());
+        let probe = controller.probe_idle(scope);
+        let CoordinatedProbe::Ready(write) = coordinator.authorize_probe(probe).expect("authorize")
+        else {
+            panic!("ready");
+        };
+        let ReservedControllerWrite { lane, command } = *write;
+        let turn_scope = command.turn_scope();
+        let mut backend = coordinator.authority_mut().inspect_persist().clone();
+        let turn = backend
+            .seal_native_coordinate(
+                &turn_scope,
+                &SecretNativeCoordinate::turn("coordinator-turn").expect("turn"),
+            )
+            .expect("seal turn");
+        let _ = controller.write_reserved_turn(lane, command);
+        let disposition = NativeWriteDisposition::Accepted {
+            turn_ref: turn.clone(),
+        };
+        controller = controller.with_observations(vec![Some(NativeTurnFact::Started {
+            turn_ref: turn.clone(),
+        })]);
+        assert!(controller.native_bytes() > 0);
+        coordinator
+            .conclude_native_write(Ok(disposition))
+            .expect("conclude");
+        assert!(coordinator.has_pending_native_authority());
+        assert_eq!(
+            coordinator
+                .poll_and_record_exact(&mut controller)
+                .expect("poll and persist"),
+            Some(IdempotentWrite::Recorded)
+        );
+        let backend = coordinator.authority_mut().inspect_persist().clone();
+        let mut recovered = HostCoordinator::recover(DaemonAuthority::new(backend, now()))
+            .expect("recover observation");
+        assert!(recovered.has_pending_native_authority());
+        let mut terminal = FakeController::new(vec![], vec![]).with_observations(vec![Some(
+            NativeTurnFact::Terminal {
+                turn_ref: turn,
+                class: crate::controller::TerminalClass::Succeeded,
+            },
+        )]);
+        recovered
+            .poll_and_record_exact(&mut terminal)
+            .expect("persist terminal");
+        assert!(!recovered.has_pending_native_authority());
 
-        let mut coord2 = restarted(coord.authority_mut().persist());
-        coord2.authority_mut().recover().expect("recover");
-        coord2
-            .authority_mut()
-            .advance_generation("arm-01")
-            .expect("re-arm after restart");
+        let backend = recovered.authority_mut().inspect_persist().clone();
+        let closed = HostCoordinator::recover(DaemonAuthority::new(backend, now()))
+            .expect("recover terminal");
+        assert!(!closed.has_pending_native_authority());
+    }
 
-        let admission = coord2
-            .admit(&req("req-3", "sig-3", "fresh"))
-            .expect("fresh admission after restart");
-        assert_eq!(admission.attempt_id, "attempt-2");
-        let receipt = admission.into_receipt().expect("receipt");
-        let command = coord2.prepare(receipt).expect("prepare");
-        let attempt = command.attempt_id().to_owned();
-        let mut controller2 = accepting_controller_for(&attempt);
-        let disposition = command.dispatch(&mut controller2);
-        let observations: Vec<_> = std::iter::once(controller2.poll_observation(&attempt))
-            .chain(std::iter::once(controller2.poll_observation(&attempt)))
-            .flatten()
-            .collect();
-        coord2
-            .conclude(disposition, observations)
-            .expect("conclude after restart");
-        assert_eq!(controller2.dispatch_count(), 1);
+    #[test]
+    fn unknown_write_recovers_only_as_metadata_and_is_never_resent() {
+        let mut recovered = recovered_unknown();
+        assert!(recovered.has_pending_native_authority());
+        let turn_scope = recovered
+            .reconciling
+            .as_ref()
+            .expect("reconciliation scope")
+            .turn_scope();
+        let mut backend = recovered.authority_mut().inspect_persist().clone();
+        let turn_ref = backend
+            .seal_native_coordinate(
+                &turn_scope,
+                &SecretNativeCoordinate::turn("reconciled-turn").expect("turn"),
+            )
+            .expect("seal reconciled turn");
+        let mut reconciler = FakeController::new(vec![], vec![])
+            .with_reconciliation(ReconciliationDisposition::Accepted {
+                turn_ref: turn_ref.clone(),
+            })
+            .with_observations(vec![Some(NativeTurnFact::Started {
+                turn_ref: turn_ref.clone(),
+            })]);
+        assert_eq!(
+            recovered
+                .reconcile_and_record(&mut reconciler)
+                .expect("reconcile and persist"),
+            IdempotentWrite::Recorded
+        );
+        assert!(recovered.has_pending_native_authority());
+        recovered
+            .poll_and_record_exact(&mut reconciler)
+            .expect("persist reconciled start");
+        assert!(recovered.has_pending_native_authority());
+
+        let backend = recovered.authority_mut().inspect_persist().clone();
+        let restarted = HostCoordinator::recover(DaemonAuthority::new(backend, now()))
+            .expect("recover reconciliation");
+        assert!(restarted.has_pending_native_authority());
+    }
+
+    #[test]
+    fn uncertain_observations_enter_reconciliation() {
+        for fact in [
+            NativeTurnFact::DegradedTerminalObservation,
+            NativeTurnFact::Unknown,
+            NativeTurnFact::ControllerLost,
+        ] {
+            let mut coordinator = coordinator();
+            let admission = coordinator.admit(&request()).expect("admit");
+            let scope = coordinator
+                .prepare(admission.into_receipt().expect("receipt"))
+                .expect("prepare");
+            let mut controller = FakeController::new(
+                vec![FakeIdleState::Idle(4)],
+                vec![NativeWriteDisposition::Accepted {
+                    turn_ref: PrivateNativeRef([8; 32]),
+                }],
+            )
+            .with_now(now());
+            let probe = controller.probe_idle(scope);
+            let CoordinatedProbe::Ready(write) =
+                coordinator.authorize_probe(probe).expect("authorize")
+            else {
+                panic!("ready");
+            };
+            let ReservedControllerWrite { lane, command } = *write;
+            let turn_scope = command.turn_scope();
+            let mut backend = coordinator.authority_mut().inspect_persist().clone();
+            let turn = backend
+                .seal_native_coordinate(
+                    &turn_scope,
+                    &SecretNativeCoordinate::turn("uncertain-turn").expect("turn"),
+                )
+                .expect("seal turn");
+            let _ = controller.write_reserved_turn(lane, command);
+            coordinator
+                .conclude_native_write(Ok(NativeWriteDisposition::Accepted { turn_ref: turn }))
+                .expect("conclude");
+            controller = controller.with_observations(vec![Some(fact)]);
+            assert_eq!(
+                coordinator
+                    .poll_and_record_exact(&mut controller)
+                    .expect("record uncertain observation"),
+                Some(IdempotentWrite::Recorded)
+            );
+            let mut reconciler = FakeController::new(vec![], vec![])
+                .with_reconciliation(ReconciliationDisposition::Unknown);
+            assert_eq!(
+                coordinator
+                    .reconcile_and_record(&mut reconciler)
+                    .expect("reconciliation scope"),
+                IdempotentWrite::Recorded
+            );
+            assert!(coordinator.has_pending_native_authority());
+        }
+    }
+
+    #[test]
+    fn proven_prewrite_rejection_never_opens_reconciliation() {
+        let mut coordinator = coordinator();
+        let admission = coordinator.admit(&request()).expect("admit");
+        let scope = coordinator
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect("prepare");
+        let mut controller =
+            FakeController::new(vec![FakeIdleState::Idle(1)], vec![]).with_now(now());
+        let probe = controller.probe_idle(scope);
+        let CoordinatedProbe::Ready(_) = coordinator.authorize_probe(probe).expect("authorize")
+        else {
+            panic!("ready");
+        };
+        coordinator
+            .conclude_native_write(Ok(NativeWriteDisposition::ProvenNotAccepted))
+            .expect("conclude prewrite rejection");
+        assert!(!coordinator.has_pending_native_authority());
+    }
+
+    #[test]
+    fn controller_write_binding_rejection_records_no_conclusion() {
+        let mut coordinator = coordinator();
+        let admission = coordinator.admit(&request()).expect("admit");
+        let scope = coordinator
+            .prepare(admission.into_receipt().expect("receipt"))
+            .expect("prepare");
+        let mut controller = FakeController::new(
+            vec![FakeIdleState::Idle(1)],
+            vec![NativeWriteDisposition::ProvenNotAccepted],
+        )
+        .with_now(now())
+        .with_write_binding_rejection();
+        let probe = controller.probe_idle(scope);
+        let CoordinatedProbe::Ready(write) = coordinator.authorize_probe(probe).expect("authorize")
+        else {
+            panic!("ready");
+        };
+        let before = durable_conclusion_counts(&mut coordinator);
+        let ReservedControllerWrite { lane, command } = *write;
+        let result = controller.write_reserved_turn(lane, command);
+        assert_eq!(controller.native_bytes(), 0);
+        assert_eq!(
+            coordinator.conclude_native_write(result),
+            Err(AuthorityError::Unauthorized)
+        );
+        assert_eq!(durable_conclusion_counts(&mut coordinator), before);
+        assert!(!coordinator.has_pending_native_authority());
+    }
+
+    #[test]
+    fn controller_reconciliation_binding_rejection_records_no_conclusion() {
+        let mut coordinator = recovered_unknown();
+        let before = durable_conclusion_counts(&mut coordinator);
+        let mut wrong_controller =
+            FakeController::new(vec![], vec![]).with_reconciliation_binding_rejection();
+
+        assert_eq!(
+            coordinator.reconcile_and_record(&mut wrong_controller),
+            Err(AuthorityError::Unauthorized)
+        );
+        assert_eq!(wrong_controller.native_bytes(), 0);
+        assert_eq!(durable_conclusion_counts(&mut coordinator), before);
+        assert!(coordinator.has_pending_native_authority());
+    }
+
+    #[test]
+    fn reconciliation_closed_outcomes_do_not_reopen_after_restart() {
+        for terminal in [false, true] {
+            let mut recovered = recovered_unknown();
+            let disposition = if terminal {
+                let turn_scope = recovered
+                    .reconciling
+                    .as_ref()
+                    .expect("reconciliation scope")
+                    .turn_scope();
+                let mut backend = recovered.authority_mut().inspect_persist().clone();
+                ReconciliationDisposition::Terminal {
+                    turn_ref: backend
+                        .seal_native_coordinate(
+                            &turn_scope,
+                            &SecretNativeCoordinate::turn("terminal-turn").expect("turn"),
+                        )
+                        .expect("seal terminal turn"),
+                    class: crate::controller::TerminalClass::Failed,
+                }
+            } else {
+                ReconciliationDisposition::ProvenNotAccepted
+            };
+            let mut reconciler =
+                FakeController::new(vec![], vec![]).with_reconciliation(disposition.clone());
+            recovered
+                .reconcile_and_record(&mut reconciler)
+                .expect("persist closed reconciliation");
+            assert!(!recovered.has_pending_native_authority());
+            let backend = recovered.authority_mut().inspect_persist().clone();
+            if matches!(disposition, ReconciliationDisposition::Terminal { .. }) {
+                let mut inspection = DaemonAuthority::new(backend.clone(), now());
+                let recovery = inspection.recover().expect("inspect terminal facts");
+                assert!(matches!(
+                    recovery.snapshot.native_turn_facts[0].facts.as_slice(),
+                    [NativeTurnFact::Terminal { .. }]
+                ));
+            }
+            let restarted = HostCoordinator::recover(DaemonAuthority::new(backend, now()))
+                .expect("recover closed reconciliation");
+            assert!(!restarted.has_pending_native_authority());
+        }
+
+        let mut recovered = recovered_unknown();
+        let mut unresolved = FakeController::new(vec![], vec![])
+            .with_reconciliation(ReconciliationDisposition::Unknown);
+        recovered
+            .reconcile_and_record(&mut unresolved)
+            .expect("persist unknown reconciliation");
+        let backend = recovered.authority_mut().inspect_persist().clone();
+        let restarted = HostCoordinator::recover(DaemonAuthority::new(backend, now()))
+            .expect("recover unknown reconciliation");
+        assert!(restarted.has_pending_native_authority());
     }
 }
