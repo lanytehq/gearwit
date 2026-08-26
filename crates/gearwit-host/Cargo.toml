@@ -15,6 +15,11 @@ workspace = true
 gearwit-protocol.workspace = true
 ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.4", default-features = false }
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
-rsfulmen = { version = "0.1.6", default-features = false, features = ["logging"] }
+# sysprims v0.1.18 pins its shared logging ABI to rsfulmen 0.1.5.
+rsfulmen = { version = "=0.1.5", default-features = false, features = ["logging"] }
+serde_json = "1"
+sysprims-proc = { git = "https://github.com/3leaps/sysprims", tag = "v0.1.18" }
+sysprims-session = { git = "https://github.com/3leaps/sysprims", tag = "v0.1.18" }
+sysprims-signal = { git = "https://github.com/3leaps/sysprims", tag = "v0.1.18" }
 time = { version = "0.3", default-features = false, features = ["parsing", "formatting", "macros"] }
 ulid = "1"
