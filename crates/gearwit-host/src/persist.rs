@@ -1,687 +1,692 @@
-//! Semantic persistence port for gearwitd authority.
-//!
-//! Defines the operational contract for durable claim admission, monotonic
-//! transition recording, and restart recovery. Backends implement this port;
-//! the daemon treats it as the single durability boundary.
+//! Sealed semantic persistence port for native-controller authority.
 
-use crate::controller::ManagedCapability;
-use gearwit_protocol::{ProviderEvent, WaiterLinkError};
-use std::collections::BTreeMap;
+use crate::controller::{
+    ActiveObservationEvidenceRef, ActiveObservationFingerprint, ActiveObservationProof, ArmId,
+    AttemptId, ClaimRequestId, ControllerBirthId, ManagedCapability, NativeCoordinateKind,
+    NativeCoordinateScope, NativeMutationEpoch, NativeTurnFact, NativeWriteReservation,
+    OpenedNativeCoordinate, PersistedTurnCorrelation, PrivateNativeRef, ReconciliationDisposition,
+    ReconciliationScope, RequestNonce, SeatId, SecretNativeCoordinate, SignalId,
+    ValidatedIdlePermit, VerifierRef,
+};
+use gearwit_protocol::ProviderEvent;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
+use zeroize::Zeroizing;
 
-/// A generation-stamped, durably recorded claim for a stable event batch.
-///
-/// Identity is defined by `request_id` alone; content equality includes
-/// arm, generation, `signal_id`, `event_refs`, event bodies, provider,
-/// actor, and `observed_at`. The server-minted `claimed_at` timestamp is
-/// excluded from content equality so that an exact replay at a later
-/// wall-clock time matches.
-#[derive(Clone, Debug)]
-pub struct DurableClaim {
-    /// Stable claim request id.
-    pub request_id: String,
-    /// Arm id.
-    pub arm_id: String,
-    /// Generation resolved at claim time under authority lock.
-    pub generation: u64,
-    /// Stable signal id.
-    pub signal_id: String,
-    /// Oldest-first event refs.
-    pub event_refs: Vec<String>,
-    /// Bounded events.
-    pub events: Vec<ProviderEvent>,
-    /// Timestamp the claim was recorded.
-    pub claimed_at: time::OffsetDateTime,
-}
-
-impl DurableClaim {
-    /// Content identity: same `request_id`, arm, generation, `signal_id`,
-    /// `event_refs`, event bodies, provider, actor, and `observed_at`.
-    /// Excludes `claimed_at`.
-    #[must_use]
-    pub fn content_eq(&self, other: &Self) -> bool {
-        self.request_id == other.request_id
-            && self.arm_id == other.arm_id
-            && self.generation == other.generation
-            && self.signal_id == other.signal_id
-            && self.event_refs == other.event_refs
-            && self.events.len() == other.events.len()
-            && self.events.iter().zip(other.events.iter()).all(|(a, b)| {
-                a.body == b.body
-                    && a.provider == b.provider
-                    && a.actor == b.actor
-                    && a.observed_at == b.observed_at
-            })
-    }
-}
-
-impl PartialEq for DurableClaim {
-    fn eq(&self, other: &Self) -> bool {
-        self.content_eq(other)
-    }
-}
-
-impl Eq for DurableClaim {}
-
-/// Transition the host can record beyond public lifecycle receipts.
-///
-/// These are private authority transitions with a defined monotonic order:
-/// `ClaimRecorded → DispatchPrepared`. From `DispatchPrepared` the path may
-/// go through `NativeAccepted → ExactTurnStart → ExactTurnTerminal`, or to
-/// `ReconciliationRequired` (ambiguous) or `ControllerLost` (link/process
-/// loss). `ReconciliationRequired` may also follow `NativeAccepted` instead
-/// of `ExactTurnStart`. `ReconciliationResolved` follows
-/// `ReconciliationRequired` (or `NativeAccepted` after an accepted
-/// reconciliation).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum Transition {
-    /// Durable claim recorded (generation-stamped, idempotency-checked).
-    ClaimRecorded = 0,
-    /// Controller dispatch attempt prepared.
-    DispatchPrepared = 1,
-    /// Native request accepted (private provider correlation).
-    NativeAccepted = 2,
-    /// Exact turn started.
-    ExactTurnStart = 3,
-    /// Exact turn terminal.
-    ExactTurnTerminal = 4,
-    /// Reconciliation required (ambiguous acceptance).
-    ReconciliationRequired = 5,
-    /// Reconciliation resolved.
-    ReconciliationResolved = 6,
-    /// Controller lost — some controller lifecycle transitions may follow but
-    /// further delivery is not guaranteed active.
-    ControllerLost = 7,
-}
-
-/// Validate a candidate transition against the recorded history for one
-/// attempt. Shared by `record_transition`, `record_prepared`, and
-/// `record_reconciliation` so every transition write goes through the same
-/// monotonic validator.
-fn validate_transition(
-    existing: Option<&[Transition]>,
-    transition: Transition,
-) -> Result<(), WaiterLinkError> {
-    match existing {
-        None => {
-            if transition != Transition::ClaimRecorded {
-                return Err(WaiterLinkError::Semantic(
-                    "first transition must be ClaimRecorded",
-                ));
-            }
-        }
-        Some(entry) => {
-            if entry.contains(&transition) {
-                return Err(WaiterLinkError::Semantic("duplicate transition"));
-            }
-            let last = *entry.last().expect("entry is non-empty");
-            let valid = match transition {
-                Transition::ReconciliationRequired => {
-                    matches!(
-                        last,
-                        Transition::DispatchPrepared
-                            | Transition::NativeAccepted
-                            | Transition::ReconciliationResolved
-                    )
-                }
-                Transition::ReconciliationResolved => {
-                    matches!(
-                        last,
-                        Transition::ReconciliationRequired | Transition::NativeAccepted
-                    )
-                }
-                Transition::NativeAccepted => {
-                    last == Transition::DispatchPrepared
-                        || last == Transition::ReconciliationRequired
-                }
-                Transition::ControllerLost => {
-                    matches!(
-                        last,
-                        Transition::DispatchPrepared
-                            | Transition::NativeAccepted
-                            | Transition::ExactTurnStart
-                    )
-                }
-                _ => transition as u8 == last as u8 + 1,
-            };
-            if !valid {
-                return Err(WaiterLinkError::Semantic("regressive transition"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Disposition of a reconciliation attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReconciliationState {
-    /// Proven not accepted.
-    ProvenNotAccepted,
-    /// Accepted.
-    Accepted,
-    /// Terminal.
-    Terminal,
-    /// Still unknown.
-    Unknown,
-}
-
-/// What the caller should do after persisting a claim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClaimOutcome {
-    /// Claim accepted; proceed to dispatch.
-    Admitted,
-    /// Exact replay of a previously recorded claim.
-    Replay,
-}
-
-/// Why a claim was rejected or failed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ClaimError {
-    /// A different batch is claimed on this (arm, generation).
-    OccupiedDifferent,
-    /// Generation resolved at claim time is stale.
-    StaleGeneration,
-    /// Signed-off batch conflicts with the recorded claim.
-    Conflict,
-    /// Storage unavailable or I/O failure.
-    StorageFailure(String),
-}
-
-/// Durability class the backend has proven.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DurabilityClass {
-    /// Claim is durable: flushed + fsynced before dispatch.
-    Durable,
-    /// Best-effort; backend cannot prove durability.
-    BestEffort,
-}
-
-/// Full arm policy durably persisted for recovery.
-///
-/// Reconstruction of a usable fresh authority must not require the caller
-/// to re-register arms; every policy dimension the live authority uses is
-/// persisted here.
+/// Full arm policy required to reconstruct daemon authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedArm {
-    /// Arm id.
-    pub arm_id: String,
-    /// Current generation.
+    pub arm_id: ArmId,
     pub generation: u64,
-    /// Seat token.
-    pub seat_id: String,
-    /// Attached route the arm admits.
-    pub route: String,
-    /// Closed capability granted to controller dispatches.
+    pub seat_id: SeatId,
     pub capability: ManagedCapability,
-    /// Coverage end.
     pub coverage_until: OffsetDateTime,
 }
 
-/// Non-bearer attachment state durably persisted for recovery.
-///
-/// Carries the exact minted record: seat, arm, generation, route, closed
-/// capability, lease, verifier reference, and revocation. No credential or
-/// proof material is persisted.
+/// Metadata-only claim record used by general recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PersistedAttachment {
-    /// Stable attempt id.
-    pub attempt_id: String,
-    /// Arm id.
-    pub arm_id: String,
-    /// Arm generation at claim time.
+pub struct PersistedClaimRecord {
+    pub attempt_id: AttemptId,
+    pub request_id: ClaimRequestId,
+    pub arm_id: ArmId,
     pub generation: u64,
-    /// Seat token.
-    pub seat_id: String,
-    /// Capability route.
-    pub route: String,
-    /// Closed capability granted.
+    pub signal_id: SignalId,
+    pub event_refs: Vec<String>,
+    pub claimed_at: OffsetDateTime,
+}
+
+/// Admission input. Event content is stored in the fake's isolated payload map
+/// and never appears in [`RecoverySnapshot`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimAdmission {
+    pub(crate) record: PersistedClaimRecord,
+    pub(crate) events: Vec<ProviderEvent>,
+}
+
+/// Durable attachment bound to one controller birth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedControllerAttachment {
+    pub attempt_id: AttemptId,
+    pub birth_id: ControllerBirthId,
+    pub seat_id: SeatId,
+    pub arm_id: ArmId,
+    pub generation: u64,
     pub capability: ManagedCapability,
-    /// Lease end.
     pub lease_until: OffsetDateTime,
-    /// Opaque verifier reference.
-    pub verifier_ref: String,
-    /// Whether the attachment is revoked.
+    pub verifier_ref: VerifierRef,
     pub revoked: bool,
 }
 
-/// Result of recovery after daemon restart.
-#[derive(Clone, Debug, Default)]
-pub struct RecoverySnapshot {
-    /// Durable claims that were live at shutdown.
-    pub claims: Vec<DurableClaim>,
-    /// Transitions recorded per `signal_id:attempt_id`.
-    pub transitions: BTreeMap<String, Vec<Transition>>,
-    /// Recorded dispatch dispositions keyed by attempt id.
-    pub dispositions: BTreeMap<String, crate::controller::DispatchDisposition>,
-    /// Claim `request_id` → `attempt_id` mapping for replay.
-    pub attempt_map: BTreeMap<String, String>,
-    /// Full arm policy records for authority reconstruction.
-    pub arms: Vec<PersistedArm>,
-    /// Attachment records for authority reconstruction.
-    pub attachments: Vec<PersistedAttachment>,
-    /// Exact persisted `attempt_id` → `signal_id` binding.
-    pub attempt_signals: BTreeMap<String, String>,
-    /// Reconciliation resolutions keyed by attempt id.
-    pub reconciliations: BTreeMap<String, ReconciliationState>,
-    /// Durably prepared attempts.
-    pub prepared_set: BTreeMap<String, bool>,
-    /// Durably consumed (concluded) attempts.
-    pub concluded_set: BTreeMap<String, bool>,
-    /// Handled cursor positions per arm.
-    pub handled_cursors: BTreeMap<String, String>,
-    /// Re-arm flags per arm.
-    pub rearm_positions: BTreeMap<String, bool>,
-    /// Verifier refs per `request_id` (for attachment reconstruction).
-    pub verifier_refs: BTreeMap<String, String>,
-    /// Monotonic attempt counter for new claim admissions after restart.
-    pub attempt_seq: u64,
+/// One durable controller birth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedControllerBirth {
+    pub birth_id: ControllerBirthId,
+    pub seat_id: SeatId,
+    pub arm_id: ArmId,
+    pub generation: u64,
+    pub capability: ManagedCapability,
+    pub lease_until: OffsetDateTime,
+    pub verifier_ref: VerifierRef,
+    pub created_at: OffsetDateTime,
+    pub revoked: bool,
 }
 
-/// Record produced by atomic claim admission.
+/// Native thread creation reserved before any create write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThreadCreateReservation {
+    pub birth_id: ControllerBirthId,
+    pub create_attempt_id: RequestNonce,
+    pub reserved_at: OffsetDateTime,
+}
+
+/// Exact creation resolution. Unknown remains quarantined.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThreadCreateResolution {
+    Owned { thread_ref: PrivateNativeRef },
+    ProvenNotAccepted,
+    Unknown,
+}
+
+/// Exact thread ownership state for a birth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThreadOwnershipState {
+    Absent,
+    Reserved {
+        create_attempt_id: RequestNonce,
+    },
+    Unknown {
+        create_attempt_id: RequestNonce,
+    },
+    ProvenNotAccepted {
+        create_attempt_id: RequestNonce,
+    },
+    Owned {
+        create_attempt_id: RequestNonce,
+        thread_ref: PrivateNativeRef,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedThreadOwnership {
+    pub birth_id: ControllerBirthId,
+    pub state: ThreadOwnershipState,
+}
+
+/// Durable zero-write conclusion before native acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreWriteConclusion {
+    HeldBeforeNativeWrite {
+        active_evidence_ref: ActiveObservationEvidenceRef,
+    },
+    IdleStateUnproven,
+    IdleEpochInvalidated {
+        probe_id: RequestNonce,
+        expected_epoch: NativeMutationEpoch,
+        observed_epoch: NativeMutationEpoch,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedActiveObservationEvidence {
+    pub evidence_ref: ActiveObservationEvidenceRef,
+    pub birth_id: ControllerBirthId,
+    pub create_attempt_id: RequestNonce,
+    pub seat_id: SeatId,
+    pub arm_id: ArmId,
+    pub generation: u64,
+    pub capability: ManagedCapability,
+    pub attachment_verifier_ref: VerifierRef,
+    pub lease_until: OffsetDateTime,
+    pub attempt_id: AttemptId,
+    pub signal_id: SignalId,
+    pub probe_id: RequestNonce,
+    pub mutation_epoch: NativeMutationEpoch,
+    pub observed_at: OffsetDateTime,
+    pub fingerprint: ActiveObservationFingerprint,
+    pub producer_version: String,
+    pub producer_dialect: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedPreWriteConclusion {
+    pub attempt_id: AttemptId,
+    pub signal_id: SignalId,
+    pub conclusion: PreWriteConclusion,
+    pub recorded_at: OffsetDateTime,
+}
+
+/// Durable native boundary evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeWriteEvidence {
+    ProvenNotAccepted,
+    WriterAccepted { write_id: RequestNonce },
+    ExactResponse { fact: NativeTurnFact },
+    Unknown,
+}
+
+/// Semantic operation result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdempotentWrite {
+    Recorded,
+    ExactReplay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReserveBirthOutcome {
+    Reserved,
+    ExactReplay,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimOutcome {
+    Admitted,
+    ExactReplay,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionRecord {
-    /// The admission outcome.
     pub outcome: ClaimOutcome,
-    /// The attempt id (recorded on first admission; returned on replay).
-    pub attempt_id: String,
-    /// Opaque verifier ref (newly minted on admission; returned on replay).
-    pub verifier_ref: String,
+    pub attempt_id: AttemptId,
+    pub verifier_ref: VerifierRef,
 }
 
-/// Semantic persistence port.
+/// Sealed semantic commits. Callers cannot provide raw ids to mutate state.
+#[derive(Debug)]
+pub struct ThreadCreateCommit {
+    pub(crate) birth_id: ControllerBirthId,
+    pub(crate) create_attempt_id: RequestNonce,
+    pub(crate) resolution: ThreadCreateResolution,
+    pub(crate) evidence_ref: VerifierRef,
+}
+
+#[derive(Debug)]
+pub struct PreparedDispatchCommit {
+    pub(crate) correlation: PersistedTurnCorrelation,
+}
+
+#[derive(Debug)]
+pub struct PreWriteConclusionCommit {
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) signal_id: SignalId,
+    pub(crate) conclusion: PreWriteConclusion,
+    pub(crate) recorded_at: OffsetDateTime,
+}
+
+pub struct ActiveHoldCommit {
+    pub(crate) proof: ActiveObservationProof,
+}
+
+#[derive(Debug)]
+pub struct NativeWriteEvidenceCommit {
+    pub(crate) correlation: PersistedTurnCorrelation,
+    pub(crate) evidence: NativeWriteEvidence,
+    pub(crate) evidence_ref: VerifierRef,
+}
+
+#[derive(Debug)]
+pub struct NativeTurnFactCommit {
+    pub(crate) correlation: PersistedTurnCorrelation,
+    pub(crate) fact: NativeTurnFact,
+    pub(crate) evidence_ref: VerifierRef,
+}
+
+#[derive(Debug)]
+pub struct ValidatedAttachmentScope {
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) birth_id: ControllerBirthId,
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) verifier_ref: VerifierRef,
+}
+
+/// Metadata for a reservation. Recovery can classify it but cannot remint its
+/// consumed in-memory authority products.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedNativeReservation {
+    pub correlation: PersistedTurnCorrelation,
+    pub probe_id: RequestNonce,
+    pub expected_epoch: NativeMutationEpoch,
+    pub concluded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedNativeWriteEvidence {
+    pub correlation: PersistedTurnCorrelation,
+    pub evidence: NativeWriteEvidence,
+    pub evidence_ref: VerifierRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedNativeTurnFacts {
+    pub attempt_id: AttemptId,
+    pub facts: Vec<NativeTurnFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedReconciliation {
+    pub attempt_id: AttemptId,
+    pub disposition: ReconciliationDisposition,
+}
+
+/// General recovery state contains authority metadata only.
+#[derive(Clone, Debug, Default)]
+pub struct RecoverySnapshot {
+    pub arms: Vec<PersistedArm>,
+    pub claims: Vec<PersistedClaimRecord>,
+    pub attachments: Vec<PersistedControllerAttachment>,
+    pub controller_births: Vec<PersistedControllerBirth>,
+    pub ownership: Vec<PersistedThreadOwnership>,
+    pub turn_correlations: Vec<PersistedTurnCorrelation>,
+    pub reservations: Vec<PersistedNativeReservation>,
+    pub native_write_evidence: Vec<PersistedNativeWriteEvidence>,
+    pub native_turn_facts: Vec<PersistedNativeTurnFacts>,
+    pub reconciliations: Vec<PersistedReconciliation>,
+    pub prewrite_conclusions: Vec<PersistedPreWriteConclusion>,
+    pub active_observations: Vec<PersistedActiveObservationEvidence>,
+    pub attempt_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistError {
+    Conflict,
+    InvalidTransition,
+    Unauthorized,
+    StorageUnavailable,
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Semantic host persistence port. There are no generic transition, raw
+/// disposition, content-load, or backend escape-hatch methods.
 ///
-/// # Contract
-///
-/// - `admit_claim` must durably record the claim, the authority-minted
-///   attachment, the exact attempt→signal binding, and `ClaimRecorded` in
-///   one atomic operation before the caller dispatches any external I/O.
-/// - `record_transition` must be monotonic — reject duplicate, stale,
-///   regressive, or conflicting transitions. Transitions are scoped to an
-///   attempt: different attempts on the same signal may progress
-///   independently.
-/// - `record_disposition` must durably record the dispatch disposition
-///   keyed by `attempt_id` for replay on restart.
-/// - `record_prepared` must atomically append `DispatchPrepared` and mark
-///   the attempt prepared — either both appear or neither does.
-/// - `record_conclusion` must atomically record the disposition, the first
-///   post-send transition, and the durable consumption marker — either all
-///   appear or none does. Durable single consumption covers restart.
-/// - `record_reconciliation` must persist the resolution enum keyed to the
-///   attempt and its transitions atomically, failing closed when the
-///   attempt→signal binding is absent or mismatched.
-/// - `recover` must return live claims, transitions, dispositions,
-///   attachments, arm policy, bindings, resolutions, handled cursors, and
-///   re-arm positions after restart.
-/// - `durability` must report the backend's proven class, not a weaker
-///   fallback.
-/// - No bearer capability, proof material, credential, or controller
-///   secret may be persisted.
-pub trait Persist {
-    /// Atomically admit one generation-fenced claim: durably record the
-    /// claim, mint the attempt identity, store the authority-produced
-    /// attachment, record the exact attempt→signal binding, record
-    /// `ClaimRecorded`, and store an opaque verifier reference — all as
-    /// one operation.
-    ///
-    /// `attachment` is the authority-minted attachment for a new
-    /// admission; on exact replay it is ignored and the previously
-    /// recorded attempt/verifier state is returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClaimError`] when the claim is stale, conflicts, or
-    /// storage is unavailable.
+/// ```compile_fail
+/// use gearwit_host::Persist;
+/// fn append_generic_transition<P: Persist>(persist: &mut P) {
+///     persist.record_transition();
+/// }
+/// ```
+#[allow(clippy::missing_errors_doc)]
+pub trait Persist: sealed::Sealed {
+    fn persist_arm(&mut self, arm: &PersistedArm) -> Result<(), PersistError>;
     fn admit_claim(
         &mut self,
-        claim: &DurableClaim,
-        attachment: Option<&PersistedAttachment>,
-    ) -> Result<AdmissionRecord, ClaimError>;
-
-    /// Append a monotonic lifecycle transition for an attempt. The
-    /// transition must be strictly after the last recorded transition
-    /// for this attempt.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] on duplicate, stale,
-    /// regressive, or conflicting transitions.
-    fn record_transition(
+        admission: &ClaimAdmission,
+        attachment: &PersistedControllerAttachment,
+    ) -> Result<AdmissionRecord, PersistError>;
+    fn reserve_controller_birth(
         &mut self,
-        signal_id: &str,
-        attempt_id: &str,
-        transition: Transition,
-    ) -> Result<(), WaiterLinkError>;
-
-    /// Record a dispatch disposition keyed by `attempt_id` for replay
-    /// on restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] if a different disposition
-    /// is already recorded for this `attempt_id`.
-    fn record_disposition(
+        birth: &PersistedControllerBirth,
+        create: &ThreadCreateReservation,
+    ) -> Result<ReserveBirthOutcome, PersistError>;
+    fn resolve_thread_create(
         &mut self,
-        attempt_id: &str,
-        disposition: &crate::controller::DispatchDisposition,
-    ) -> Result<(), WaiterLinkError>;
-
-    /// Report the backend's proven durability class.
-    fn durability(&self) -> DurabilityClass;
-
-    /// Report backend identity for diagnostics.
-    fn backend_identity(&self) -> &'static str;
-
-    /// Recover state after daemon restart.
-    ///
-    /// Returns claims, transitions, dispositions, attempt mappings,
-    /// arm policy, attachments, attempt→signal bindings, reconciliation
-    /// resolutions, handled cursors, and re-arm positions for full
-    /// authority reconstruction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClaimError::StorageFailure`] when the backend is
-    /// unavailable or corrupt.
-    fn recover(&mut self) -> Result<RecoverySnapshot, ClaimError>;
-
-    /// Atomically record a dispatch prepare: append `DispatchPrepared`
-    /// and mark the attempt prepared in one semantic commit.
-    ///
-    /// Fails closed when there is no persisted attempt→signal binding,
-    /// when the supplied `signal_id` does not match the persisted
-    /// binding, or when the attempt was already prepared or concluded.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] if any part fails.
-    fn record_prepared(&mut self, signal_id: &str, attempt_id: &str)
-    -> Result<(), WaiterLinkError>;
-
-    /// Atomically record a dispatch conclusion: disposition plus the
-    /// first required post-send transition plus the durable consumption
-    /// marker in one semantic commit.
-    ///
-    /// The implementation must stage/validate all writes and commit
-    /// them together. No partial write may be observable — either the
-    /// disposition, transition, and consumption marker all appear or
-    /// none of them does.
-    ///
-    /// For `Accepted`, this is disposition + `NativeAccepted`.
-    /// For `Ambiguous`, this is disposition + `ReconciliationRequired`.
-    /// For `Rejected`, this is disposition only (no transition).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] if any part of the atomic
-    /// write fails or the attempt was already concluded.
-    fn record_conclusion(
-        &mut self,
-        attempt_id: &str,
-        signal_id: &str,
-        disposition: &crate::controller::DispatchDisposition,
-        first_transition: Option<Transition>,
-    ) -> Result<(), WaiterLinkError>;
-
-    /// True if the attempt has been durably consumed by a conclusion.
-    /// Checked before conclusion to enforce the durable single-conclusion
-    /// invariant.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when the check fails.
-    fn has_concluded(&self, attempt_id: &str) -> Result<bool, WaiterLinkError>;
-
-    /// Persist the full arm policy (`arm_id`, generation, seat, route,
-    /// capability, coverage) for recovery after restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
-    fn persist_arm_state(&mut self, arm: &PersistedArm) -> Result<(), WaiterLinkError>;
-
-    /// Durably mark an attempt's attachment revoked.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when persistence fails or no
-    /// attachment is persisted for the attempt.
-    fn persist_attachment_revoked(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError>;
-
-    /// Persist a handled cursor position for recovery after restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
-    fn persist_handled_cursor(&mut self, arm_id: &str, cursor: &str)
-    -> Result<(), WaiterLinkError>;
-
-    /// Persist a re-arm flag for recovery after restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when persistence fails.
-    fn persist_rearmed(&mut self, arm_id: &str) -> Result<(), WaiterLinkError>;
-
-    /// The durable claim bound to an `attempt_id`, if recorded at
-    /// admission. The authority rehydrates dispatch identity from this
-    /// record, not from caller-carried data.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when the lookup fails.
-    fn claim_for_attempt(&self, attempt_id: &str) -> Result<Option<DurableClaim>, WaiterLinkError>;
-
-    /// The exact persisted `signal_id` for an `attempt_id`, if the
-    /// binding was durably recorded at admission.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when the lookup fails.
-    fn attempt_signal(&self, attempt_id: &str) -> Result<Option<String>, WaiterLinkError>;
-
-    /// The persisted reconciliation resolution for an attempt, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when the lookup fails.
-    fn reconciliation_recorded(
+        commit: ThreadCreateCommit,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn thread_ownership_state(
         &self,
-        attempt_id: &str,
-    ) -> Result<Option<ReconciliationState>, WaiterLinkError>;
-
-    /// Durably record a reconciliation resolution for an attempt.
-    ///
-    /// Persists the resolution enum keyed to the attempt and appends the
-    /// completed resolution transitions atomically. Fails closed when the
-    /// persisted attempt→signal binding is absent or mismatched, when the
-    /// attempt has no prior `ReconciliationRequired` transition, or when a
-    /// conflicting terminal resolution is already recorded. `Unknown` is
-    /// provisional and may be atomically upgraded to a final resolution.
-    /// Repeating the same resolution is idempotent and appends no duplicate
-    /// transitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaiterLinkError::Semantic`] when any part fails.
-    fn record_reconciliation(
+        birth_id: &ControllerBirthId,
+    ) -> Result<ThreadOwnershipState, PersistError>;
+    fn seal_native_coordinate(
         &mut self,
-        attempt_id: &str,
-        signal_id: &str,
-        state: ReconciliationState,
-    ) -> Result<(), WaiterLinkError>;
+        scope: &NativeCoordinateScope,
+        coordinate: &SecretNativeCoordinate,
+    ) -> Result<PrivateNativeRef, PersistError>;
+    fn open_native_coordinate(
+        &self,
+        scope: &NativeCoordinateScope,
+        native_ref: &PrivateNativeRef,
+    ) -> Result<OpenedNativeCoordinate, PersistError>;
+    fn record_dispatch_prepared(
+        &mut self,
+        commit: PreparedDispatchCommit,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn record_prewrite_conclusion(
+        &mut self,
+        commit: PreWriteConclusionCommit,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn record_active_hold(
+        &mut self,
+        commit: ActiveHoldCommit,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn reserve_native_turn_write(
+        &mut self,
+        idle: ValidatedIdlePermit,
+        correlation: &PersistedTurnCorrelation,
+    ) -> Result<NativeWriteReservation, PersistError>;
+    fn record_native_write_evidence(
+        &mut self,
+        commit: NativeWriteEvidenceCommit,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn record_native_turn_fact(
+        &mut self,
+        commit: NativeTurnFactCommit,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn record_reconciliation_fact(
+        &mut self,
+        scope: &ReconciliationScope,
+        disposition: &ReconciliationDisposition,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn revoke_controller_attachment(
+        &mut self,
+        scope: ValidatedAttachmentScope,
+    ) -> Result<IdempotentWrite, PersistError>;
+    fn recover_authority_state(&mut self) -> Result<RecoverySnapshot, PersistError>;
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic fake for unit tests
-// ---------------------------------------------------------------------------
+/// Deterministic semantic fake. Payload content is intentionally isolated from
+/// all recovery and authority inspection records.
+#[derive(Clone)]
+struct RecoveryCoordinate {
+    scope: NativeCoordinateScope,
+    plaintext: Zeroizing<Vec<u8>>,
+}
 
-/// Deterministic in-memory fake that implements [`Persist`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct FakePersist {
-    /// Claims keyed by `request_id`.
-    pub claims: BTreeMap<String, DurableClaim>,
-    /// Transitions keyed by (`signal_id`, `attempt_id`).
-    pub transitions: BTreeMap<(String, String), Vec<Transition>>,
-    /// Dispositions keyed by `attempt_id`.
-    pub dispositions: BTreeMap<String, crate::controller::DispatchDisposition>,
-    /// Attempt id per `request_id` (for replay lookups).
-    pub claim_attempts: BTreeMap<String, String>,
-    /// Verifier ref per `request_id`.
-    pub verifier_refs: BTreeMap<String, String>,
-    /// Full arm policy keyed by `arm_id`.
-    pub persisted_arms: BTreeMap<String, PersistedArm>,
-    /// Attachment records keyed by `attempt_id`.
-    pub persisted_attachments: BTreeMap<String, PersistedAttachment>,
-    /// Exact attempt→signal bindings keyed by `attempt_id`.
-    pub attempt_signals: BTreeMap<String, String>,
-    /// Reconciliation resolutions keyed by `attempt_id`.
-    pub reconciliations: BTreeMap<String, ReconciliationState>,
-    /// Set of durably prepared `attempt_ids`.
-    pub prepared_set: BTreeMap<String, bool>,
-    /// Set of durably concluded `attempt_ids`.
-    pub concluded_set: BTreeMap<String, bool>,
-    /// Monotonic attempt counter.
-    pub attempt_seq: u64,
-    /// When set, `admit_claim` returns `StorageFailure` with this message
-    /// instead of succeeding.
-    pub next_claim_error: Option<String>,
-    /// When set, `record_transition` returns an error with this message.
-    pub next_transition_error: Option<String>,
-    /// When set, `record_disposition` returns an error with this message.
-    pub next_disposition_error: Option<String>,
-    /// When set, `record_prepared` returns an error with this message.
-    pub next_prepare_error: Option<String>,
-    /// When set, `record_conclusion` fails atomically with this message.
-    pub next_conclusion_error: Option<String>,
-    /// When set, `persist_arm_state` returns an error with this message.
-    pub next_arm_persist_error: Option<String>,
-    /// When set, `persist_attachment_revoked` returns an error with this
-    /// message.
-    pub next_revoke_error: Option<String>,
-    /// When set, `persist_handled_cursor` returns an error with this message.
-    pub next_cursor_error: Option<String>,
-    /// When set, `persist_rearmed` returns an error with this message.
-    pub next_rearm_error: Option<String>,
-    /// When set, `record_reconciliation` returns an error with this message.
-    pub next_reconciliation_error: Option<String>,
-    /// Counter: how many `record_transition` calls to allow before injecting error.
-    pub transition_allow_count: usize,
-    /// Tracks how many `record_transition` calls have been made.
-    pub transition_call_count: usize,
-    /// Handled cursors to return on recovery.
-    pub handled_cursors: BTreeMap<String, String>,
-    /// Re-arm positions to return on recovery.
-    pub rearm_positions: BTreeMap<String, bool>,
+    arms: BTreeMap<ArmId, PersistedArm>,
+    claims: BTreeMap<ClaimRequestId, PersistedClaimRecord>,
+    payloads: BTreeMap<ClaimRequestId, Vec<ProviderEvent>>,
+    claim_attempts: BTreeMap<ClaimRequestId, AttemptId>,
+    attachments: BTreeMap<AttemptId, PersistedControllerAttachment>,
+    births: BTreeMap<ControllerBirthId, PersistedControllerBirth>,
+    creates: BTreeMap<ControllerBirthId, ThreadCreateReservation>,
+    ownership: BTreeMap<ControllerBirthId, ThreadOwnershipState>,
+    create_evidence_refs: BTreeMap<ControllerBirthId, VerifierRef>,
+    private_recovery: BTreeMap<PrivateNativeRef, RecoveryCoordinate>,
+    prepared: BTreeMap<AttemptId, PersistedTurnCorrelation>,
+    reservations: BTreeMap<AttemptId, PersistedNativeReservation>,
+    consumed_probes: BTreeSet<RequestNonce>,
+    prewrite: BTreeMap<AttemptId, PersistedPreWriteConclusion>,
+    active_observations: BTreeMap<AttemptId, PersistedActiveObservationEvidence>,
+    active_mac_key: Zeroizing<[u8; 32]>,
+    write_evidence: BTreeMap<AttemptId, NativeWriteEvidence>,
+    write_evidence_refs: BTreeMap<AttemptId, VerifierRef>,
+    turn_facts: BTreeMap<AttemptId, Vec<NativeTurnFact>>,
+    reconciliations: BTreeMap<AttemptId, ReconciliationDisposition>,
+    attempt_seq: u64,
+    #[cfg(test)]
+    fail_next_turn_fact: bool,
+    #[cfg(test)]
+    fail_next_active_hold: bool,
+}
+
+impl Default for FakePersist {
+    fn default() -> Self {
+        let mut active_mac_key = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(&mut *active_mac_key).expect("OS entropy for semantic fake MAC key");
+        Self {
+            arms: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            payloads: BTreeMap::new(),
+            claim_attempts: BTreeMap::new(),
+            attachments: BTreeMap::new(),
+            births: BTreeMap::new(),
+            creates: BTreeMap::new(),
+            ownership: BTreeMap::new(),
+            create_evidence_refs: BTreeMap::new(),
+            private_recovery: BTreeMap::new(),
+            prepared: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            consumed_probes: BTreeSet::new(),
+            prewrite: BTreeMap::new(),
+            active_observations: BTreeMap::new(),
+            write_evidence: BTreeMap::new(),
+            write_evidence_refs: BTreeMap::new(),
+            turn_facts: BTreeMap::new(),
+            reconciliations: BTreeMap::new(),
+            active_mac_key,
+            attempt_seq: 0,
+            #[cfg(test)]
+            fail_next_turn_fact: false,
+            #[cfg(test)]
+            fail_next_active_hold: false,
+        }
+    }
+}
+
+impl fmt::Debug for FakePersist {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FakePersist([redacted private recovery partition])")
+    }
+}
+
+/// Cloneable test handle whose clones address one semantic fake store.
+#[derive(Clone, Default)]
+pub struct SharedFakePersist(Arc<Mutex<FakePersist>>);
+
+impl fmt::Debug for SharedFakePersist {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedFakePersist([redacted shared store])")
+    }
+}
+
+impl SharedFakePersist {
+    fn with_store<T>(
+        &self,
+        operation: impl FnOnce(&mut FakePersist) -> Result<T, PersistError>,
+    ) -> Result<T, PersistError> {
+        let mut store = self
+            .0
+            .lock()
+            .map_err(|_| PersistError::StorageUnavailable)?;
+        operation(&mut store)
+    }
+}
+
+impl sealed::Sealed for SharedFakePersist {}
+
+impl Persist for SharedFakePersist {
+    fn persist_arm(&mut self, arm: &PersistedArm) -> Result<(), PersistError> {
+        self.with_store(|store| store.persist_arm(arm))
+    }
+
+    fn admit_claim(
+        &mut self,
+        admission: &ClaimAdmission,
+        attachment: &PersistedControllerAttachment,
+    ) -> Result<AdmissionRecord, PersistError> {
+        self.with_store(|store| store.admit_claim(admission, attachment))
+    }
+
+    fn reserve_controller_birth(
+        &mut self,
+        birth: &PersistedControllerBirth,
+        create: &ThreadCreateReservation,
+    ) -> Result<ReserveBirthOutcome, PersistError> {
+        self.with_store(|store| store.reserve_controller_birth(birth, create))
+    }
+
+    fn resolve_thread_create(
+        &mut self,
+        commit: ThreadCreateCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.resolve_thread_create(commit))
+    }
+
+    fn thread_ownership_state(
+        &self,
+        birth_id: &ControllerBirthId,
+    ) -> Result<ThreadOwnershipState, PersistError> {
+        self.with_store(|store| store.thread_ownership_state(birth_id))
+    }
+
+    fn seal_native_coordinate(
+        &mut self,
+        scope: &NativeCoordinateScope,
+        coordinate: &SecretNativeCoordinate,
+    ) -> Result<PrivateNativeRef, PersistError> {
+        self.with_store(|store| store.seal_native_coordinate(scope, coordinate))
+    }
+
+    fn open_native_coordinate(
+        &self,
+        scope: &NativeCoordinateScope,
+        native_ref: &PrivateNativeRef,
+    ) -> Result<OpenedNativeCoordinate, PersistError> {
+        self.with_store(|store| store.open_native_coordinate(scope, native_ref))
+    }
+
+    fn record_dispatch_prepared(
+        &mut self,
+        commit: PreparedDispatchCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.record_dispatch_prepared(commit))
+    }
+
+    fn record_prewrite_conclusion(
+        &mut self,
+        commit: PreWriteConclusionCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.record_prewrite_conclusion(commit))
+    }
+
+    fn record_active_hold(
+        &mut self,
+        commit: ActiveHoldCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.record_active_hold(commit))
+    }
+
+    fn reserve_native_turn_write(
+        &mut self,
+        idle: ValidatedIdlePermit,
+        correlation: &PersistedTurnCorrelation,
+    ) -> Result<NativeWriteReservation, PersistError> {
+        self.with_store(|store| store.reserve_native_turn_write(idle, correlation))
+    }
+
+    fn record_native_write_evidence(
+        &mut self,
+        commit: NativeWriteEvidenceCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.record_native_write_evidence(commit))
+    }
+
+    fn record_native_turn_fact(
+        &mut self,
+        commit: NativeTurnFactCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.record_native_turn_fact(commit))
+    }
+
+    fn record_reconciliation_fact(
+        &mut self,
+        scope: &ReconciliationScope,
+        disposition: &ReconciliationDisposition,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.record_reconciliation_fact(scope, disposition))
+    }
+
+    fn revoke_controller_attachment(
+        &mut self,
+        scope: ValidatedAttachmentScope,
+    ) -> Result<IdempotentWrite, PersistError> {
+        self.with_store(|store| store.revoke_controller_attachment(scope))
+    }
+
+    fn recover_authority_state(&mut self) -> Result<RecoverySnapshot, PersistError> {
+        self.with_store(FakePersist::recover_authority_state)
+    }
 }
 
 impl FakePersist {
-    /// Number of claims recorded.
     #[must_use]
-    pub fn claim_count(&self) -> usize {
-        self.claims.len()
+    pub fn prewrite_conclusion(&self, attempt_id: &str) -> Option<&PreWriteConclusion> {
+        self.prewrite
+            .iter()
+            .find(|(id, _)| id.as_str() == attempt_id)
+            .map(|(_, record)| &record.conclusion)
     }
 
-    /// Look up a persisted claim by request id.
     #[must_use]
-    pub fn get_claim(&self, request_id: &str) -> Option<&DurableClaim> {
-        self.claims.get(request_id)
+    pub fn reservation_concluded(&self, attempt_id: &str) -> bool {
+        self.reservations
+            .iter()
+            .find(|(id, _)| id.as_str() == attempt_id)
+            .is_some_and(|(_, reservation)| reservation.concluded)
     }
 
-    /// Transitions recorded for a (`signal_id`, `attempt_id`).
-    #[must_use]
-    pub fn get_transitions(&self, signal_id: &str, attempt_id: &str) -> &[Transition] {
-        self.transitions
-            .get(&(signal_id.to_owned(), attempt_id.to_owned()))
-            .map_or(&[], Vec::as_slice)
+    #[cfg(test)]
+    pub fn fail_next_turn_fact(&mut self) {
+        self.fail_next_turn_fact = true;
     }
 
-    /// Disposition recorded for an `attempt_id`.
-    #[must_use]
-    pub fn get_disposition(
-        &self,
-        attempt_id: &str,
-    ) -> Option<&crate::controller::DispatchDisposition> {
-        self.dispositions.get(attempt_id)
+    #[cfg(test)]
+    pub fn fail_next_active_hold(&mut self) {
+        self.fail_next_active_hold = true;
+    }
+
+    #[cfg(test)]
+    fn rekey_active_evidence(&mut self) {
+        getrandom::fill(&mut *self.active_mac_key).expect("test MAC rekey entropy");
     }
 }
 
+impl sealed::Sealed for FakePersist {}
+
 impl Persist for FakePersist {
+    fn persist_arm(&mut self, arm: &PersistedArm) -> Result<(), PersistError> {
+        self.arms.insert(arm.arm_id.clone(), arm.clone());
+        Ok(())
+    }
+
     fn admit_claim(
         &mut self,
-        claim: &DurableClaim,
-        attachment: Option<&PersistedAttachment>,
-    ) -> Result<AdmissionRecord, ClaimError> {
-        if let Some(msg) = self.next_claim_error.take() {
-            return Err(ClaimError::StorageFailure(msg));
-        }
-        // Replay: return previously recorded attempt/verifier
-        if let Some(existing) = self.claims.get(&claim.request_id) {
-            if existing.content_eq(claim) {
+        admission: &ClaimAdmission,
+        attachment: &PersistedControllerAttachment,
+    ) -> Result<AdmissionRecord, PersistError> {
+        if let Some(existing) = self.claims.get(&admission.record.request_id) {
+            if existing.arm_id == admission.record.arm_id
+                && existing.generation == admission.record.generation
+                && existing.signal_id == admission.record.signal_id
+                && existing.event_refs == admission.record.event_refs
+                && self.payloads.get(&admission.record.request_id) == Some(&admission.events)
+            {
                 let attempt_id = self
                     .claim_attempts
-                    .get(&claim.request_id)
-                    .cloned()
-                    .expect("attempt must exist for replayed claim");
-                let verifier_ref = self
-                    .verifier_refs
-                    .get(&claim.request_id)
-                    .cloned()
-                    .expect("verifier must exist for replayed claim");
+                    .get(&admission.record.request_id)
+                    .ok_or(PersistError::InvalidTransition)?;
+                let stored = self
+                    .attachments
+                    .get(attempt_id)
+                    .ok_or(PersistError::InvalidTransition)?;
                 return Ok(AdmissionRecord {
-                    outcome: ClaimOutcome::Replay,
-                    attempt_id,
-                    verifier_ref,
+                    outcome: ClaimOutcome::ExactReplay,
+                    attempt_id: attempt_id.clone(),
+                    verifier_ref: stored.verifier_ref.clone(),
                 });
             }
-            // Same request_id, different content = conflict
-            return Err(ClaimError::Conflict);
+            return Err(PersistError::Conflict);
         }
-        // Check if this (arm_id, generation) is already occupied by a different request
-        for existing in self.claims.values() {
-            if existing.arm_id == claim.arm_id
-                && existing.generation == claim.generation
-                && existing.request_id != claim.request_id
-            {
-                return Err(ClaimError::OccupiedDifferent);
-            }
+        if self.claims.values().any(|claim| {
+            claim.arm_id == admission.record.arm_id
+                && claim.generation == admission.record.generation
+        }) {
+            return Err(PersistError::Conflict);
         }
-        let attachment = attachment
-            .ok_or_else(|| ClaimError::StorageFailure("missing attachment".to_owned()))?;
-        if self
-            .persisted_attachments
-            .contains_key(&attachment.attempt_id)
-            || self.attempt_signals.contains_key(&attachment.attempt_id)
-            || self
-                .claim_attempts
-                .values()
-                .any(|attempt_id| attempt_id == &attachment.attempt_id)
-        {
-            return Err(ClaimError::Conflict);
+        if self.attachments.contains_key(&attachment.attempt_id) {
+            return Err(PersistError::Conflict);
         }
-        // Atomic admission: store claim, attempt map, attachment, exact
-        // attempt→signal binding, verifier ref, and ClaimRecorded together.
-        if let Some(seq) = attachment
-            .attempt_id
-            .strip_prefix("attempt-")
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            self.attempt_seq = self.attempt_seq.max(seq);
-        }
-        self.claim_attempts
-            .insert(claim.request_id.clone(), attachment.attempt_id.clone());
-        self.verifier_refs
-            .insert(claim.request_id.clone(), attachment.verifier_ref.clone());
-        self.claims.insert(claim.request_id.clone(), claim.clone());
-        self.persisted_attachments
+        self.claims.insert(
+            admission.record.request_id.clone(),
+            admission.record.clone(),
+        );
+        self.payloads.insert(
+            admission.record.request_id.clone(),
+            admission.events.clone(),
+        );
+        self.claim_attempts.insert(
+            admission.record.request_id.clone(),
+            attachment.attempt_id.clone(),
+        );
+        self.attachments
             .insert(attachment.attempt_id.clone(), attachment.clone());
-        self.attempt_signals
-            .insert(attachment.attempt_id.clone(), claim.signal_id.clone());
-        // Record ClaimRecorded atomically
-        let key = (claim.signal_id.clone(), attachment.attempt_id.clone());
-        self.transitions
-            .entry(key)
-            .or_default()
-            .push(Transition::ClaimRecorded);
+        self.attempt_seq = self.attempt_seq.saturating_add(1);
         Ok(AdmissionRecord {
             outcome: ClaimOutcome::Admitted,
             attempt_id: attachment.attempt_id.clone(),
@@ -689,978 +694,1232 @@ impl Persist for FakePersist {
         })
     }
 
-    fn record_transition(
+    fn reserve_controller_birth(
         &mut self,
-        signal_id: &str,
-        attempt_id: &str,
-        transition: Transition,
-    ) -> Result<(), WaiterLinkError> {
-        self.transition_call_count += 1;
-        if self.transition_call_count > self.transition_allow_count
-            && let Some(msg) = self.next_transition_error.take()
-        {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
+        birth: &PersistedControllerBirth,
+        create: &ThreadCreateReservation,
+    ) -> Result<ReserveBirthOutcome, PersistError> {
+        if let Some(existing) = self.births.get(&birth.birth_id) {
+            return if existing == birth && self.creates.get(&birth.birth_id) == Some(create) {
+                Ok(ReserveBirthOutcome::ExactReplay)
+            } else {
+                Ok(ReserveBirthOutcome::Conflict)
+            };
         }
-        let key = (signal_id.to_owned(), attempt_id.to_owned());
-        validate_transition(self.transitions.get(&key).map(Vec::as_slice), transition)?;
-        self.transitions.entry(key).or_default().push(transition);
-        Ok(())
+        if birth.birth_id != create.birth_id {
+            return Err(PersistError::Conflict);
+        }
+        self.births.insert(birth.birth_id.clone(), birth.clone());
+        self.creates.insert(birth.birth_id.clone(), create.clone());
+        self.ownership.insert(
+            birth.birth_id.clone(),
+            ThreadOwnershipState::Reserved {
+                create_attempt_id: create.create_attempt_id.clone(),
+            },
+        );
+        Ok(ReserveBirthOutcome::Reserved)
     }
 
-    fn record_disposition(
+    fn resolve_thread_create(
         &mut self,
-        attempt_id: &str,
-        disposition: &crate::controller::DispatchDisposition,
-    ) -> Result<(), WaiterLinkError> {
-        if let Some(msg) = self.next_disposition_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
+        commit: ThreadCreateCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let create = self
+            .creates
+            .get(&commit.birth_id)
+            .ok_or(PersistError::InvalidTransition)?;
+        if create.create_attempt_id != commit.create_attempt_id {
+            return Err(PersistError::Conflict);
         }
-        if self
-            .dispositions
-            .get(attempt_id)
-            .is_some_and(|existing| existing != disposition)
-        {
-            return Err(WaiterLinkError::Semantic(
-                "conflicting disposition for attempt_id",
-            ));
-        }
-        self.dispositions
-            .insert(attempt_id.to_owned(), disposition.clone());
-        Ok(())
-    }
-
-    fn record_prepared(
-        &mut self,
-        signal_id: &str,
-        attempt_id: &str,
-    ) -> Result<(), WaiterLinkError> {
-        // ---- Stage: validate everything before any mutation ----
-        if let Some(msg) = self.next_prepare_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        if self.prepared_set.contains_key(attempt_id) {
-            return Err(WaiterLinkError::Semantic(
-                "attempt already prepared — duplicate prepare",
-            ));
-        }
-        if self.concluded_set.contains_key(attempt_id) {
-            return Err(WaiterLinkError::Semantic(
-                "attempt already concluded — cannot prepare",
-            ));
-        }
-        let Some(bound_signal) = self.attempt_signals.get(attempt_id) else {
-            return Err(WaiterLinkError::Semantic(
-                "no persisted attempt→signal binding for this attempt",
-            ));
+        let evidence_ref = commit.evidence_ref;
+        let next = match commit.resolution {
+            ThreadCreateResolution::Owned { thread_ref } => ThreadOwnershipState::Owned {
+                create_attempt_id: commit.create_attempt_id,
+                thread_ref,
+            },
+            ThreadCreateResolution::ProvenNotAccepted => ThreadOwnershipState::ProvenNotAccepted {
+                create_attempt_id: commit.create_attempt_id,
+            },
+            ThreadCreateResolution::Unknown => ThreadOwnershipState::Unknown {
+                create_attempt_id: commit.create_attempt_id,
+            },
         };
-        if bound_signal != signal_id {
-            return Err(WaiterLinkError::Semantic(
-                "signal_id does not match persisted attempt→signal binding",
-            ));
+        let current = self
+            .ownership
+            .get(&commit.birth_id)
+            .ok_or(PersistError::InvalidTransition)?;
+        if current == &next {
+            return if self.create_evidence_refs.get(&commit.birth_id) == Some(&evidence_ref) {
+                Ok(IdempotentWrite::ExactReplay)
+            } else {
+                Err(PersistError::Conflict)
+            };
         }
-        let key = (signal_id.to_owned(), attempt_id.to_owned());
-        validate_transition(
-            self.transitions.get(&key).map(Vec::as_slice),
-            Transition::DispatchPrepared,
-        )?;
-        // ---- Commit ----
-        self.transitions
-            .entry(key)
-            .or_default()
-            .push(Transition::DispatchPrepared);
-        self.prepared_set.insert(attempt_id.to_owned(), true);
-        Ok(())
-    }
-
-    fn record_conclusion(
-        &mut self,
-        attempt_id: &str,
-        signal_id: &str,
-        disposition: &crate::controller::DispatchDisposition,
-        first_transition: Option<Transition>,
-    ) -> Result<(), WaiterLinkError> {
-        // ---- Stage: validate both writes before any mutation ----
-        if let Some(msg) = self.next_disposition_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        if self
-            .dispositions
-            .get(attempt_id)
-            .is_some_and(|existing| existing != disposition)
-        {
-            return Err(WaiterLinkError::Semantic(
-                "conflicting disposition for attempt_id",
-            ));
-        }
-        if self.concluded_set.contains_key(attempt_id) {
-            return Err(WaiterLinkError::Semantic(
-                "attempt already concluded — durable single consumption",
-            ));
-        }
-        if let Some(transition) = first_transition {
-            let key = (signal_id.to_owned(), attempt_id.to_owned());
-            validate_transition(self.transitions.get(&key).map(Vec::as_slice), transition)?;
-        }
-        if let Some(msg) = self.next_conclusion_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-
-        // ---- Commit: all three writes together ----
-        self.dispositions
-            .insert(attempt_id.to_owned(), disposition.clone());
-        if let Some(transition) = first_transition {
-            let key = (signal_id.to_owned(), attempt_id.to_owned());
-            self.transitions.entry(key).or_default().push(transition);
-        }
-        self.concluded_set.insert(attempt_id.to_owned(), true);
-        Ok(())
-    }
-
-    fn has_concluded(&self, attempt_id: &str) -> Result<bool, WaiterLinkError> {
-        Ok(self.concluded_set.contains_key(attempt_id))
-    }
-
-    fn persist_arm_state(&mut self, arm: &PersistedArm) -> Result<(), WaiterLinkError> {
-        if let Some(msg) = self.next_arm_persist_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        self.persisted_arms.insert(arm.arm_id.clone(), arm.clone());
-        Ok(())
-    }
-
-    fn persist_attachment_revoked(&mut self, attempt_id: &str) -> Result<(), WaiterLinkError> {
-        if let Some(msg) = self.next_revoke_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        let stored =
-            self.persisted_attachments
-                .get_mut(attempt_id)
-                .ok_or(WaiterLinkError::Semantic(
-                    "no persisted attachment for this attempt",
-                ))?;
-        stored.revoked = true;
-        Ok(())
-    }
-
-    fn persist_handled_cursor(
-        &mut self,
-        arm_id: &str,
-        cursor: &str,
-    ) -> Result<(), WaiterLinkError> {
-        if let Some(msg) = self.next_cursor_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        self.handled_cursors
-            .insert(arm_id.to_owned(), cursor.to_owned());
-        Ok(())
-    }
-
-    fn persist_rearmed(&mut self, arm_id: &str) -> Result<(), WaiterLinkError> {
-        if let Some(msg) = self.next_rearm_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        self.rearm_positions.insert(arm_id.to_owned(), true);
-        Ok(())
-    }
-
-    fn claim_for_attempt(&self, attempt_id: &str) -> Result<Option<DurableClaim>, WaiterLinkError> {
-        let Some(request_id) = self
-            .claim_attempts
-            .iter()
-            .find(|(_, aid)| *aid == attempt_id)
-            .map(|(rid, _)| rid.clone())
-        else {
-            return Ok(None);
-        };
-        Ok(self.claims.get(&request_id).cloned())
-    }
-
-    fn attempt_signal(&self, attempt_id: &str) -> Result<Option<String>, WaiterLinkError> {
-        Ok(self.attempt_signals.get(attempt_id).cloned())
-    }
-
-    fn reconciliation_recorded(
-        &self,
-        attempt_id: &str,
-    ) -> Result<Option<ReconciliationState>, WaiterLinkError> {
-        Ok(self.reconciliations.get(attempt_id).copied())
-    }
-
-    fn record_reconciliation(
-        &mut self,
-        attempt_id: &str,
-        signal_id: &str,
-        state: ReconciliationState,
-    ) -> Result<(), WaiterLinkError> {
-        // ---- Stage: validate before any mutation ----
-        if let Some(msg) = self.next_reconciliation_error.take() {
-            return Err(WaiterLinkError::Semantic(Box::leak(msg.into_boxed_str())));
-        }
-        // Fail closed on the exact persisted attempt→signal binding.
-        let Some(bound_signal) = self.attempt_signals.get(attempt_id) else {
-            return Err(WaiterLinkError::Semantic(
-                "no persisted attempt→signal binding for this attempt",
-            ));
-        };
-        if bound_signal != signal_id {
-            return Err(WaiterLinkError::Semantic(
-                "signal_id does not match persisted attempt→signal binding",
-            ));
-        }
-        let key = (signal_id.to_owned(), attempt_id.to_owned());
-        let prior = self.transitions.get(&key).cloned().unwrap_or_default();
-        if !prior.contains(&Transition::ReconciliationRequired) {
-            return Err(WaiterLinkError::Semantic(
-                "no prior ReconciliationRequired transition for this attempt",
-            ));
-        }
-        // Final resolutions are immutable. Unknown is a provisional result
-        // and can be atomically upgraded when a later probe reaches a final
-        // disposition.
-        if let Some(existing) = self.reconciliations.get(attempt_id) {
-            if *existing == state {
-                return Ok(());
-            }
-            if !matches!(existing, ReconciliationState::Unknown) {
-                return Err(WaiterLinkError::Semantic(
-                    "conflicting reconciliation resolution for attempt",
+        let valid_transition = matches!(current, ThreadOwnershipState::Reserved { .. })
+            || (matches!(current, ThreadOwnershipState::Unknown { .. })
+                && matches!(
+                    next,
+                    ThreadOwnershipState::Owned { .. }
+                        | ThreadOwnershipState::ProvenNotAccepted { .. }
                 ));
+        if !valid_transition {
+            return Err(PersistError::Conflict);
+        }
+        self.create_evidence_refs
+            .insert(commit.birth_id.clone(), evidence_ref);
+        self.ownership.insert(commit.birth_id, next);
+        Ok(IdempotentWrite::Recorded)
+    }
+
+    fn thread_ownership_state(
+        &self,
+        birth_id: &ControllerBirthId,
+    ) -> Result<ThreadOwnershipState, PersistError> {
+        Ok(self
+            .ownership
+            .get(birth_id)
+            .cloned()
+            .unwrap_or(ThreadOwnershipState::Absent))
+    }
+
+    fn seal_native_coordinate(
+        &mut self,
+        scope: &NativeCoordinateScope,
+        coordinate: &SecretNativeCoordinate,
+    ) -> Result<PrivateNativeRef, PersistError> {
+        if !matches!(
+            (scope, coordinate.kind()),
+            (
+                NativeCoordinateScope::Thread { .. },
+                NativeCoordinateKind::Thread
+            ) | (
+                NativeCoordinateScope::Turn { .. },
+                NativeCoordinateKind::Turn
+            )
+        ) {
+            return Err(PersistError::Unauthorized);
+        }
+        if let Some((native_ref, _)) = self.private_recovery.iter().find(|(_, stored)| {
+            stored.scope == *scope && stored.plaintext.as_slice() == coordinate.as_bytes()
+        }) {
+            let native_ref = native_ref.clone();
+            let replay_open = match scope {
+                NativeCoordinateScope::Turn { attempt_id, .. } => {
+                    self.reservations
+                        .get(attempt_id)
+                        .and_then(|reservation| reservation.correlation.turn_ref.as_ref())
+                        == Some(&native_ref)
+                }
+                NativeCoordinateScope::Thread { birth_id, .. } => matches!(
+                    self.ownership.get(birth_id),
+                    Some(ThreadOwnershipState::Owned { thread_ref, .. }) if thread_ref == &native_ref
+                ),
+            };
+            self.validate_coordinate_scope(scope, Some(&native_ref), replay_open)?;
+            return Ok(native_ref);
+        }
+        self.validate_coordinate_scope(scope, None, false)?;
+        let mut bytes = [0_u8; 32];
+        loop {
+            getrandom::fill(&mut bytes).map_err(|_| PersistError::StorageUnavailable)?;
+            let native_ref = PrivateNativeRef(bytes);
+            if !self.private_recovery.contains_key(&native_ref) {
+                self.private_recovery.insert(
+                    native_ref.clone(),
+                    RecoveryCoordinate {
+                        scope: scope.clone(),
+                        plaintext: Zeroizing::new(coordinate.as_bytes().to_vec()),
+                    },
+                );
+                bytes.fill(0);
+                return Ok(native_ref);
             }
         }
+    }
 
-        // ---- Stage transitions through the shared monotonic validator ----
-        let mut staged = prior;
-        match state {
-            ReconciliationState::Accepted => {
-                if !staged.contains(&Transition::NativeAccepted) {
-                    validate_transition(Some(&staged), Transition::NativeAccepted)?;
-                    staged.push(Transition::NativeAccepted);
-                }
-                if !staged.contains(&Transition::ReconciliationResolved) {
-                    validate_transition(Some(&staged), Transition::ReconciliationResolved)?;
-                    staged.push(Transition::ReconciliationResolved);
-                }
-            }
-            ReconciliationState::ProvenNotAccepted | ReconciliationState::Terminal => {
-                if !staged.contains(&Transition::ReconciliationResolved) {
-                    validate_transition(Some(&staged), Transition::ReconciliationResolved)?;
-                    staged.push(Transition::ReconciliationResolved);
-                }
-            }
-            ReconciliationState::Unknown => {}
+    fn open_native_coordinate(
+        &self,
+        scope: &NativeCoordinateScope,
+        native_ref: &PrivateNativeRef,
+    ) -> Result<OpenedNativeCoordinate, PersistError> {
+        self.validate_coordinate_scope(scope, Some(native_ref), true)?;
+        let coordinate = self
+            .private_recovery
+            .get(native_ref)
+            .filter(|coordinate| &coordinate.scope == scope)
+            .ok_or(PersistError::Unauthorized)?;
+        Ok(OpenedNativeCoordinate::from_bytes(&coordinate.plaintext))
+    }
+
+    fn record_dispatch_prepared(
+        &mut self,
+        commit: PreparedDispatchCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let id = commit.correlation.attempt_id.clone();
+        if let Some(existing) = self.prepared.get(&id) {
+            return if existing == &commit.correlation {
+                Ok(IdempotentWrite::ExactReplay)
+            } else {
+                Err(PersistError::Conflict)
+            };
+        }
+        self.prepared.insert(id, commit.correlation);
+        Ok(IdempotentWrite::Recorded)
+    }
+
+    fn record_prewrite_conclusion(
+        &mut self,
+        commit: PreWriteConclusionCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let record = PersistedPreWriteConclusion {
+            attempt_id: commit.attempt_id.clone(),
+            signal_id: commit.signal_id,
+            conclusion: commit.conclusion,
+            recorded_at: commit.recorded_at,
+        };
+        if let Some(existing) = self.prewrite.get(&commit.attempt_id) {
+            return if existing.conclusion == record.conclusion {
+                Ok(IdempotentWrite::ExactReplay)
+            } else {
+                Err(PersistError::Conflict)
+            };
+        }
+        if let Some(reservation) = self.reservations.get_mut(&commit.attempt_id) {
+            reservation.concluded = true;
+        }
+        self.prewrite.insert(commit.attempt_id, record);
+        Ok(IdempotentWrite::Recorded)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn record_active_hold(
+        &mut self,
+        commit: ActiveHoldCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let proof = commit.proof;
+        let attachment = self
+            .attachments
+            .get(&proof.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        let birth = self
+            .births
+            .get(&proof.birth_id)
+            .ok_or(PersistError::Unauthorized)?;
+        let claim = self
+            .claims
+            .values()
+            .find(|claim| claim.attempt_id == proof.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        let prepared = self
+            .prepared
+            .get(&proof.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if attachment.birth_id != proof.birth_id
+            || attachment.seat_id != proof.seat_id
+            || attachment.arm_id != proof.arm_id
+            || attachment.generation != proof.generation
+            || attachment.capability != proof.capability
+            || attachment.verifier_ref != proof.attachment_verifier_ref
+            || attachment.lease_until != proof.lease_until
+            || attachment.revoked
+            || birth.revoked
+            || birth.seat_id != proof.seat_id
+            || birth.arm_id != proof.arm_id
+            || birth.generation != proof.generation
+            || birth.capability != proof.capability
+            || birth.lease_until < proof.observed_at
+            || claim.signal_id != proof.signal_id
+            || prepared.signal_id != proof.signal_id
+            || prepared.birth_id != proof.birth_id
+            || prepared.thread_ref != proof.thread_ref
+            || proof.mutation_epoch.birth_id != proof.birth_id
+            || proof.producer_version != "codex-cli 0.149.1"
+            || proof.producer_dialect != "thread/read-v2"
+            || !matches!(
+                self.ownership.get(&proof.birth_id),
+                Some(ThreadOwnershipState::Owned {
+                    create_attempt_id,
+                    thread_ref,
+                }) if create_attempt_id == &proof.create_attempt_id && thread_ref == &proof.thread_ref
+            )
+        {
+            return Err(PersistError::Unauthorized);
         }
 
-        // ---- Commit ----
-        self.transitions.insert(key, staged);
-        self.reconciliations.insert(attempt_id.to_owned(), state);
-        Ok(())
+        let mut mac = blake3::Hasher::new_keyed(&self.active_mac_key);
+        mac.update(b"gearwit.active-observation.v1\0");
+        mac_field(&mut mac, &proof.birth_id.0);
+        mac_field(&mut mac, &proof.create_attempt_id.0);
+        mac_field(&mut mac, &proof.thread_ref.0);
+        mac_field(&mut mac, proof.seat_id.as_str().as_bytes());
+        mac_field(&mut mac, proof.arm_id.as_str().as_bytes());
+        mac_field(&mut mac, &proof.generation.to_le_bytes());
+        mac_field(&mut mac, &[proof.capability as u8]);
+        mac_field(&mut mac, proof.attachment_verifier_ref.bytes());
+        mac_field(
+            &mut mac,
+            &proof.lease_until.unix_timestamp_nanos().to_le_bytes(),
+        );
+        mac_field(&mut mac, proof.attempt_id.as_str().as_bytes());
+        mac_field(&mut mac, proof.signal_id.as_str().as_bytes());
+        mac_field(&mut mac, &proof.probe_id.0);
+        mac_field(&mut mac, &proof.mutation_epoch.sequence.to_le_bytes());
+        mac_field(
+            &mut mac,
+            &proof.observed_at.unix_timestamp_nanos().to_le_bytes(),
+        );
+        mac_field(&mut mac, proof.prehash.bytes());
+        mac_field(&mut mac, proof.producer_version.as_bytes());
+        mac_field(&mut mac, proof.producer_dialect.as_bytes());
+        let fingerprint = ActiveObservationFingerprint(*mac.finalize().as_bytes());
+        let mut evidence_mac = blake3::Hasher::new_keyed(&self.active_mac_key);
+        evidence_mac.update(b"gearwit.active-observation-ref.v1\0");
+        evidence_mac.update(&fingerprint.0);
+        let evidence_ref = ActiveObservationEvidenceRef(*evidence_mac.finalize().as_bytes());
+        let record = PersistedActiveObservationEvidence {
+            evidence_ref: evidence_ref.clone(),
+            birth_id: proof.birth_id,
+            create_attempt_id: proof.create_attempt_id,
+            seat_id: proof.seat_id,
+            arm_id: proof.arm_id,
+            generation: proof.generation,
+            capability: proof.capability,
+            attachment_verifier_ref: proof.attachment_verifier_ref,
+            lease_until: proof.lease_until,
+            attempt_id: proof.attempt_id.clone(),
+            signal_id: proof.signal_id.clone(),
+            probe_id: proof.probe_id,
+            mutation_epoch: proof.mutation_epoch,
+            observed_at: proof.observed_at,
+            fingerprint,
+            producer_version: proof.producer_version,
+            producer_dialect: proof.producer_dialect,
+        };
+        let conclusion = PersistedPreWriteConclusion {
+            attempt_id: proof.attempt_id.clone(),
+            signal_id: proof.signal_id,
+            conclusion: PreWriteConclusion::HeldBeforeNativeWrite {
+                active_evidence_ref: evidence_ref,
+            },
+            recorded_at: proof.observed_at,
+        };
+        if let Some(existing) = self.active_observations.get(&proof.attempt_id) {
+            return if existing == &record
+                && self.prewrite.get(&proof.attempt_id) == Some(&conclusion)
+            {
+                Ok(IdempotentWrite::ExactReplay)
+            } else {
+                Err(PersistError::Conflict)
+            };
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_active_hold) {
+            return Err(PersistError::StorageUnavailable);
+        }
+        if self.prewrite.contains_key(&proof.attempt_id)
+            || !self.consumed_probes.insert(record.probe_id.clone())
+        {
+            return Err(PersistError::Conflict);
+        }
+        self.active_observations
+            .insert(proof.attempt_id.clone(), record);
+        self.prewrite.insert(proof.attempt_id, conclusion);
+        Ok(IdempotentWrite::Recorded)
     }
 
-    fn durability(&self) -> DurabilityClass {
-        DurabilityClass::BestEffort
+    fn reserve_native_turn_write(
+        &mut self,
+        idle: ValidatedIdlePermit,
+        correlation: &PersistedTurnCorrelation,
+    ) -> Result<NativeWriteReservation, PersistError> {
+        if idle.observed_at >= idle.valid_until
+            || idle.attempt_id != correlation.attempt_id
+            || idle.signal_id != correlation.signal_id
+            || idle.birth_id != correlation.birth_id
+            || idle.thread_ref != correlation.thread_ref
+            || idle.mutation_epoch.birth_id != idle.birth_id
+            || self.consumed_probes.contains(&idle.probe_id)
+            || self.reservations.contains_key(&idle.attempt_id)
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        let attachment = self
+            .attachments
+            .get(&idle.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if attachment.birth_id != idle.birth_id
+            || attachment.arm_id != idle.arm_id
+            || attachment.generation != idle.generation
+            || attachment.capability != idle.capability
+            || attachment.verifier_ref != idle.verifier_ref
+            || attachment.revoked
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        self.consumed_probes.insert(idle.probe_id.clone());
+        self.reservations.insert(
+            idle.attempt_id,
+            PersistedNativeReservation {
+                correlation: correlation.clone(),
+                probe_id: idle.probe_id.clone(),
+                expected_epoch: idle.mutation_epoch.clone(),
+                concluded: false,
+            },
+        );
+        Ok(NativeWriteReservation {
+            correlation: correlation.clone(),
+            probe_id: idle.probe_id,
+            expected_epoch: idle.mutation_epoch,
+        })
     }
 
-    fn backend_identity(&self) -> &'static str {
-        "fake-deterministic"
+    fn record_native_write_evidence(
+        &mut self,
+        commit: NativeWriteEvidenceCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let id = commit.correlation.attempt_id.clone();
+        let reservation = self
+            .reservations
+            .get(&id)
+            .ok_or(PersistError::InvalidTransition)?;
+        if reservation.correlation != commit.correlation {
+            return Err(PersistError::Unauthorized);
+        }
+        if let Some(existing) = self.write_evidence.get(&id) {
+            return if existing == &commit.evidence
+                && self.write_evidence_refs.get(&id) == Some(&commit.evidence_ref)
+            {
+                Ok(IdempotentWrite::ExactReplay)
+            } else {
+                Err(PersistError::Conflict)
+            };
+        }
+        self.write_evidence.insert(id.clone(), commit.evidence);
+        self.write_evidence_refs
+            .insert(id.clone(), commit.evidence_ref);
+        if let Some(reservation) = self.reservations.get_mut(&id) {
+            reservation.concluded = true;
+        }
+        Ok(IdempotentWrite::Recorded)
     }
 
-    fn recover(&mut self) -> Result<RecoverySnapshot, ClaimError> {
-        let mut transitions_map: BTreeMap<String, Vec<Transition>> = BTreeMap::new();
-        for ((signal_id, attempt_id), ts) in &self.transitions {
-            let key = format!("{signal_id}:{attempt_id}");
-            transitions_map.insert(key, ts.clone());
+    fn record_native_turn_fact(
+        &mut self,
+        commit: NativeTurnFactCommit,
+    ) -> Result<IdempotentWrite, PersistError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_turn_fact) {
+            return Err(PersistError::StorageUnavailable);
+        }
+        let prepared = self
+            .prepared
+            .get(&commit.correlation.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if prepared.signal_id != commit.correlation.signal_id
+            || prepared.birth_id != commit.correlation.birth_id
+            || prepared.thread_ref != commit.correlation.thread_ref
+            || prepared.turn_write_id != commit.correlation.turn_write_id
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        let fact_turn_ref = match &commit.fact {
+            NativeTurnFact::Accepted { turn_ref }
+            | NativeTurnFact::Started { turn_ref }
+            | NativeTurnFact::Terminal { turn_ref, .. } => Some(turn_ref),
+            NativeTurnFact::DegradedTerminalObservation
+            | NativeTurnFact::ControllerLost
+            | NativeTurnFact::Unknown => None,
+        }
+        .cloned();
+        if fact_turn_ref.is_some() && fact_turn_ref.as_ref() != commit.correlation.turn_ref.as_ref()
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        if let Some(turn_ref) = fact_turn_ref.as_ref() {
+            let scope = NativeCoordinateScope::Turn {
+                birth_id: commit.correlation.birth_id.clone(),
+                attempt_id: commit.correlation.attempt_id.clone(),
+                signal_id: commit.correlation.signal_id.clone(),
+                turn_write_id: commit.correlation.turn_write_id.clone(),
+            };
+            let coordinate = self
+                .private_recovery
+                .get(turn_ref)
+                .filter(|coordinate| coordinate.scope == scope)
+                .ok_or(PersistError::Unauthorized)?;
+            if coordinate.plaintext.is_empty() {
+                return Err(PersistError::Unauthorized);
+            }
+            let reservation = self
+                .reservations
+                .get(&commit.correlation.attempt_id)
+                .ok_or(PersistError::Unauthorized)?;
+            if reservation.correlation.birth_id != commit.correlation.birth_id
+                || reservation.correlation.signal_id != commit.correlation.signal_id
+                || reservation.correlation.thread_ref != commit.correlation.thread_ref
+                || reservation.correlation.turn_write_id != commit.correlation.turn_write_id
+                || reservation
+                    .correlation
+                    .turn_ref
+                    .as_ref()
+                    .is_some_and(|existing| existing != turn_ref)
+                || prepared
+                    .turn_ref
+                    .as_ref()
+                    .is_some_and(|existing| existing != turn_ref)
+            {
+                return Err(PersistError::Unauthorized);
+            }
+        }
+        let attempt_id = commit.correlation.attempt_id.clone();
+        let facts = self.turn_facts.entry(attempt_id.clone()).or_default();
+        if facts.contains(&commit.fact) {
+            return Ok(IdempotentWrite::ExactReplay);
+        }
+        facts.push(commit.fact);
+        if let Some(turn_ref) = fact_turn_ref.as_ref() {
+            self.prepared
+                .get_mut(&attempt_id)
+                .expect("validated prepared correlation")
+                .turn_ref = Some(turn_ref.clone());
+            self.reservations
+                .get_mut(&attempt_id)
+                .expect("validated native reservation")
+                .correlation
+                .turn_ref = Some(turn_ref.clone());
+        }
+        if matches!(
+            facts.last(),
+            Some(
+                NativeTurnFact::DegradedTerminalObservation
+                    | NativeTurnFact::ControllerLost
+                    | NativeTurnFact::Unknown
+            )
+        ) {
+            self.write_evidence
+                .insert(attempt_id, NativeWriteEvidence::Unknown);
+        }
+        Ok(IdempotentWrite::Recorded)
+    }
+
+    fn record_reconciliation_fact(
+        &mut self,
+        scope: &ReconciliationScope,
+        disposition: &ReconciliationDisposition,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let id = scope.correlation.attempt_id.clone();
+        let reservation = self
+            .reservations
+            .get(&id)
+            .ok_or(PersistError::InvalidTransition)?;
+        if reservation.correlation != scope.correlation
+            || self.write_evidence.get(&id) != Some(&NativeWriteEvidence::Unknown)
+            || self.write_evidence_refs.get(&id) != Some(&scope.evidence_ref)
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        if let Some(existing) = self.reconciliations.get(&id) {
+            return if existing == disposition {
+                Ok(IdempotentWrite::ExactReplay)
+            } else if matches!(existing, ReconciliationDisposition::Unknown) {
+                self.reconciliations.insert(id, disposition.clone());
+                Ok(IdempotentWrite::Recorded)
+            } else {
+                Err(PersistError::Conflict)
+            };
+        }
+        self.reconciliations.insert(id, disposition.clone());
+        Ok(IdempotentWrite::Recorded)
+    }
+
+    fn revoke_controller_attachment(
+        &mut self,
+        scope: ValidatedAttachmentScope,
+    ) -> Result<IdempotentWrite, PersistError> {
+        let attachment = self
+            .attachments
+            .get_mut(&scope.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if attachment.birth_id != scope.birth_id
+            || attachment.arm_id != scope.arm_id
+            || attachment.generation != scope.generation
+            || attachment.verifier_ref != scope.verifier_ref
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        if attachment.revoked {
+            return Ok(IdempotentWrite::ExactReplay);
+        }
+        attachment.revoked = true;
+        Ok(IdempotentWrite::Recorded)
+    }
+
+    fn recover_authority_state(&mut self) -> Result<RecoverySnapshot, PersistError> {
+        for state in self.ownership.values_mut() {
+            if let ThreadOwnershipState::Reserved { create_attempt_id } = state {
+                *state = ThreadOwnershipState::Unknown {
+                    create_attempt_id: create_attempt_id.clone(),
+                };
+            }
+        }
+        let interrupted_facts: Vec<_> = self
+            .write_evidence
+            .iter()
+            .filter(|(attempt_id, _)| !self.turn_facts.contains_key(*attempt_id))
+            .map(|(attempt_id, evidence)| (attempt_id.clone(), evidence.clone()))
+            .collect();
+        for (attempt_id, evidence) in interrupted_facts {
+            match evidence {
+                NativeWriteEvidence::WriterAccepted { .. } => {
+                    self.write_evidence
+                        .insert(attempt_id, NativeWriteEvidence::Unknown);
+                }
+                NativeWriteEvidence::ExactResponse { fact } => {
+                    self.turn_facts.insert(attempt_id, vec![fact]);
+                }
+                NativeWriteEvidence::ProvenNotAccepted | NativeWriteEvidence::Unknown => {}
+            }
+        }
+        let unresolved: Vec<_> = self
+            .reservations
+            .iter()
+            .filter(|(attempt_id, reservation)| {
+                !reservation.concluded && !self.write_evidence.contains_key(*attempt_id)
+            })
+            .map(|(attempt_id, _)| attempt_id.clone())
+            .collect();
+        for attempt_id in unresolved {
+            let evidence_ref =
+                VerifierRef::random().map_err(|_| PersistError::StorageUnavailable)?;
+            self.write_evidence
+                .insert(attempt_id.clone(), NativeWriteEvidence::Unknown);
+            self.write_evidence_refs
+                .insert(attempt_id.clone(), evidence_ref);
+            if let Some(reservation) = self.reservations.get_mut(&attempt_id) {
+                reservation.concluded = true;
+            }
         }
         Ok(RecoverySnapshot {
+            arms: self.arms.values().cloned().collect(),
             claims: self.claims.values().cloned().collect(),
-            transitions: transitions_map,
-            dispositions: self.dispositions.clone(),
-            attempt_map: self.claim_attempts.clone(),
-            arms: self.persisted_arms.values().cloned().collect(),
-            attachments: self.persisted_attachments.values().cloned().collect(),
-            attempt_signals: self.attempt_signals.clone(),
-            reconciliations: self.reconciliations.clone(),
-            prepared_set: self.prepared_set.clone(),
-            concluded_set: self.concluded_set.clone(),
-            handled_cursors: self.handled_cursors.clone(),
-            rearm_positions: self.rearm_positions.clone(),
-            verifier_refs: self.verifier_refs.clone(),
+            attachments: self.attachments.values().cloned().collect(),
+            controller_births: self.births.values().cloned().collect(),
+            ownership: self
+                .ownership
+                .iter()
+                .map(|(birth_id, state)| PersistedThreadOwnership {
+                    birth_id: birth_id.clone(),
+                    state: state.clone(),
+                })
+                .collect(),
+            turn_correlations: self.prepared.values().cloned().collect(),
+            reservations: self.reservations.values().cloned().collect(),
+            native_write_evidence: self
+                .write_evidence
+                .iter()
+                .filter_map(|(attempt_id, evidence)| {
+                    Some(PersistedNativeWriteEvidence {
+                        correlation: self.reservations.get(attempt_id)?.correlation.clone(),
+                        evidence: evidence.clone(),
+                        evidence_ref: self.write_evidence_refs.get(attempt_id)?.clone(),
+                    })
+                })
+                .collect(),
+            native_turn_facts: self
+                .turn_facts
+                .iter()
+                .map(|(attempt_id, facts)| PersistedNativeTurnFacts {
+                    attempt_id: attempt_id.clone(),
+                    facts: facts.clone(),
+                })
+                .collect(),
+            reconciliations: self
+                .reconciliations
+                .iter()
+                .map(|(attempt_id, disposition)| PersistedReconciliation {
+                    attempt_id: attempt_id.clone(),
+                    disposition: disposition.clone(),
+                })
+                .collect(),
+            prewrite_conclusions: self.prewrite.values().cloned().collect(),
+            active_observations: self.active_observations.values().cloned().collect(),
             attempt_seq: self.attempt_seq,
         })
     }
 }
 
+impl FakePersist {
+    fn validate_coordinate_scope(
+        &self,
+        scope: &NativeCoordinateScope,
+        native_ref: Option<&PrivateNativeRef>,
+        opening: bool,
+    ) -> Result<(), PersistError> {
+        match scope {
+            NativeCoordinateScope::Thread {
+                birth_id,
+                create_attempt_id,
+            } => {
+                let create = self
+                    .creates
+                    .get(birth_id)
+                    .ok_or(PersistError::Unauthorized)?;
+                if create.create_attempt_id != *create_attempt_id {
+                    return Err(PersistError::Unauthorized);
+                }
+                let birth = self
+                    .births
+                    .get(birth_id)
+                    .filter(|birth| !birth.revoked)
+                    .ok_or(PersistError::Unauthorized)?;
+                if birth.birth_id != *birth_id {
+                    return Err(PersistError::Unauthorized);
+                }
+                if !opening
+                    && !matches!(
+                        self.ownership.get(birth_id),
+                        Some(
+                            ThreadOwnershipState::Reserved {
+                                create_attempt_id: reserved_create,
+                            }
+                            | ThreadOwnershipState::Unknown {
+                                create_attempt_id: reserved_create,
+                            }
+                        ) if reserved_create == create_attempt_id
+                    )
+                {
+                    return Err(PersistError::Unauthorized);
+                }
+                if opening
+                    && !matches!(
+                        self.ownership.get(birth_id),
+                        Some(ThreadOwnershipState::Owned {
+                            create_attempt_id: owned_create,
+                            thread_ref,
+                        }) if owned_create == create_attempt_id && Some(thread_ref) == native_ref
+                    )
+                {
+                    return Err(PersistError::Unauthorized);
+                }
+            }
+            NativeCoordinateScope::Turn {
+                birth_id,
+                attempt_id,
+                signal_id,
+                turn_write_id,
+            } => {
+                let correlation = self
+                    .reservations
+                    .get(attempt_id)
+                    .map(|reservation| &reservation.correlation)
+                    .ok_or(PersistError::Unauthorized)?;
+                let attachment = self
+                    .attachments
+                    .get(attempt_id)
+                    .filter(|attachment| !attachment.revoked)
+                    .ok_or(PersistError::Unauthorized)?;
+                let birth = self
+                    .births
+                    .get(birth_id)
+                    .filter(|birth| !birth.revoked)
+                    .ok_or(PersistError::Unauthorized)?;
+                if correlation.birth_id != *birth_id
+                    || correlation.attempt_id != *attempt_id
+                    || correlation.signal_id != *signal_id
+                    || correlation.turn_write_id != *turn_write_id
+                    || attachment.birth_id != *birth_id
+                    || attachment.arm_id != birth.arm_id
+                    || attachment.generation != birth.generation
+                    || attachment.seat_id != birth.seat_id
+                    || attachment.capability != birth.capability
+                    || (opening && correlation.turn_ref.as_ref() != native_ref)
+                    || (!opening && correlation.turn_ref.is_some())
+                {
+                    return Err(PersistError::Unauthorized);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn mac_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::DispatchDisposition;
-    use gearwit_protocol::ProviderEvent;
-    use time::macros::datetime;
 
-    fn sample_claim(signal_id: &str, generation: u64, request_id: &str) -> DurableClaim {
-        DurableClaim {
-            request_id: request_id.to_owned(),
-            arm_id: "01J00000000000000000000010".to_owned(),
-            generation,
-            signal_id: signal_id.to_owned(),
-            event_refs: vec!["post01".to_owned()],
-            events: vec![ProviderEvent {
-                provider: "test".to_owned(),
-                event_ref: "post01".to_owned(),
-                actor: Some("example-devlead".to_owned()),
-                observed_at: "2026-01-15T12:00:00Z".to_owned(),
-                body: "test event".to_owned(),
-            }],
-            claimed_at: datetime!(2026-01-15 12:00:00 UTC),
-        }
-    }
-
-    fn sample_claim_different_metadata(
-        signal_id: &str,
-        generation: u64,
-        request_id: &str,
-    ) -> DurableClaim {
-        DurableClaim {
-            request_id: request_id.to_owned(),
-            arm_id: "01J00000000000000000000010".to_owned(),
-            generation,
-            signal_id: signal_id.to_owned(),
-            event_refs: vec!["post01".to_owned()],
-            events: vec![ProviderEvent {
-                provider: "other-provider".to_owned(),
-                event_ref: "post01".to_owned(),
-                actor: Some("different-actor".to_owned()),
-                observed_at: "2026-01-15T13:00:00Z".to_owned(),
-                body: "test event".to_owned(),
-            }],
-            claimed_at: datetime!(2026-01-15 12:00:00 UTC),
-        }
-    }
-
-    fn sample_attachment(attempt_id: &str, _signal_id: &str) -> PersistedAttachment {
-        PersistedAttachment {
-            attempt_id: attempt_id.to_owned(),
-            arm_id: "01J00000000000000000000010".to_owned(),
-            generation: 1,
-            seat_id: "example-devrev".to_owned(),
-            route: ManagedCapability::MANAGED_TURN_START_ROUTE.to_owned(),
-            capability: ManagedCapability::ManagedTurnStart,
-            lease_until: datetime!(2026-02-15 12:00:00 UTC),
-            verifier_ref: format!("vrf:{attempt_id}"),
-            revoked: false,
-        }
-    }
-
-    fn sample_arm() -> PersistedArm {
-        PersistedArm {
-            arm_id: "01J00000000000000000000010".to_owned(),
-            generation: 1,
-            seat_id: "example-devrev".to_owned(),
-            route: ManagedCapability::MANAGED_TURN_START_ROUTE.to_owned(),
-            capability: ManagedCapability::ManagedTurnStart,
-            coverage_until: datetime!(2026-02-15 12:00:00 UTC),
-        }
-    }
-
-    /// Admit a claim with the standard sample attachment.
-    fn admit(persist: &mut FakePersist, claim: &DurableClaim, attempt_id: &str) -> AdmissionRecord {
-        let attachment = sample_attachment(attempt_id, &claim.signal_id);
-        persist
-            .admit_claim(claim, Some(&attachment))
-            .expect("admit")
+    fn birth() -> (PersistedControllerBirth, ThreadCreateReservation) {
+        let birth_id = ControllerBirthId::fixture(1);
+        (
+            PersistedControllerBirth {
+                birth_id: birth_id.clone(),
+                seat_id: SeatId::new("seat-a").expect("seat"),
+                arm_id: ArmId::new("arm-a").expect("arm"),
+                generation: 1,
+                capability: ManagedCapability::HandleClaimedSignal,
+                lease_until: OffsetDateTime::UNIX_EPOCH,
+                verifier_ref: VerifierRef::fixture(3),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                revoked: false,
+            },
+            ThreadCreateReservation {
+                birth_id,
+                create_attempt_id: RequestNonce::fixture(2),
+                reserved_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        )
     }
 
     #[test]
-    fn first_claim_is_admitted() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("01J00000000000000000000021", 1, "req-1");
-        let record = admit(&mut persist, &claim, "attempt-1");
-        assert_eq!(record.outcome, ClaimOutcome::Admitted);
-        assert_eq!(persist.claim_count(), 1);
-        // Admission is atomic across all families.
-        assert!(persist.persisted_attachments.contains_key("attempt-1"));
+    fn controller_birth_replay_and_conflict_are_exact() {
+        let mut store = FakePersist::default();
+        let (birth, create) = birth();
         assert_eq!(
-            persist.attempt_signals.get("attempt-1"),
-            Some(&"01J00000000000000000000021".to_owned())
+            store.reserve_controller_birth(&birth, &create),
+            Ok(ReserveBirthOutcome::Reserved)
         );
-        assert_eq!(persist.attempt_seq, 1);
-    }
-
-    #[test]
-    fn exact_replay_is_idempotent() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("01J00000000000000000000021", 1, "req-1");
-        let record = admit(&mut persist, &claim, "attempt-1");
-        assert_eq!(record.outcome, ClaimOutcome::Admitted);
-        let record = persist.admit_claim(&claim, None).expect("replay");
-        assert_eq!(record.outcome, ClaimOutcome::Replay);
-        assert_eq!(record.attempt_id, "attempt-1");
-    }
-
-    #[test]
-    fn later_time_replay_is_idempotent() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        let later = DurableClaim {
-            claimed_at: datetime!(2026-01-15 13:00:00 UTC),
-            ..claim.clone()
-        };
-        let record = persist.admit_claim(&later, None).expect("replay");
-        assert_eq!(record.outcome, ClaimOutcome::Replay);
-    }
-
-    #[test]
-    fn replay_ignores_supplied_attachment() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        // A bogus attachment on replay must not be persisted.
-        let bogus = sample_attachment("attempt-99", "wrong");
-        let record = persist.admit_claim(&claim, Some(&bogus)).expect("replay");
-        assert_eq!(record.outcome, ClaimOutcome::Replay);
-        assert!(!persist.persisted_attachments.contains_key("attempt-99"));
-        assert!(!persist.attempt_signals.contains_key("attempt-99"));
-    }
-
-    #[test]
-    fn same_request_id_different_body_is_conflict() {
-        let mut persist = FakePersist::default();
-        let first = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &first, "attempt-1");
-        let mut second = first.clone();
-        second.events[0].body = "different".to_owned();
         assert_eq!(
-            persist.admit_claim(&second, None),
-            Err(ClaimError::Conflict)
+            store.reserve_controller_birth(&birth, &create),
+            Ok(ReserveBirthOutcome::ExactReplay)
         );
-    }
-
-    #[test]
-    fn changed_metadata_is_not_exact_replay() {
-        // Different provider/actor/observed_at with same body and request_id
-        // should be detected as a conflict, not an exact replay.
-        let mut persist = FakePersist::default();
-        let first = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &first, "attempt-1");
-        let changed = sample_claim_different_metadata("01J00000000000000000000021", 1, "req-1");
+        let mut changed = create.clone();
+        changed.create_attempt_id = RequestNonce::fixture(3);
         assert_eq!(
-            persist.admit_claim(&changed, None),
-            Err(ClaimError::Conflict)
+            store.reserve_controller_birth(&birth, &changed),
+            Ok(ReserveBirthOutcome::Conflict)
         );
     }
 
     #[test]
-    fn different_request_id_same_signal_allows_new_claim() {
-        let mut persist = FakePersist::default();
-        let first = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &first, "attempt-1");
-        // Different request_id with same signal_id but different generation
-        let second = sample_claim("01J00000000000000000000021", 2, "req-2");
-        let record = admit(&mut persist, &second, "attempt-2");
-        assert_eq!(record.outcome, ClaimOutcome::Admitted);
-    }
-
-    #[test]
-    fn storage_failure_is_returned() {
-        let mut persist = FakePersist {
-            next_claim_error: Some("disk full".to_owned()),
-            ..Default::default()
-        };
-        let claim = sample_claim("01J00000000000000000000021", 1, "req-1");
-        assert!(matches!(
-            persist.admit_claim(&claim, None),
-            Err(ClaimError::StorageFailure(_))
-        ));
-        assert_eq!(persist.claim_count(), 0);
-    }
-
-    #[test]
-    fn occupied_arm_generation_rejects_new_request() {
-        let mut persist = FakePersist::default();
-        let first = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &first, "attempt-1");
+    fn shared_fake_handles_observe_one_store() {
+        let mut writer = SharedFakePersist::default();
+        let reader = writer.clone();
+        let (birth, create) = birth();
+        writer
+            .reserve_controller_birth(&birth, &create)
+            .expect("reserve birth");
         assert_eq!(
-            persist.admit_claim(
-                &sample_claim("01J00000000000000000000022", 1, "req-2"),
-                Some(&sample_attachment(
-                    "attempt-2",
-                    "01J00000000000000000000022"
-                )),
-            ),
-            Err(ClaimError::OccupiedDifferent)
-        );
-    }
-
-    #[test]
-    fn different_generation_allows_new_claim() {
-        let mut persist = FakePersist::default();
-        let first = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &first, "attempt-1");
-        let record = admit(
-            &mut persist,
-            &sample_claim("01J00000000000000000000022", 2, "req-2"),
-            "attempt-2",
-        );
-        assert_eq!(record.outcome, ClaimOutcome::Admitted);
-    }
-
-    #[test]
-    fn duplicate_attempt_id_for_new_claim_fails_closed() {
-        let mut persist = FakePersist::default();
-        let first = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &first, "attempt-1");
-        let second = sample_claim("sig-2", 2, "req-2");
-        assert_eq!(
-            persist.admit_claim(&second, Some(&sample_attachment("attempt-1", "sig-2"))),
-            Err(ClaimError::Conflict)
-        );
-        assert!(!persist.claims.contains_key("req-2"));
-    }
-
-    #[test]
-    fn duplicate_transition_is_rejected() {
-        let mut persist = FakePersist::default();
-        assert!(
-            persist
-                .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-                .is_ok()
-        );
-        assert!(
-            persist
-                .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn regressive_transition_is_rejected() {
-        let mut persist = FakePersist::default();
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-            .expect("claim");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("dispatch");
-        // ClaimRecorded after DispatchPrepared is regressive
-        assert!(
-            persist
-                .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn first_transition_must_be_claim_recorded() {
-        let mut persist = FakePersist::default();
-        assert!(
-            persist
-                .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn different_attempts_allow_independent_transitions() {
-        // Same signal_id, different attempt_id → independent state machines
-        let mut persist = FakePersist::default();
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-            .expect("claim a1");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("dispatch a1");
-        // Different attempt, starts fresh
-        persist
-            .record_transition("sig-1", "attempt-2", Transition::ClaimRecorded)
-            .expect("claim a2");
-    }
-
-    #[test]
-    fn reconciliation_after_native_accepted_is_valid() {
-        let mut persist = FakePersist::default();
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-            .expect("claim");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("dispatch");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::NativeAccepted)
-            .expect("accepted");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ReconciliationRequired)
-            .expect("reconciliation required");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ReconciliationResolved)
-            .expect("reconciliation resolved");
-    }
-
-    #[test]
-    fn accepted_reconciliation_transitions_are_valid() {
-        // The accepted-resolution shape: RR → NativeAccepted → Resolved.
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("dispatch");
-        persist
-            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Accepted)
-            .expect_err("no prior ReconciliationRequired");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ReconciliationRequired)
-            .expect("required");
-        persist
-            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Accepted)
-            .expect("accepted resolution");
-        {
-            let ts = persist.get_transitions("sig-1", "attempt-1");
-            assert!(
-                ts.contains(&Transition::NativeAccepted)
-                    && ts.contains(&Transition::ReconciliationResolved)
-            );
-        }
-        assert_eq!(
-            persist.reconciliations.get("attempt-1"),
-            Some(&ReconciliationState::Accepted)
-        );
-        // Idempotent repeat appends nothing.
-        let len_before = persist.get_transitions("sig-1", "attempt-1").len();
-        persist
-            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Accepted)
-            .expect("idempotent repeat");
-        assert_eq!(
-            persist.get_transitions("sig-1", "attempt-1").len(),
-            len_before
-        );
-        // Conflicting resolution is rejected.
-        assert!(
-            persist
-                .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Terminal)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn unknown_reconciliation_can_upgrade_once_but_final_conflicts_fail() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("prepare");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ReconciliationRequired)
-            .expect("ambiguity");
-        persist
-            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Unknown)
-            .expect("unknown");
-        persist
-            .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Terminal)
-            .expect("terminal upgrade");
-        assert_eq!(
-            persist.reconciliations.get("attempt-1"),
-            Some(&ReconciliationState::Terminal)
-        );
-        assert!(
-            persist
-                .get_transitions("sig-1", "attempt-1")
-                .contains(&Transition::ReconciliationResolved)
-        );
-        assert!(
-            persist
-                .record_reconciliation("attempt-1", "sig-1", ReconciliationState::Accepted)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn reconciliation_signal_binding_fails_closed() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("dispatch");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ReconciliationRequired)
-            .expect("required");
-        // Wrong signal id → fail closed, no resolution recorded.
-        assert!(
-            persist
-                .record_reconciliation("attempt-1", "sig-99", ReconciliationState::Terminal)
-                .is_err()
-        );
-        assert!(persist.reconciliations.is_empty());
-        // Unknown attempt → fail closed.
-        assert!(
-            persist
-                .record_reconciliation("attempt-99", "sig-1", ReconciliationState::Terminal)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn record_prepared_is_atomic_and_binding_checked() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        // Wrong binding fails closed — no transition, no marker.
-        assert!(persist.record_prepared("sig-99", "attempt-1").is_err());
-        assert!(!persist.prepared_set.contains_key("attempt-1"));
-        assert!(persist.get_transitions("sig-1", "attempt-1").len() == 1);
-        // Correct prep records both atomically.
-        persist
-            .record_prepared("sig-1", "attempt-1")
-            .expect("prepare");
-        assert!(persist.prepared_set.contains_key("attempt-1"));
-        assert_eq!(persist.get_transitions("sig-1", "attempt-1").len(), 2);
-        // Duplicate prepare is rejected without mutating.
-        assert!(persist.record_prepared("sig-1", "attempt-1").is_err());
-        assert_eq!(persist.get_transitions("sig-1", "attempt-1").len(), 2);
-    }
-
-    #[test]
-    fn record_prepare_error_injection_is_atomic() {
-        let mut persist = FakePersist {
-            next_prepare_error: Some("prepare failed".to_owned()),
-            ..Default::default()
-        };
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        assert!(persist.record_prepared("sig-1", "attempt-1").is_err());
-        assert!(!persist.prepared_set.contains_key("attempt-1"));
-        assert_eq!(persist.get_transitions("sig-1", "attempt-1").len(), 1);
-    }
-
-    #[test]
-    fn record_conclusion_is_fully_atomic() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        persist
-            .record_prepared("sig-1", "attempt-1")
-            .expect("prepare");
-        let conclusion = crate::controller::DispatchDisposition::Ambiguous;
-        persist
-            .record_conclusion(
-                "attempt-1",
-                "sig-1",
-                &conclusion,
-                Some(Transition::ReconciliationRequired),
-            )
-            .expect("conclusion");
-        assert_eq!(
-            persist.get_disposition("attempt-1"),
-            Some(&crate::controller::DispatchDisposition::Ambiguous)
-        );
-        assert!(persist.concluded_set.contains_key("attempt-1"));
-        assert!(
-            persist
-                .get_transitions("sig-1", "attempt-1")
-                .contains(&Transition::ReconciliationRequired)
-        );
-    }
-
-    #[test]
-    fn record_conclusion_failure_commits_nothing() {
-        for injection in ["disposition", "commit"] {
-            let mut persist = FakePersist::default();
-            if injection == "disposition" {
-                persist.next_disposition_error = Some("disposition failed".to_owned());
-            } else {
-                persist.next_conclusion_error = Some("commit failed".to_owned());
+            reader
+                .thread_ownership_state(&birth.birth_id)
+                .expect("shared ownership"),
+            ThreadOwnershipState::Reserved {
+                create_attempt_id: create.create_attempt_id,
             }
-            let claim = sample_claim("sig-1", 1, "req-1");
-            admit(&mut persist, &claim, "attempt-1");
-            persist
-                .record_prepared("sig-1", "attempt-1")
-                .expect("prepare");
-            let outcome = persist.record_conclusion(
-                "attempt-1",
-                "sig-1",
-                &DispatchDisposition::Accepted {
-                    correlation: "c".to_owned(),
+        );
+    }
+
+    #[test]
+    fn recovery_quarantines_an_unresolved_create_reservation() {
+        let mut store = FakePersist::default();
+        let (birth, create) = birth();
+        store
+            .reserve_controller_birth(&birth, &create)
+            .expect("reserve birth");
+        let snapshot = store.recover_authority_state().expect("recover");
+        assert!(matches!(
+            snapshot.ownership.as_slice(),
+            [PersistedThreadOwnership {
+                state: ThreadOwnershipState::Unknown { create_attempt_id },
+                ..
+            }] if create_attempt_id == &create.create_attempt_id
+        ));
+    }
+
+    #[test]
+    fn unknown_create_cannot_be_replaced_by_another_attempt() {
+        let mut store = FakePersist::default();
+        let (birth, create) = birth();
+        store
+            .reserve_controller_birth(&birth, &create)
+            .expect("reserve");
+        store
+            .resolve_thread_create(ThreadCreateCommit {
+                birth_id: birth.birth_id.clone(),
+                create_attempt_id: create.create_attempt_id.clone(),
+                resolution: ThreadCreateResolution::Unknown,
+                evidence_ref: VerifierRef::fixture(4),
+            })
+            .expect("unknown");
+        let conflict = store.resolve_thread_create(ThreadCreateCommit {
+            birth_id: birth.birth_id,
+            create_attempt_id: RequestNonce::fixture(9),
+            resolution: ThreadCreateResolution::Owned {
+                thread_ref: PrivateNativeRef::fixture(8),
+            },
+            evidence_ref: VerifierRef::fixture(5),
+        });
+        assert_eq!(conflict, Err(PersistError::Conflict));
+    }
+
+    fn coordinate_store() -> (
+        FakePersist,
+        ControllerBirthId,
+        RequestNonce,
+        PersistedTurnCorrelation,
+    ) {
+        let mut store = FakePersist::default();
+        let (birth, create) = birth();
+        store
+            .reserve_controller_birth(&birth, &create)
+            .expect("reserve birth");
+        let thread_scope = NativeCoordinateScope::Thread {
+            birth_id: birth.birth_id.clone(),
+            create_attempt_id: create.create_attempt_id.clone(),
+        };
+        let thread_ref = store
+            .seal_native_coordinate(
+                &thread_scope,
+                &SecretNativeCoordinate::thread("native-thread-private").expect("secret"),
+            )
+            .expect("seal thread");
+        store
+            .resolve_thread_create(ThreadCreateCommit {
+                birth_id: birth.birth_id.clone(),
+                create_attempt_id: create.create_attempt_id.clone(),
+                resolution: ThreadCreateResolution::Owned {
+                    thread_ref: thread_ref.clone(),
                 },
-                Some(Transition::NativeAccepted),
-            );
-            assert!(outcome.is_err(), "injection={injection}");
-            // Nothing observable: no disposition, no transition, no marker.
-            assert!(persist.get_disposition("attempt-1").is_none());
-            assert!(!persist.concluded_set.contains_key("attempt-1"));
-            assert_eq!(persist.get_transitions("sig-1", "attempt-1").len(), 2);
+                evidence_ref: VerifierRef::fixture(5),
+            })
+            .expect("resolve owned");
+        let correlation = PersistedTurnCorrelation {
+            attempt_id: AttemptId::new("attempt-a").expect("attempt"),
+            signal_id: SignalId::new("signal-a").expect("signal"),
+            birth_id: birth.birth_id.clone(),
+            thread_ref,
+            turn_write_id: RequestNonce::fixture(6),
+            turn_ref: None,
+        };
+        let attachment_verifier = VerifierRef::fixture(8);
+        store
+            .admit_claim(
+                &ClaimAdmission {
+                    record: PersistedClaimRecord {
+                        attempt_id: correlation.attempt_id.clone(),
+                        request_id: ClaimRequestId::new("claim-a").expect("claim"),
+                        arm_id: birth.arm_id.clone(),
+                        generation: birth.generation,
+                        signal_id: correlation.signal_id.clone(),
+                        event_refs: vec!["event-a".to_owned()],
+                        claimed_at: OffsetDateTime::UNIX_EPOCH,
+                    },
+                    events: vec![ProviderEvent {
+                        provider: "test".to_owned(),
+                        event_ref: "event-a".to_owned(),
+                        actor: None,
+                        observed_at: "1970-01-01T00:00:00Z".to_owned(),
+                        body: "test".to_owned(),
+                    }],
+                },
+                &PersistedControllerAttachment {
+                    attempt_id: correlation.attempt_id.clone(),
+                    birth_id: birth.birth_id.clone(),
+                    seat_id: birth.seat_id.clone(),
+                    arm_id: birth.arm_id.clone(),
+                    generation: birth.generation,
+                    capability: birth.capability,
+                    lease_until: birth.lease_until,
+                    verifier_ref: attachment_verifier.clone(),
+                    revoked: false,
+                },
+            )
+            .expect("admit claim");
+        store
+            .record_dispatch_prepared(PreparedDispatchCommit {
+                correlation: correlation.clone(),
+            })
+            .expect("prepare turn");
+        store
+            .reserve_native_turn_write(
+                ValidatedIdlePermit {
+                    attempt_id: correlation.attempt_id.clone(),
+                    signal_id: correlation.signal_id.clone(),
+                    birth_id: correlation.birth_id.clone(),
+                    thread_ref: correlation.thread_ref.clone(),
+                    arm_id: birth.arm_id.clone(),
+                    generation: birth.generation,
+                    capability: birth.capability,
+                    verifier_ref: attachment_verifier,
+                    mutation_epoch: NativeMutationEpoch {
+                        birth_id: birth.birth_id.clone(),
+                        sequence: 1,
+                    },
+                    probe_id: RequestNonce::fixture(9),
+                    observed_at: OffsetDateTime::UNIX_EPOCH,
+                    valid_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+                },
+                &correlation,
+            )
+            .expect("reserve write");
+        (store, birth.birth_id, create.create_attempt_id, correlation)
+    }
+
+    fn active_proof(
+        correlation: &PersistedTurnCorrelation,
+        prehash: [u8; 32],
+        epoch_sequence: u64,
+    ) -> ActiveObservationProof {
+        ActiveObservationProof {
+            birth_id: correlation.birth_id.clone(),
+            create_attempt_id: RequestNonce::fixture(2),
+            thread_ref: correlation.thread_ref.clone(),
+            seat_id: SeatId::new("seat-a").expect("seat"),
+            arm_id: ArmId::new("arm-a").expect("arm"),
+            generation: 1,
+            capability: ManagedCapability::HandleClaimedSignal,
+            attachment_verifier_ref: VerifierRef::fixture(8),
+            lease_until: OffsetDateTime::UNIX_EPOCH,
+            attempt_id: correlation.attempt_id.clone(),
+            signal_id: correlation.signal_id.clone(),
+            probe_id: RequestNonce::fixture(50),
+            mutation_epoch: NativeMutationEpoch {
+                birth_id: correlation.birth_id.clone(),
+                sequence: epoch_sequence,
+            },
+            observed_at: OffsetDateTime::UNIX_EPOCH - time::Duration::seconds(1),
+            prehash: crate::controller::ActiveObservationPrehash::new(prehash),
+            producer_version: "codex-cli 0.149.1".to_owned(),
+            producer_dialect: "thread/read-v2".to_owned(),
         }
     }
 
     #[test]
-    fn transition_failure_is_atomic_within_conclusion() {
-        // A regressive first transition must fail the entire conclusion.
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("sig-1", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        persist
-            .record_prepared("sig-1", "attempt-1")
-            .expect("prepare");
-        // ClaimRecorded is regressive here — conclusion must fail everywhere.
-        assert!(
-            persist
-                .record_conclusion(
-                    "attempt-1",
-                    "sig-1",
-                    &DispatchDisposition::Rejected,
-                    Some(Transition::ClaimRecorded),
-                )
-                .is_err()
-        );
-        assert!(persist.get_disposition("attempt-1").is_none());
-        assert!(!persist.concluded_set.contains_key("attempt-1"));
-        assert_eq!(persist.get_transitions("sig-1", "attempt-1").len(), 2);
-    }
-
-    #[test]
-    fn transitions_are_ordered() {
-        let mut persist = FakePersist::default();
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-            .expect("claim");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::DispatchPrepared)
-            .expect("dispatch");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::NativeAccepted)
-            .expect("accepted");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ExactTurnStart)
-            .expect("start");
-        persist
-            .record_transition("sig-1", "attempt-1", Transition::ExactTurnTerminal)
-            .expect("terminal");
+    fn active_evidence_replay_binds_prehash_epoch_and_store_key() {
+        let (store, _, _, correlation) = coordinate_store();
+        let mut first = store.clone();
+        let mut second = store;
+        second.rekey_active_evidence();
         assert_eq!(
-            persist.get_transitions("sig-1", "attempt-1"),
-            &[
-                Transition::ClaimRecorded,
-                Transition::DispatchPrepared,
-                Transition::NativeAccepted,
-                Transition::ExactTurnStart,
-                Transition::ExactTurnTerminal,
-            ]
+            first.record_active_hold(ActiveHoldCommit {
+                proof: active_proof(&correlation, [1; 32], 7),
+            }),
+            Ok(IdempotentWrite::Recorded)
         );
-    }
-
-    #[test]
-    fn recover_returns_claims_transitions_and_dispositions() {
-        let mut persist = FakePersist::default();
-        let claim = sample_claim("01J00000000000000000000021", 1, "req-1");
-        admit(&mut persist, &claim, "attempt-1");
-        // The admission already recorded ClaimRecorded for
-        // (01J…21, attempt-1); a duplicate is rejected.
-        persist
-            .record_transition(
-                "01J00000000000000000000021",
-                "attempt-1",
-                Transition::ClaimRecorded,
-            )
-            .expect_err("duplicate ClaimRecorded from admission");
-        persist
-            .record_disposition(
-                "attempt-1",
-                &DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
-                },
-            )
-            .expect("disp");
-        persist.persist_arm_state(&sample_arm()).expect("arm");
-        let snapshot = persist.recover().expect("recover");
-        assert_eq!(snapshot.claims.len(), 1);
-        assert!(
-            snapshot
-                .transitions
-                .contains_key("01J00000000000000000000021:attempt-1")
-        );
-        assert!(snapshot.dispositions.contains_key("attempt-1"));
-        assert_eq!(snapshot.arms.len(), 1);
-        assert_eq!(snapshot.attachments.len(), 1);
         assert_eq!(
-            snapshot.attempt_signals.get("attempt-1"),
-            Some(&"01J00000000000000000000021".to_owned())
+            first.record_active_hold(ActiveHoldCommit {
+                proof: active_proof(&correlation, [1; 32], 7),
+            }),
+            Ok(IdempotentWrite::ExactReplay)
         );
-    }
-
-    #[test]
-    fn record_disposition_is_idempotent() {
-        let mut persist = FakePersist::default();
-        let d = DispatchDisposition::Accepted {
-            correlation: "turn-X".to_owned(),
-        };
-        persist.record_disposition("attempt-1", &d).expect("first");
-        // Same disposition, same attempt_id = ok (idempotent)
-        persist.record_disposition("attempt-1", &d).expect("replay");
-    }
-
-    #[test]
-    fn conflicting_disposition_is_rejected() {
-        let mut persist = FakePersist::default();
-        persist
-            .record_disposition(
-                "attempt-1",
-                &DispatchDisposition::Accepted {
-                    correlation: "turn-X".to_owned(),
-                },
-            )
-            .expect("first");
-        assert!(
-            persist
-                .record_disposition("attempt-1", &DispatchDisposition::Rejected,)
-                .is_err()
+        assert_eq!(
+            first.record_active_hold(ActiveHoldCommit {
+                proof: active_proof(&correlation, [2; 32], 7),
+            }),
+            Err(PersistError::Conflict)
         );
-    }
-
-    #[test]
-    fn storage_failure_on_transition_is_returned() {
-        let mut persist = FakePersist {
-            next_transition_error: Some("transition write failed".to_owned()),
-            ..Default::default()
-        };
-        assert!(
-            persist
-                .record_transition("sig-1", "attempt-1", Transition::ClaimRecorded)
-                .is_err()
+        assert_eq!(
+            first.record_active_hold(ActiveHoldCommit {
+                proof: active_proof(&correlation, [1; 32], 8),
+            }),
+            Err(PersistError::Conflict)
         );
+        second
+            .record_active_hold(ActiveHoldCommit {
+                proof: active_proof(&correlation, [1; 32], 7),
+            })
+            .expect("second store active evidence");
+        let first_fingerprint = first
+            .recover_authority_state()
+            .expect("first snapshot")
+            .active_observations[0]
+            .fingerprint
+            .clone();
+        let second_fingerprint = second
+            .recover_authority_state()
+            .expect("second snapshot")
+            .active_observations[0]
+            .fingerprint
+            .clone();
+        assert_ne!(first_fingerprint, second_fingerprint);
     }
 
     #[test]
-    fn storage_failure_on_disposition_is_returned() {
-        let mut persist = FakePersist {
-            next_disposition_error: Some("disposition write failed".to_owned()),
-            ..Default::default()
+    #[allow(clippy::too_many_lines)]
+    fn native_coordinate_scopes_reject_every_cross_binding_and_kind() {
+        let (mut store, birth_id, create_attempt_id, correlation) = coordinate_store();
+        let thread_scope = NativeCoordinateScope::Thread {
+            birth_id: birth_id.clone(),
+            create_attempt_id: create_attempt_id.clone(),
         };
-        assert!(
-            persist
-                .record_disposition(
-                    "attempt-1",
-                    &DispatchDisposition::Accepted {
-                        correlation: "turn-X".to_owned(),
-                    },
+        let ThreadOwnershipState::Owned {
+            create_attempt_id: recovered_create,
+            thread_ref,
+        } = store.thread_ownership_state(&birth_id).expect("ownership")
+        else {
+            panic!("owned");
+        };
+        assert_eq!(recovered_create, create_attempt_id);
+        assert_eq!(
+            store
+                .open_native_coordinate(&thread_scope, &thread_ref)
+                .expect("open thread")
+                .as_str(),
+            Ok("native-thread-private")
+        );
+        assert_eq!(
+            store
+                .seal_native_coordinate(
+                    &thread_scope,
+                    &SecretNativeCoordinate::thread("native-thread-private").expect("secret")
                 )
-                .is_err()
+                .expect("replay thread seal"),
+            thread_ref
         );
-    }
+        assert_eq!(
+            store.seal_native_coordinate(
+                &thread_scope,
+                &SecretNativeCoordinate::thread("different-thread").expect("secret")
+            ),
+            Err(PersistError::Unauthorized)
+        );
 
-    #[test]
-    fn arm_persist_is_full_policy() {
-        let mut persist = FakePersist::default();
-        persist.persist_arm_state(&sample_arm()).expect("persist");
-        let snapshot = persist.recover().expect("recover");
-        let arm = snapshot.arms.first().expect("arm");
-        assert_eq!(arm.seat_id, "example-devrev");
-        assert_eq!(arm.capability, ManagedCapability::ManagedTurnStart);
-        assert_eq!(arm.coverage_until, datetime!(2026-02-15 12:00:00 UTC));
-    }
+        let turn_scope = NativeCoordinateScope::Turn {
+            birth_id: birth_id.clone(),
+            attempt_id: correlation.attempt_id.clone(),
+            signal_id: correlation.signal_id.clone(),
+            turn_write_id: correlation.turn_write_id.clone(),
+        };
+        let turn_ref = store
+            .seal_native_coordinate(
+                &turn_scope,
+                &SecretNativeCoordinate::turn("native-turn-private").expect("secret"),
+            )
+            .expect("seal turn");
+        assert!(matches!(
+            store.open_native_coordinate(&turn_scope, &turn_ref),
+            Err(PersistError::Unauthorized)
+        ));
+        let mut accepted = correlation.clone();
+        accepted.turn_ref = Some(turn_ref.clone());
+        store
+            .record_native_turn_fact(NativeTurnFactCommit {
+                correlation: accepted,
+                fact: NativeTurnFact::Accepted {
+                    turn_ref: turn_ref.clone(),
+                },
+                evidence_ref: VerifierRef::fixture(10),
+            })
+            .expect("commit accepted turn binding");
+        assert_eq!(
+            store
+                .open_native_coordinate(&turn_scope, &turn_ref)
+                .expect("open turn")
+                .as_str(),
+            Ok("native-turn-private")
+        );
+        assert_eq!(
+            store
+                .seal_native_coordinate(
+                    &turn_scope,
+                    &SecretNativeCoordinate::turn("native-turn-private").expect("secret")
+                )
+                .expect("replay turn seal"),
+            turn_ref
+        );
+        assert_eq!(
+            store.seal_native_coordinate(
+                &turn_scope,
+                &SecretNativeCoordinate::turn("different-turn").expect("secret")
+            ),
+            Err(PersistError::Unauthorized)
+        );
 
-    #[test]
-    fn fake_identity_is_correct() {
-        let persist = FakePersist::default();
-        assert_eq!(persist.backend_identity(), "fake-deterministic");
-        assert_eq!(persist.durability(), DurabilityClass::BestEffort);
+        let wrong_thread_scopes = [
+            NativeCoordinateScope::Thread {
+                birth_id: birth_id.clone(),
+                create_attempt_id: RequestNonce::fixture(99),
+            },
+            NativeCoordinateScope::Thread {
+                birth_id: ControllerBirthId::fixture(99),
+                create_attempt_id: create_attempt_id.clone(),
+            },
+        ];
+        for scope in wrong_thread_scopes {
+            assert_eq!(
+                store.seal_native_coordinate(
+                    &scope,
+                    &SecretNativeCoordinate::thread("wrong").expect("secret")
+                ),
+                Err(PersistError::Unauthorized)
+            );
+            assert!(matches!(
+                store.open_native_coordinate(&scope, &thread_ref),
+                Err(PersistError::Unauthorized)
+            ));
+        }
+
+        let wrong_turn_scopes = [
+            NativeCoordinateScope::Turn {
+                birth_id: ControllerBirthId::fixture(99),
+                attempt_id: correlation.attempt_id.clone(),
+                signal_id: correlation.signal_id.clone(),
+                turn_write_id: correlation.turn_write_id.clone(),
+            },
+            NativeCoordinateScope::Turn {
+                birth_id: birth_id.clone(),
+                attempt_id: AttemptId::new("attempt-other").expect("attempt"),
+                signal_id: correlation.signal_id.clone(),
+                turn_write_id: correlation.turn_write_id.clone(),
+            },
+            NativeCoordinateScope::Turn {
+                birth_id: birth_id.clone(),
+                attempt_id: correlation.attempt_id.clone(),
+                signal_id: SignalId::new("signal-other").expect("signal"),
+                turn_write_id: correlation.turn_write_id.clone(),
+            },
+            NativeCoordinateScope::Turn {
+                birth_id: birth_id.clone(),
+                attempt_id: correlation.attempt_id.clone(),
+                signal_id: correlation.signal_id.clone(),
+                turn_write_id: RequestNonce::fixture(99),
+            },
+        ];
+        for scope in wrong_turn_scopes {
+            assert_eq!(
+                store.seal_native_coordinate(
+                    &scope,
+                    &SecretNativeCoordinate::turn("wrong").expect("secret")
+                ),
+                Err(PersistError::Unauthorized)
+            );
+            assert!(matches!(
+                store.open_native_coordinate(&scope, &turn_ref),
+                Err(PersistError::Unauthorized)
+            ));
+        }
+        assert!(matches!(
+            store.open_native_coordinate(&turn_scope, &thread_ref),
+            Err(PersistError::Unauthorized)
+        ));
+        assert!(matches!(
+            store.open_native_coordinate(&thread_scope, &turn_ref),
+            Err(PersistError::Unauthorized)
+        ));
+        assert_eq!(
+            store.seal_native_coordinate(
+                &turn_scope,
+                &SecretNativeCoordinate::thread("wrong-kind").expect("secret")
+            ),
+            Err(PersistError::Unauthorized)
+        );
+        assert_eq!(
+            store.seal_native_coordinate(
+                &thread_scope,
+                &SecretNativeCoordinate::turn("wrong-kind").expect("secret")
+            ),
+            Err(PersistError::Unauthorized)
+        );
+
+        let rendered = format!("{store:?}");
+        assert!(!rendered.contains("native-thread-private"));
+        assert!(!rendered.contains("native-turn-private"));
+        let snapshot = store.recover_authority_state().expect("snapshot");
+        let rendered = format!("{snapshot:?}");
+        assert!(!rendered.contains("native-thread-private"));
+        assert!(!rendered.contains("native-turn-private"));
     }
 }
