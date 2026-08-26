@@ -5,6 +5,8 @@
 mod ack;
 mod admit;
 mod authority;
+#[allow(dead_code)] // Kept private until a host integration point is approved.
+mod codex_transport;
 pub mod controller;
 pub mod coordinator;
 mod deliver;

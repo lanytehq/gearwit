@@ -232,6 +232,10 @@ dependencies = [
  "ipcprims",
  "nix",
  "rsfulmen",
+ "serde_json",
+ "sysprims-proc",
+ "sysprims-session",
+ "sysprims-signal",
  "time",
  "ulid",
 ]
@@ -467,12 +471,11 @@ dependencies = [
 
 [[package]]
 name = "rsfulmen"
-version = "0.1.6"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cd0ea6e6047f2a49afcae3844172c5f220162d66ea9ff13bb055fb05377dccd"
+checksum = "b47400bda4eabdb1d346494637579a1fd896423d37fbd34f2fdbb9ed16797ae6"
 dependencies = [
  "ctrlc",
- "libc",
  "once_cell",
  "serde",
  "serde_json",
@@ -601,6 +604,49 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sysprims-core"
+version = "0.1.18"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+dependencies = [
+ "rsfulmen",
+ "thiserror 1.0.69",
+ "time",
+]
+
+[[package]]
+name = "sysprims-proc"
+version = "0.1.18"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sysprims-core",
+ "sysprims-signal",
+ "windows-sys",
+]
+
+[[package]]
+name = "sysprims-session"
+version = "0.1.18"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+dependencies = [
+ "libc",
+ "sysprims-core",
+]
+
+[[package]]
+name = "sysprims-signal"
+version = "0.1.18"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+dependencies = [
+ "libc",
+ "rsfulmen",
+ "sysprims-core",
+ "windows-sys",
 ]
 
 [[package]]
