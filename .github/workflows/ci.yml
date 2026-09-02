@@ -58,6 +58,8 @@ jobs:
   platform-smoke-hosted:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ github.workspace }}/../_tmp
     strategy:
       fail-fast: false
       matrix:
@@ -87,6 +89,10 @@ jobs:
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
 
+      - name: Prepare temp directory
+        if: matrix.build
+        run: mkdir -p "$TMPDIR"
+
       - name: Test workspace
         if: matrix.build
         env:
@@ -113,6 +119,8 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ github.workspace }}/../_tmp
     strategy:
       fail-fast: false
       matrix:
@@ -137,6 +145,10 @@ jobs:
           toolchain: "1.90.0"
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
+
+      - name: Prepare temp directory
+        if: matrix.build
+        run: mkdir -p "$TMPDIR"
 
       - name: Test workspace
         if: matrix.build
