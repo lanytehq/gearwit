@@ -20,16 +20,16 @@ goneat-version:
 		(echo "goneat version mismatch: expected $(GONEAT_VERSION)" >&2; exit 1)
 
 metadata:
-	cargo metadata --no-deps --format-version 1 > /dev/null
+	cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
 fmt:
 	cargo fmt --all --check
 
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test:
-	cargo test --workspace
+	cargo test --workspace --locked
 
 console-check:
 	bun run check:js
