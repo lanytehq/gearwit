@@ -28,14 +28,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Ensure goneat pin
+      - name: Install pinned tools
         run: |
           set -euo pipefail
+          bun_version="$(tr -d ' \n\r' < .bun-version)"
           mkdir -p "$HOME/.local/bin"
           sfetch --repo fulmenhq/goneat --tag "$GONEAT_VERSION" \
             --dest-dir "$HOME/.local/bin" --require-minisign
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
+          npm install --global --prefix "$HOME/.local" "bun@$bun_version"
+          test "$(bun --version)" = "$bun_version"
           make goneat-version
 
       - name: Install JavaScript dependencies
