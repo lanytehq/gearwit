@@ -1,0 +1,9 @@
+---
+# actionlint configuration.
+#
+# These labels are lanytehq larger-hosted runners. This file only teaches
+# actionlint about deployed labels; it does not provision runners.
+self-hosted-runner:
+  labels:
+    - ubuntu-latest-arm64-s
+    - windows-latest-arm64-s
