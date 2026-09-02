@@ -22,17 +22,22 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      CARGO_HOME: ${{ github.workspace }}/../_cargo
+      RUSTUP_HOME: ${{ github.workspace }}/../_rustup
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - name: Prepare tool directories
+        run: mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$HOME/.local/bin"
+
       - name: Install pinned tools
         run: |
           set -euo pipefail
           bun_version="$(tr -d ' \n\r' < .bun-version)"
-          mkdir -p "$HOME/.local/bin"
           sfetch --repo fulmenhq/goneat --tag "$GONEAT_VERSION" \
             --dest-dir "$HOME/.local/bin" --require-minisign
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
