@@ -37,7 +37,8 @@ jobs:
             --dest-dir "$HOME/.local/bin" --require-minisign
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
-          npm install --global --prefix "$HOME/.local" "bun@$bun_version"
+          npm install --global --prefix "$HOME/.local" \
+            --allow-scripts=bun "bun@$bun_version"
           test "$(bun --version)" = "$bun_version"
           make goneat-version
 
