@@ -24,6 +24,7 @@ jobs:
         shell: bash
     env:
       CARGO_HOME: ${{ github.workspace }}/../_cargo
+      TMPDIR: ${{ github.workspace }}/../_tmp
       RUSTUP_HOME: ${{ github.workspace }}/../_rustup
     steps:
       - name: Checkout
@@ -32,7 +33,7 @@ jobs:
           persist-credentials: false
 
       - name: Prepare tool directories
-        run: mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$HOME/.local/bin"
+        run: mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$TMPDIR" "$HOME/.local/bin"
 
       - name: Install pinned tools
         run: |
