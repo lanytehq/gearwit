@@ -2,8 +2,9 @@
 
 VERSION := $(shell tr -d ' \n\r' < VERSION)
 MSRV := $(shell awk -F'"' '/^channel/ { print $$2; exit }' rust-toolchain.toml)
+GONEAT_VERSION ?= v0.6.0
 
-.PHONY: all check gate repository-check metadata fmt clippy test console-check msrv deny help
+.PHONY: all check gate repository-check goneat-version metadata fmt clippy test console-check msrv deny help
 
 all: check
 
@@ -13,6 +14,10 @@ gate: check deny
 
 repository-check:
 	sh scripts/check-repository.sh
+
+goneat-version:
+	@test "$$(goneat --version | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//')" = "$(GONEAT_VERSION:v%=%)" || \
+		(echo "goneat version mismatch: expected $(GONEAT_VERSION)" >&2; exit 1)
 
 metadata:
 	cargo metadata --no-deps --format-version 1 > /dev/null

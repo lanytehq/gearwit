@@ -675,8 +675,8 @@ dependencies = [
 
 [[package]]
 name = "sysprims-core"
-version = "0.1.18"
-source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+version = "0.2.3"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.2.3#e366d37bbdbe28764c0f7022577b1999393742cb"
 dependencies = [
  "rsfulmen",
  "thiserror 1.0.69",
@@ -685,8 +685,8 @@ dependencies = [
 
 [[package]]
 name = "sysprims-proc"
-version = "0.1.18"
-source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+version = "0.2.3"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.2.3#e366d37bbdbe28764c0f7022577b1999393742cb"
 dependencies = [
  "libc",
  "serde",
@@ -698,8 +698,8 @@ dependencies = [
 
 [[package]]
 name = "sysprims-session"
-version = "0.1.18"
-source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+version = "0.2.3"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.2.3#e366d37bbdbe28764c0f7022577b1999393742cb"
 dependencies = [
  "libc",
  "sysprims-core",
@@ -707,8 +707,8 @@ dependencies = [
 
 [[package]]
 name = "sysprims-signal"
-version = "0.1.18"
-source = "git+https://github.com/3leaps/sysprims?tag=v0.1.18#3d9f9cebfe4a7f589663f9261469bb87885b8296"
+version = "0.2.3"
+source = "git+https://github.com/3leaps/sysprims?tag=v0.2.3#e366d37bbdbe28764c0f7022577b1999393742cb"
 dependencies = [
  "libc",
  "rsfulmen",
