@@ -1,5 +1,6 @@
 # yamllint disable rule:document-start
 # yamllint disable rule:truthy
+# yamllint disable rule:line-length
 name: CI
 
 on:
@@ -28,7 +29,7 @@ jobs:
       RUSTUP_HOME: ${{ github.workspace }}/../_rustup
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
 
@@ -53,3 +54,118 @@ jobs:
 
       - name: Check
         run: make gate
+
+  platform-smoke-hosted:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ github.workspace }}/../_tmp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: smoke (linux-amd64)
+            build: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: smoke (macos-arm64)
+            build: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: contract (windows-amd64; unix host pending)
+            build: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.90.0"
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+
+      - name: Prepare temp directory
+        if: matrix.build
+        run: mkdir -p "$TMPDIR"
+
+      - name: Test workspace
+        if: matrix.build
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Lint workspace
+        if: matrix.build
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Validate workspace contract
+        if: ${{ !matrix.build }}
+        run: cargo metadata --locked --format-version 1 --filter-platform ${{ matrix.target }}
+
+      - name: Check formatting
+        if: ${{ !matrix.build }}
+        run: cargo fmt --all -- --check
+
+  platform-smoke-arm64:
+    name: ${{ matrix.name }}
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ github.workspace }}/../_tmp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest-arm64-s
+            target: aarch64-unknown-linux-gnu
+            name: smoke (linux-arm64)
+            build: true
+          - os: windows-latest-arm64-s
+            target: aarch64-pc-windows-msvc
+            name: contract (windows-arm64; unix host pending)
+            build: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.90.0"
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+
+      - name: Prepare temp directory
+        if: matrix.build
+        run: mkdir -p "$TMPDIR"
+
+      - name: Test workspace
+        if: matrix.build
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Lint workspace
+        if: matrix.build
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Validate workspace contract
+        if: ${{ !matrix.build }}
+        run: cargo metadata --locked --format-version 1 --filter-platform ${{ matrix.target }}
+
+      - name: Check formatting
+        if: ${{ !matrix.build }}
+        run: cargo fmt --all -- --check
