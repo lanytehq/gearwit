@@ -812,7 +812,7 @@ impl Controller for FakeController {
                     epoch,
                     self.now,
                     ActiveObservationPrehash::new(*blake3::hash(b"fake-active").as_bytes()),
-                    "codex-cli 0.149.1",
+                    "codex-cli 0.152.1",
                     "thread/read-v2",
                 ))
             }

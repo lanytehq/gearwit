@@ -938,7 +938,7 @@ impl<P: Persist> DaemonAuthority<P> {
             || proof.observed_at > self.now
             || self.now - proof.observed_at >= IDLE_PERMIT_WINDOW
             || proof.lease_until <= self.now
-            || proof.producer_version != "codex-cli 0.149.1"
+            || proof.producer_version != "codex-cli 0.152.1"
             || proof.producer_dialect != "thread/read-v2"
             || !matches!(
                 owned,
@@ -1354,7 +1354,7 @@ mod tests {
                 4 => proof.signal_id = SignalId::new("signal-other").expect("signal"),
                 5 => proof.probe_id = RequestNonce::fixture(90),
                 6 => proof.mutation_epoch.birth_id = ControllerBirthId::fixture(90),
-                7 => proof.producer_version = "codex-cli 0.149.2".to_owned(),
+                7 => proof.producer_version = "codex-cli 0.152.2".to_owned(),
                 8 => proof.producer_dialect = "thread/read-v3".to_owned(),
                 9 => proof.seat_id = SeatId::new("seat-other").expect("seat"),
                 10 => proof.arm_id = ArmId::new("arm-other").expect("arm"),
