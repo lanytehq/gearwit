@@ -933,7 +933,7 @@ impl Persist for FakePersist {
             || prepared.birth_id != proof.birth_id
             || prepared.thread_ref != proof.thread_ref
             || proof.mutation_epoch.birth_id != proof.birth_id
-            || proof.producer_version != "codex-cli 0.149.1"
+            || proof.producer_version != "codex-cli 0.152.1"
             || proof.producer_dialect != "thread/read-v2"
             || !matches!(
                 self.ownership.get(&proof.birth_id),
@@ -1682,7 +1682,7 @@ mod tests {
             },
             observed_at: OffsetDateTime::UNIX_EPOCH - time::Duration::seconds(1),
             prehash: crate::controller::ActiveObservationPrehash::new(prehash),
-            producer_version: "codex-cli 0.149.1".to_owned(),
+            producer_version: "codex-cli 0.152.1".to_owned(),
             producer_dialect: "thread/read-v2".to_owned(),
         }
     }

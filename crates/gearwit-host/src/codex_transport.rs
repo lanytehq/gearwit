@@ -37,7 +37,7 @@ use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const VERSION: &str = "codex-cli 0.149.1";
+const VERSION: &str = "codex-cli 0.152.1";
 const DIALECT: &str = "thread/read-v2";
 const CLIENT_NAME: &str = "gearwit";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2651,7 +2651,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let exact = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -2696,7 +2696,7 @@ mod tests {
 
         let ambiguous = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -2747,7 +2747,7 @@ mod tests {
 
         let rejected = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -2780,7 +2780,7 @@ mod tests {
 
         let late_rejected = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -2849,7 +2849,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -2949,7 +2949,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -3136,7 +3136,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -3192,7 +3192,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -3283,7 +3283,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -3327,7 +3327,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -3387,7 +3387,7 @@ mod tests {
         let helper = test_executable("#!/bin/sh\nexit 0\n");
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -3746,19 +3746,19 @@ mod tests {
     #[test]
     fn version_must_match_exactly() {
         assert_eq!(
-            parse_version(&mut Cursor::new(b"codex-cli 0.149.1\n")),
+            parse_version(&mut Cursor::new(b"codex-cli 0.152.1\n")),
             Ok(())
         );
         assert_eq!(
-            parse_version(&mut Cursor::new(b"codex-cli 0.149.2\n")),
+            parse_version(&mut Cursor::new(b"codex-cli 0.152.2\n")),
             Err(Error::Version)
         );
         assert_eq!(
-            parse_version(&mut Cursor::new(b"codex-cli 0.149.1")),
+            parse_version(&mut Cursor::new(b"codex-cli 0.152.1")),
             Err(Error::Version)
         );
         assert_eq!(
-            parse_version(&mut Cursor::new(b"codex-cli 0.149.1\nextra\n")),
+            parse_version(&mut Cursor::new(b"codex-cli 0.152.1\nextra\n")),
             Err(Error::Version)
         );
         assert_eq!(
@@ -4256,11 +4256,11 @@ mod tests {
         mkfifo(&ready, Mode::S_IRUSR | Mode::S_IWUSR).expect("ready fifo");
         mkfifo(&proceed, Mode::S_IRUSR | Mode::S_IWUSR).expect("proceed fifo");
         let executable = test_executable(&format!(
-            "#!/bin/sh\nprintf x > '{}'\nIFS= read -r _ < '{}'\nprintf 'codex-cli 0.149.1\\n'\n",
+            "#!/bin/sh\nprintf x > '{}'\nIFS= read -r _ < '{}'\nprintf 'codex-cli 0.152.1\\n'\n",
             ready.display(),
             proceed.display()
         ));
-        let replacement = test_executable("#!/bin/sh\nprintf 'codex-cli 0.149.1\\n'\n");
+        let replacement = test_executable("#!/bin/sh\nprintf 'codex-cli 0.152.1\\n'\n");
         let ready_for_thread = ready.clone();
         let proceed_for_thread = proceed.clone();
         let executable_for_thread = executable.clone();
@@ -4293,7 +4293,7 @@ mod tests {
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
             "if [ \"$1\" = \"--version\" ]; then\n",
-            "  printf 'codex-cli 0.149.1\\n'\n",
+            "  printf 'codex-cli 0.152.1\\n'\n",
             "  printf 'bounded diagnostic\\n' >&2\n",
             "  exit 0\n",
             "fi\n",
@@ -4347,7 +4347,7 @@ mod tests {
     fn composed_transport_qualifies_exact_resume_read_and_reordered_notifications() {
         let executable = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -4412,7 +4412,7 @@ mod tests {
             ),
         ] {
             let executable = test_executable(&format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\nIFS= read -r _\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r _\nIFS= read -r _\nprintf '%s\\n' '{response}'\nwhile IFS= read -r _; do :; done\n"
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\nIFS= read -r _\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r _\nIFS= read -r _\nprintf '%s\\n' '{response}'\nwhile IFS= read -r _; do :; done\n"
             ));
             let mut transport = CodexTransport::start(&executable).expect("transport");
             assert_eq!(transport.receive(), Ok(Received::Initialized));
@@ -4434,7 +4434,7 @@ mod tests {
 
         let native_error = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -4453,7 +4453,7 @@ mod tests {
 
         let timeout = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -4474,7 +4474,7 @@ mod tests {
 
         let process_loss = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
@@ -4497,7 +4497,7 @@ mod tests {
     fn real_transport_child_exit_matrix_is_no_replay() {
         let before_request = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "exit 0\n"
         ));
         let before = CodexTransport::start_with_before_initialize(&before_request, |child| {
@@ -4517,7 +4517,7 @@ mod tests {
 
         let after_write = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "exit 0\n"
         ));
@@ -4528,7 +4528,7 @@ mod tests {
 
         let during_call = test_executable(concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.149.1\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.152.1\\n'; exit 0; fi\n",
             "IFS= read -r _\n",
             "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
             "IFS= read -r _\n",
