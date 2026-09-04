@@ -7,8 +7,14 @@
 
 use std::fmt;
 
+mod attempt;
 mod interrupt;
 
+pub use attempt::{
+    DoorbellAttemptError, DoorbellAttemptObservation, DoorbellAttemptPhase, DoorbellAttemptReceipt,
+    DoorbellAttemptSource, DoorbellAttemptTrace, MANAGED_DOORBELL_PHASES,
+    MANAGED_DOORBELL_PROOF_STEPS,
+};
 pub use interrupt::{
     CoverageEndReason, CoveragePolicy, CoveragePolicyError, DeliveryRoute, InterruptPhase,
     LifecycleFact, LifecycleReceipt, PhaseObservation, ReceiptError, ReceiptLog, ReceiptSource,
