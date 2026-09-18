@@ -2534,8 +2534,14 @@ mod tests {
             store.admit_claim(&dropped, &attachment),
             Err(PersistError::Conflict)
         );
-        // Zero state change: nothing recorded, and the valid admission
-        // still lands as a fresh write.
+        // Zero state change: claims, attachments, payload map, request
+        // index, and attempt sequence are all untouched, and the valid
+        // admission still lands as a fresh write.
+        assert!(store.claims.is_empty());
+        assert!(store.attachments.is_empty());
+        assert!(store.payloads.is_empty());
+        assert!(store.claim_attempts.is_empty());
+        assert_eq!(store.attempt_seq, 0);
         let snapshot = store.recover_authority_state().expect("snapshot");
         assert!(snapshot.claims.is_empty());
         let record = store
