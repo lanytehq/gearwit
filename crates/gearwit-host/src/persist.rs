@@ -513,9 +513,16 @@ pub struct HelperExecutableIdentity {
 /// Durable helper-grant verifier record. Only the keyed verifier digest is
 /// persisted; raw grant material never crosses the port. The verifier
 /// compares in fixed time and is redacted from debug output.
+///
+/// `grant_ref` is the persisted grant-instance identity minted with the
+/// grant: every live binding and revocation scope must present it exactly,
+/// so rotation (new verifier plus new ref) fences stale bindings and
+/// scopes. Connection multiplexing within one grant is face composition;
+/// the store sees one ref per persisted grant.
 #[derive(Clone)]
 pub struct PersistedHelperGrant {
     pub(crate) grant_verifier: [u8; 32],
+    pub(crate) grant_ref: VerifierRef,
     pub(crate) seat_id: SeatId,
     pub(crate) arm_id: ArmId,
     pub(crate) generation: u64,
@@ -534,6 +541,7 @@ impl fmt::Debug for PersistedHelperGrant {
         formatter
             .debug_struct("PersistedHelperGrant")
             .field("grant_verifier", &"[redacted]")
+            .field("grant_ref", &self.grant_ref)
             .field("seat_id", &self.seat_id)
             .field("arm_id", &self.arm_id)
             .field("generation", &self.generation)
@@ -552,6 +560,7 @@ impl fmt::Debug for PersistedHelperGrant {
 impl PartialEq for PersistedHelperGrant {
     fn eq(&self, other: &Self) -> bool {
         bool::from(self.grant_verifier.ct_eq(&other.grant_verifier))
+            && self.grant_ref == other.grant_ref
             && self.seat_id == other.seat_id
             && self.arm_id == other.arm_id
             && self.generation == other.generation
@@ -658,13 +667,27 @@ pub struct PersistedRetrieveReplay {
     pub(crate) result: RecordedRetrieveResult,
 }
 
-/// Content-free persisted acknowledge replay metadata.
+/// Content-free persisted acknowledge replay metadata. The actual request
+/// identity (retrieval plus cursor) is retained alongside the digests so a
+/// reused or forged digest over changed fields cannot replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedAckReplay {
     pub(crate) request_id: RequestNonce,
     pub(crate) binding_digest: [u8; 32],
     pub(crate) canonical_body_digest: CanonicalBodyDigest,
+    pub(crate) retrieval_id: RetrievalId,
+    pub(crate) cursor: EventRef,
     pub(crate) result: AcknowledgeResult,
+}
+
+/// Content-free retrieval index row: which complete binding originated each
+/// recorded retrieval. Materialization and acknowledgment must present the
+/// originating binding identity, not just an equal claim reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedRetrievalRecord {
+    pub(crate) retrieval_id: RetrievalId,
+    pub(crate) binding_digest: [u8; 32],
+    pub(crate) result: RecordedRetrieveResult,
 }
 
 /// Durable handled coverage for one attempt: the furthest contiguously
@@ -733,6 +756,7 @@ pub struct RecoverySnapshot {
     pub active_observations: Vec<PersistedActiveObservationEvidence>,
     pub helper_grants: Vec<PersistedHelperGrant>,
     pub retrieve_replays: Vec<PersistedRetrieveReplay>,
+    pub retrieval_bindings: Vec<PersistedRetrievalRecord>,
     pub ack_replays: Vec<PersistedAckReplay>,
     pub handled_coverage: Vec<PersistedHandledCoverage>,
     pub rearmed_joins: Vec<PersistedRearmJoin>,
@@ -882,7 +906,7 @@ pub struct FakePersist {
     grants: Vec<PersistedHelperGrant>,
     retrieve_replays: BTreeMap<RequestNonce, PersistedRetrieveReplay>,
     ack_replays: BTreeMap<RequestNonce, PersistedAckReplay>,
-    retrievals: BTreeMap<RetrievalId, RecordedRetrieveResult>,
+    retrievals: BTreeMap<RetrievalId, PersistedRetrievalRecord>,
     handled: BTreeMap<AttemptId, PersistedHandledCoverage>,
     rearmed: BTreeSet<(ArmId, u64, AttemptId, SignalId)>,
     now: OffsetDateTime,
@@ -1150,11 +1174,46 @@ fn canonical_binding_digest(binding: &ValidatedHelperBinding) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Canonical retrieve-request body digest over the authenticated binding
+/// identity plus the request nonce. The operation is bound by the domain
+/// tag, so a retrieve digest is never valid as an acknowledge digest. The
+/// claimed-batch face computes the identical encoding; the sealed port
+/// recomputes and compares before replay lookup or mutation.
+pub(crate) fn canonical_retrieve_body_digest(
+    binding_digest: &[u8; 32],
+    request_id: &RequestNonce,
+) -> CanonicalBodyDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gearwit.retrieve-request.v1\0");
+    mac_field(&mut hasher, binding_digest);
+    mac_field(&mut hasher, &request_id.0);
+    CanonicalBodyDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Canonical acknowledge-request body digest over the authenticated binding
+/// identity plus the validated retrieval and cursor. Same domain-separation
+/// and recompute discipline as retrieve.
+pub(crate) fn canonical_ack_body_digest(
+    binding_digest: &[u8; 32],
+    request_id: &RequestNonce,
+    retrieval_id: &RetrievalId,
+    cursor: &EventRef,
+) -> CanonicalBodyDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gearwit.ack-request.v1\0");
+    mac_field(&mut hasher, binding_digest);
+    mac_field(&mut hasher, &request_id.0);
+    mac_field(&mut hasher, &retrieval_id.0);
+    mac_field(&mut hasher, cursor.as_str().as_bytes());
+    CanonicalBodyDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
 /// Content-free helper snapshot sections: verifier records, replay
 /// metadata, handled coverage, and join positions. No bodies included.
 struct HelperSnapshotSections {
     grants: Vec<PersistedHelperGrant>,
     retrieve_replays: Vec<PersistedRetrieveReplay>,
+    retrieval_bindings: Vec<PersistedRetrievalRecord>,
     ack_replays: Vec<PersistedAckReplay>,
     handled_coverage: Vec<PersistedHandledCoverage>,
     rearmed_joins: Vec<PersistedRearmJoin>,
@@ -1173,6 +1232,7 @@ impl FakePersist {
         HelperSnapshotSections {
             grants: self.grants.clone(),
             retrieve_replays: self.retrieve_replays.values().cloned().collect(),
+            retrieval_bindings: self.retrievals.values().cloned().collect(),
             ack_replays: self.ack_replays.values().cloned().collect(),
             handled_coverage: self.handled.values().cloned().collect(),
             rearmed_joins: self
@@ -1216,11 +1276,63 @@ impl FakePersist {
             .find(|claim| claim.attempt_id == *attempt_id)
     }
 
-    /// Revalidate a live helper binding against durable grant and claim
-    /// state: the grant exists and is not revoked, every bound field
-    /// matches, both sides authorize the operation, both leases cover now,
-    /// and the binding digest matches the admitted claim.
-    fn validated_grant_for(
+    /// Validate a grant mint or re-issue against complete current
+    /// authority: the admitted claim tuple, a live matching controller
+    /// attachment and birth, current arm generation, a future lease, no
+    /// controller loss, and an attempt that is not helper-closed. Reads
+    /// live store state only; recovered metadata never mints authority.
+    fn validate_grant_mint(&self, grant: &PersistedHelperGrant) -> Result<(), PersistError> {
+        let claim = self
+            .claim_for_attempt(&grant.attempt_id)
+            .ok_or(PersistError::Conflict)?;
+        if claim.claim_digest != grant.claim_digest
+            || claim.arm_id != grant.arm_id
+            || claim.generation != grant.generation
+            || claim.signal_id != grant.signal_id
+        {
+            return Err(PersistError::Conflict);
+        }
+        let attachment = self
+            .attachments
+            .get(&grant.attempt_id)
+            .ok_or(PersistError::Conflict)?;
+        if attachment.revoked
+            || attachment.birth_id != grant.birth_id
+            || attachment.seat_id != grant.seat_id
+            || attachment.arm_id != grant.arm_id
+        {
+            return Err(PersistError::Conflict);
+        }
+        let birth = self
+            .births
+            .get(&grant.birth_id)
+            .ok_or(PersistError::Conflict)?;
+        if birth.revoked || birth.arm_id != grant.arm_id || birth.seat_id != grant.seat_id {
+            return Err(PersistError::Conflict);
+        }
+        let arm = self.arms.get(&grant.arm_id).ok_or(PersistError::Conflict)?;
+        if arm.generation != grant.generation {
+            return Err(PersistError::Conflict);
+        }
+        if grant.lease_until <= self.now {
+            return Err(PersistError::Conflict);
+        }
+        if self.attempt_lost(&grant.attempt_id) {
+            return Err(PersistError::Conflict);
+        }
+        if self.handled_complete(&grant.attempt_id) && self.attempt_terminal(&grant.attempt_id) {
+            return Err(PersistError::Conflict);
+        }
+        Ok(())
+    }
+
+    /// Authenticate a live helper binding against the persisted grant and
+    /// admitted claim. This runs on every operation including exact replay:
+    /// the grant exists, the presented ref equals the persisted grant ref,
+    /// every bound field matches, both sides authorize the operation, and
+    /// the binding digest matches the admitted claim. No lifecycle, timing,
+    /// or revocation state is consulted here.
+    fn authenticate_binding(
         &self,
         binding: &ValidatedHelperBinding,
         operation: HelperOperation,
@@ -1228,7 +1340,8 @@ impl FakePersist {
         let grant = self
             .helper_grant(&binding.birth_id, &binding.attempt_id)
             .ok_or(PersistError::Unauthorized)?;
-        if grant.revoked {
+        // VerifierRef equality is constant-time by construction.
+        if grant.grant_ref != binding.grant_ref {
             return Err(PersistError::Unauthorized);
         }
         if grant.seat_id != binding.seat_id
@@ -1239,9 +1352,6 @@ impl FakePersist {
             || !grant.operations.allows(operation)
             || !binding.operations.allows(operation)
         {
-            return Err(PersistError::Unauthorized);
-        }
-        if grant.lease_until <= self.now || binding.lease_until <= self.now {
             return Err(PersistError::Unauthorized);
         }
         let claim = self
@@ -1255,6 +1365,120 @@ impl FakePersist {
             return Err(PersistError::Unauthorized);
         }
         Ok(grant)
+    }
+
+    /// Enforce sticky revocation for grant, controller attachment, and
+    /// birth. Mandatory on every path including exact replay and
+    /// re-presentation: revocation is trust, never lifecycle.
+    fn enforce_unrevoked(&self, binding: &ValidatedHelperBinding) -> Result<(), PersistError> {
+        let grant = self
+            .helper_grant(&binding.birth_id, &binding.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if grant.revoked {
+            return Err(PersistError::Unauthorized);
+        }
+        let attachment = self
+            .attachments
+            .get(&binding.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if attachment.revoked {
+            return Err(PersistError::Unauthorized);
+        }
+        let birth = self
+            .births
+            .get(&binding.birth_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if birth.revoked {
+            return Err(PersistError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn attempt_lost(&self, attempt_id: &AttemptId) -> bool {
+        self.turn_facts.get(attempt_id).is_some_and(|facts| {
+            facts
+                .iter()
+                .any(|fact| matches!(fact, NativeTurnFact::ControllerLost))
+        })
+    }
+
+    fn attempt_terminal(&self, attempt_id: &AttemptId) -> bool {
+        self.turn_facts.get(attempt_id).is_some_and(|facts| {
+            facts
+                .iter()
+                .any(|fact| matches!(fact, NativeTurnFact::Terminal { .. }))
+        })
+    }
+
+    fn handled_complete(&self, attempt_id: &AttemptId) -> bool {
+        self.handled
+            .get(attempt_id)
+            .is_some_and(|coverage| coverage.covered_through_newest)
+    }
+
+    /// Authorize an unseen (non-replay) helper request against current
+    /// authority and attempt lifecycle. Exact replay bypasses all of this;
+    /// revocation is enforced separately and is never bypassed.
+    ///
+    /// Credential staleness (leases, generation currency, attachment/birth
+    /// association) fails Unauthorized. Attempt-lifecycle closure (loss,
+    /// handled completion, helper-closed retrieve) fails `InvalidTransition`:
+    /// the request is well authenticated but the attempt no longer accepts
+    /// fresh work of that kind.
+    fn authorize_fresh_use(
+        &self,
+        binding: &ValidatedHelperBinding,
+        operation: HelperOperation,
+    ) -> Result<(), PersistError> {
+        let grant = self
+            .helper_grant(&binding.birth_id, &binding.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if grant.lease_until <= self.now || binding.lease_until <= self.now {
+            return Err(PersistError::Unauthorized);
+        }
+        let arm = self
+            .arms
+            .get(&binding.arm_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if arm.generation != binding.generation {
+            return Err(PersistError::Unauthorized);
+        }
+        let attachment = self
+            .attachments
+            .get(&binding.attempt_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if attachment.birth_id != binding.birth_id
+            || attachment.seat_id != binding.seat_id
+            || attachment.arm_id != binding.arm_id
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        if !self.births.contains_key(&binding.birth_id) {
+            return Err(PersistError::Unauthorized);
+        }
+        if self.attempt_lost(&binding.attempt_id) {
+            return Err(PersistError::InvalidTransition);
+        }
+        match operation {
+            // Fresh retrieval needs an unconsumed, unclosed attempt: fully
+            // handled plus terminal closes it. Either state alone still
+            // permits retrieval so a late helper can complete the join.
+            HelperOperation::Retrieve => {
+                if self.handled_complete(&binding.attempt_id)
+                    && self.attempt_terminal(&binding.attempt_id)
+                {
+                    return Err(PersistError::InvalidTransition);
+                }
+            }
+            // Fresh acknowledgment needs incomplete coverage; terminal alone
+            // still permits the ack that completes the join.
+            HelperOperation::Acknowledge => {
+                if self.handled_complete(&binding.attempt_id) {
+                    return Err(PersistError::InvalidTransition);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1960,16 +2184,7 @@ impl Persist for FakePersist {
     }
 
     fn persist_helper_grant(&mut self, grant: &PersistedHelperGrant) -> Result<(), PersistError> {
-        let claim = self
-            .claim_for_attempt(&grant.attempt_id)
-            .ok_or(PersistError::Conflict)?;
-        if claim.claim_digest != grant.claim_digest
-            || claim.arm_id != grant.arm_id
-            || claim.generation != grant.generation
-            || claim.signal_id != grant.signal_id
-        {
-            return Err(PersistError::Conflict);
-        }
+        self.validate_grant_mint(grant)?;
         if let Some(existing) = self.helper_grant_mut(&grant.birth_id, &grant.attempt_id) {
             if existing == grant {
                 return Ok(());
@@ -1977,8 +2192,21 @@ impl Persist for FakePersist {
             if existing.revoked {
                 return Err(PersistError::Conflict);
             }
-            // Recovery re-issue supersedes a live grant; only revocation is
-            // sticky.
+            // Recovery re-issue replaces the verifier, ref, and lease of a
+            // live grant; the bound identity tuple must be identical or the
+            // reissue is invalid.
+            if existing.seat_id != grant.seat_id
+                || existing.arm_id != grant.arm_id
+                || existing.generation != grant.generation
+                || existing.birth_id != grant.birth_id
+                || existing.attempt_id != grant.attempt_id
+                || existing.signal_id != grant.signal_id
+                || existing.claim_digest != grant.claim_digest
+                || existing.operations != grant.operations
+                || existing.executable_identity != grant.executable_identity
+            {
+                return Err(PersistError::Conflict);
+            }
             *existing = grant.clone();
             return Ok(());
         }
@@ -1990,13 +2218,14 @@ impl Persist for FakePersist {
         &mut self,
         scope: HelperRevocationScope,
     ) -> Result<IdempotentWrite, PersistError> {
-        // The persisted grant record carries no connection ref, so
-        // revocation targets the attempt's current grant; connection-level
-        // ref precision is enforced by the face that constructs this sealed
-        // scope.
+        // Revocation names the exact persisted grant instance: a stale
+        // scope from before rotation cannot affect the replacement grant.
         let grant = self
             .helper_grant_mut(&scope.birth_id, &scope.attempt_id)
             .ok_or(PersistError::Unauthorized)?;
+        if grant.grant_ref != scope.grant_ref {
+            return Err(PersistError::Unauthorized);
+        }
         if grant.revoked {
             return Ok(IdempotentWrite::ExactReplay);
         }
@@ -2008,8 +2237,16 @@ impl Persist for FakePersist {
         &mut self,
         exchange: &RetrieveExchange,
     ) -> Result<IdempotentResult<RecordedRetrieveResult>, PersistError> {
-        self.validated_grant_for(&exchange.binding, HelperOperation::Retrieve)?;
+        // Mandatory on every call including replay: complete binding
+        // authentication plus sticky revocation. Lifecycle/timing below
+        // applies to unseen requests only.
+        self.authenticate_binding(&exchange.binding, HelperOperation::Retrieve)?;
+        self.enforce_unrevoked(&exchange.binding)?;
         let binding_digest = canonical_binding_digest(&exchange.binding);
+        let recomputed = canonical_retrieve_body_digest(&binding_digest, &exchange.request_id);
+        if recomputed != exchange.canonical_body_digest {
+            return Err(PersistError::Conflict);
+        }
         if let Some(stored) = self.retrieve_replays.get(&exchange.request_id) {
             return if stored.binding_digest == binding_digest
                 && stored.canonical_body_digest == exchange.canonical_body_digest
@@ -2019,6 +2256,7 @@ impl Persist for FakePersist {
                 Err(PersistError::Conflict)
             };
         }
+        self.authorize_fresh_use(&exchange.binding, HelperOperation::Retrieve)?;
         let claim = self
             .claim_for_attempt(&exchange.binding.attempt_id)
             .ok_or(PersistError::Unauthorized)?
@@ -2035,8 +2273,14 @@ impl Persist for FakePersist {
             event_count: u8::try_from(refs.len()).map_err(|_| PersistError::InvalidTransition)?,
             retrieved_at: self.now,
         };
-        self.retrievals
-            .insert(result.retrieval_id.clone(), result.clone());
+        self.retrievals.insert(
+            result.retrieval_id.clone(),
+            PersistedRetrievalRecord {
+                retrieval_id: result.retrieval_id.clone(),
+                binding_digest,
+                result: result.clone(),
+            },
+        );
         self.retrieve_replays.insert(
             exchange.request_id.clone(),
             PersistedRetrieveReplay {
@@ -2054,12 +2298,20 @@ impl Persist for FakePersist {
         binding: &ValidatedHelperBinding,
         recorded: &RecordedRetrieveResult,
     ) -> Result<BoundedClaimPayload, PersistError> {
-        self.validated_grant_for(binding, HelperOperation::Retrieve)?;
+        // Exact re-presentation: complete binding authentication plus
+        // sticky revocation, then the originating binding identity. Like
+        // replay, this bypasses lifecycle/timing; unlike fresh work it
+        // creates no authority, so presenting old metadata cannot mint any.
+        self.authenticate_binding(binding, HelperOperation::Retrieve)?;
+        self.enforce_unrevoked(binding)?;
         let stored = self
             .retrievals
             .get(&recorded.retrieval_id)
             .ok_or(PersistError::Unauthorized)?;
-        if stored != recorded {
+        if stored.result != *recorded {
+            return Err(PersistError::Unauthorized);
+        }
+        if stored.binding_digest != canonical_binding_digest(binding) {
             return Err(PersistError::Unauthorized);
         }
         let claim = self
@@ -2079,27 +2331,46 @@ impl Persist for FakePersist {
         binding: &ValidatedHelperBinding,
         request: &AcknowledgeRequest,
     ) -> Result<IdempotentResult<AcknowledgeResult>, PersistError> {
-        self.validated_grant_for(binding, HelperOperation::Acknowledge)?;
+        // Mandatory on every call including replay: complete binding
+        // authentication plus sticky revocation. Lifecycle/timing below
+        // applies to unseen requests only.
+        self.authenticate_binding(binding, HelperOperation::Acknowledge)?;
+        self.enforce_unrevoked(binding)?;
         let binding_digest = canonical_binding_digest(binding);
+        let recomputed = canonical_ack_body_digest(
+            &binding_digest,
+            &request.request_id,
+            &request.retrieval_id,
+            &request.cursor,
+        );
+        if recomputed != request.canonical_body_digest {
+            return Err(PersistError::Conflict);
+        }
         if let Some(stored) = self.ack_replays.get(&request.request_id) {
             return if stored.binding_digest == binding_digest
                 && stored.canonical_body_digest == request.canonical_body_digest
+                && stored.retrieval_id == request.retrieval_id
+                && stored.cursor == request.cursor
             {
                 Ok(IdempotentResult::ExactReplay(stored.result.clone()))
             } else {
                 Err(PersistError::Conflict)
             };
         }
+        self.authorize_fresh_use(binding, HelperOperation::Acknowledge)?;
         let retrieval = self
             .retrievals
             .get(&request.retrieval_id)
             .ok_or(PersistError::Unauthorized)?
             .clone();
+        if retrieval.binding_digest != binding_digest {
+            return Err(PersistError::Unauthorized);
+        }
         let claim = self
             .claim_for_attempt(&binding.attempt_id)
             .ok_or(PersistError::Unauthorized)?
             .clone();
-        if retrieval.claim_payload_ref != claim.payload_ref {
+        if retrieval.result.claim_payload_ref != claim.payload_ref {
             return Err(PersistError::Unauthorized);
         }
         let refs = claim.event_refs.as_slice();
@@ -2147,6 +2418,8 @@ impl Persist for FakePersist {
                 request_id: request.request_id.clone(),
                 binding_digest,
                 canonical_body_digest: request.canonical_body_digest.clone(),
+                retrieval_id: request.retrieval_id.clone(),
+                cursor: request.cursor.clone(),
                 result: result.clone(),
             },
         );
@@ -2279,6 +2552,7 @@ impl Persist for FakePersist {
             active_observations: self.active_observations.values().cloned().collect(),
             helper_grants: helper_sections.grants,
             retrieve_replays: helper_sections.retrieve_replays,
+            retrieval_bindings: helper_sections.retrieval_bindings,
             ack_replays: helper_sections.ack_replays,
             handled_coverage: helper_sections.handled_coverage,
             rearmed_joins: helper_sections.rearmed_joins,
@@ -3121,6 +3395,7 @@ mod tests {
     fn grant_verifier_redacted_and_compared() {
         let grant = PersistedHelperGrant {
             grant_verifier: [0x5a; 32],
+            grant_ref: VerifierRef::fixture(9),
             seat_id: SeatId::new("seat-a").expect("seat"),
             arm_id: ArmId::new("arm-a").expect("arm"),
             generation: 1,
@@ -3145,6 +3420,7 @@ mod tests {
         assert!(!rendered.contains("build-1"), "{rendered}");
         let mut rotated = grant.clone();
         rotated.grant_verifier = [0x5b; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
         assert_ne!(grant, rotated);
     }
 
@@ -3157,23 +3433,37 @@ mod tests {
     }
 
     fn helper_store() -> HelperSetup {
+        helper_store_events(&[("event-a", "test-a"), ("event-b", "test-b")])
+    }
+
+    fn helper_store_events(events: &[(&str, &str)]) -> HelperSetup {
         let mut store = FakePersist::default();
         let (birth, create) = birth();
         store
             .reserve_controller_birth(&birth, &create)
             .expect("reserve");
+        store
+            .persist_arm(&PersistedArm {
+                arm_id: birth.arm_id.clone(),
+                generation: birth.generation,
+                seat_id: birth.seat_id.clone(),
+                capability: birth.capability,
+                coverage_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(600),
+            })
+            .expect("arm");
         let lease_until = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
         let attempt_id = AttemptId::new("attempt-a").expect("attempt");
         let signal_id = SignalId::new("signal-a").expect("signal");
+        let wire: Vec<ProviderEvent> = events
+            .iter()
+            .map(|(event_ref, body)| wire_event(event_ref, body))
+            .collect();
         let admission = claim_admission_fixture(
             "claim-a",
             birth.arm_id.clone(),
             birth.generation,
             signal_id.clone(),
-            &[
-                wire_event("event-a", "test-a"),
-                wire_event("event-b", "test-b"),
-            ],
+            &wire,
             OffsetDateTime::UNIX_EPOCH,
         );
         let attachment = PersistedControllerAttachment {
@@ -3190,6 +3480,7 @@ mod tests {
         store.admit_claim(&admission, &attachment).expect("admit");
         let grant = PersistedHelperGrant {
             grant_verifier: [0x33; 32],
+            grant_ref: VerifierRef::fixture(9),
             seat_id: birth.seat_id.clone(),
             arm_id: birth.arm_id.clone(),
             generation: birth.generation,
@@ -3229,21 +3520,42 @@ mod tests {
     }
 
     fn retrieve_for(binding: &ValidatedHelperBinding, nonce: u8) -> RetrieveExchange {
+        let cloned = ValidatedHelperBinding {
+            grant_ref: binding.grant_ref.clone(),
+            seat_id: binding.seat_id.clone(),
+            arm_id: binding.arm_id.clone(),
+            generation: binding.generation,
+            birth_id: binding.birth_id.clone(),
+            attempt_id: binding.attempt_id.clone(),
+            signal_id: binding.signal_id.clone(),
+            claim_digest: binding.claim_digest.clone(),
+            operations: binding.operations,
+            lease_until: binding.lease_until,
+        };
+        let request_id = RequestNonce::fixture(nonce);
+        let canonical_body_digest =
+            canonical_retrieve_body_digest(&canonical_binding_digest(&cloned), &request_id);
         RetrieveExchange {
-            binding: ValidatedHelperBinding {
-                grant_ref: binding.grant_ref.clone(),
-                seat_id: binding.seat_id.clone(),
-                arm_id: binding.arm_id.clone(),
-                generation: binding.generation,
-                birth_id: binding.birth_id.clone(),
-                attempt_id: binding.attempt_id.clone(),
-                signal_id: binding.signal_id.clone(),
-                claim_digest: binding.claim_digest.clone(),
-                operations: binding.operations,
-                lease_until: binding.lease_until,
-            },
-            request_id: RequestNonce::fixture(nonce),
-            canonical_body_digest: CanonicalBodyDigest::fixture(nonce),
+            binding: cloned,
+            request_id,
+            canonical_body_digest,
+        }
+    }
+
+    /// Field-by-field copy of a sealed binding for negative tests; the
+    /// production type is intentionally non-Clone.
+    fn mutated_binding(base: &ValidatedHelperBinding) -> ValidatedHelperBinding {
+        ValidatedHelperBinding {
+            grant_ref: base.grant_ref.clone(),
+            seat_id: base.seat_id.clone(),
+            arm_id: base.arm_id.clone(),
+            generation: base.generation,
+            birth_id: base.birth_id.clone(),
+            attempt_id: base.attempt_id.clone(),
+            signal_id: base.signal_id.clone(),
+            claim_digest: base.claim_digest.clone(),
+            operations: base.operations,
+            lease_until: base.lease_until,
         }
     }
 
@@ -3306,6 +3618,7 @@ mod tests {
             .expect("stored grant")
             .clone();
         rotated.grant_verifier = [0x34; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
         setup
             .store
             .persist_helper_grant(&rotated)
@@ -3315,6 +3628,7 @@ mod tests {
             .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
             .expect("current grant");
         assert_eq!(current.grant_verifier, [0x34; 32]);
+        assert_eq!(current.grant_ref, VerifierRef::fixture(10));
 
         // Grant for an unknown attempt conflicts.
         let mut orphan = rotated.clone();
@@ -3368,13 +3682,16 @@ mod tests {
             setup.store.record_retrieve_exchange(&conflict),
             Err(PersistError::Conflict)
         );
-        // Same nonce, changed binding conflicts.
+        // Same nonce, changed binding conflicts: the sealed digest no
+        // longer matches the presented fields.
         let mut rebound = retrieve_for(&setup.binding, 21);
-        rebound.binding.grant_ref = VerifierRef::fixture(10);
+        rebound.binding.lease_until += time::Duration::seconds(1);
         assert_eq!(
             setup.store.record_retrieve_exchange(&rebound),
             Err(PersistError::Conflict)
         );
+        // Neither rejection mutated the replay registry.
+        assert_eq!(setup.store.retrieve_replays.len(), 1);
     }
 
     #[test]
@@ -3489,18 +3806,35 @@ mod tests {
         );
     }
 
-    fn ack_for(retrieval_id: &RetrievalId, cursor: &str, nonce: u8) -> AcknowledgeRequest {
+    fn ack_for(
+        binding: &ValidatedHelperBinding,
+        retrieval_id: &RetrievalId,
+        cursor: &str,
+        nonce: u8,
+    ) -> AcknowledgeRequest {
+        let request_id = RequestNonce::fixture(nonce);
+        let cursor = EventRef::new(cursor).expect("cursor");
+        let canonical_body_digest = canonical_ack_body_digest(
+            &canonical_binding_digest(binding),
+            &request_id,
+            retrieval_id,
+            &cursor,
+        );
         AcknowledgeRequest {
-            request_id: RequestNonce::fixture(nonce),
+            request_id,
             retrieval_id: retrieval_id.clone(),
-            cursor: EventRef::new(cursor).expect("cursor"),
-            canonical_body_digest: CanonicalBodyDigest::fixture(nonce),
+            cursor,
+            canonical_body_digest,
         }
     }
 
     #[test]
     fn acknowledge_coverage_replay_and_conflict() {
-        let mut setup = helper_store();
+        let mut setup = helper_store_events(&[
+            ("event-a", "test-a"),
+            ("event-b", "test-b"),
+            ("event-c", "test-c"),
+        ]);
         let at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(9);
         setup.store.set_now(at);
         let exchange = retrieve_for(&setup.binding, 51);
@@ -3513,7 +3847,7 @@ mod tests {
             IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
         };
         // Partial prefix coverage.
-        let first = ack_for(&recorded.retrieval_id, "event-a", 52);
+        let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 52);
         let accepted = match setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &first)
@@ -3536,10 +3870,10 @@ mod tests {
             .store
             .acknowledge_retrieved_batch(&setup.binding, &first)
             .expect("replay");
-        assert_eq!(replay, IdempotentResult::ExactReplay(accepted));
+        assert_eq!(replay, IdempotentResult::ExactReplay(accepted.clone()));
 
         // Same nonce, changed cursor conflicts.
-        let mut conflict = ack_for(&recorded.retrieval_id, "event-b", 52);
+        let mut conflict = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 52);
         conflict.canonical_body_digest = CanonicalBodyDigest::fixture(53);
         assert_eq!(
             setup
@@ -3548,21 +3882,23 @@ mod tests {
             Err(PersistError::Conflict)
         );
 
-        // Full coverage through newest.
-        let full = ack_for(&recorded.retrieval_id, "event-b", 54);
+        // Advance to event-b; coverage is still partial.
+        let second = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 54);
         setup
             .store
-            .acknowledge_retrieved_batch(&setup.binding, &full)
-            .expect("full ack");
+            .acknowledge_retrieved_batch(&setup.binding, &second)
+            .expect("second ack");
         let coverage = setup
             .store
             .handled
             .get(&setup.attempt_id)
             .expect("coverage");
-        assert!(coverage.covered_through_newest);
+        assert_eq!(coverage.cursor.as_str(), "event-b");
+        assert!(!coverage.covered_through_newest);
 
-        // Regression echoes the requested cursor; durable coverage stays max.
-        let regress = ack_for(&recorded.retrieval_id, "event-a", 55);
+        // Regression while partial echoes the requested cursor; durable
+        // coverage stays at its max.
+        let regress = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 55);
         let regressed = match setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &regress)
@@ -3578,7 +3914,70 @@ mod tests {
             .get(&setup.attempt_id)
             .expect("coverage");
         assert_eq!(coverage.cursor.as_str(), "event-b");
+        assert!(!coverage.covered_through_newest);
+    }
+
+    #[test]
+    fn acknowledge_fresh_refused_after_full_closure_replay_survives() {
+        let mut setup = helper_store_events(&[
+            ("event-a", "test-a"),
+            ("event-b", "test-b"),
+            ("event-c", "test-c"),
+        ]);
+        let exchange = retrieve_for(&setup.binding, 58);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 59);
+        let accepted = match setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &first)
+            .expect("ack")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first ack must record"),
+        };
+        // Full coverage through newest.
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-c", 56);
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &full)
+            .expect("full ack");
+        let coverage = setup
+            .store
+            .handled
+            .get(&setup.attempt_id)
+            .expect("coverage");
         assert!(coverage.covered_through_newest);
+
+        // A fresh nonce after full handled closure fails without mutation,
+        // while the exact authenticated prior replay still returns its
+        // recorded result.
+        let replays_before = setup.store.ack_replays.len();
+        let closed = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 57);
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &closed),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(setup.store.ack_replays.len(), replays_before);
+        let coverage = setup
+            .store
+            .handled
+            .get(&setup.attempt_id)
+            .expect("coverage");
+        assert_eq!(coverage.cursor.as_str(), "event-c");
+        let replay_after_close = setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &first)
+            .expect("replay after close");
+        assert_eq!(replay_after_close, IdempotentResult::ExactReplay(accepted));
     }
 
     #[test]
@@ -3594,16 +3993,16 @@ mod tests {
             IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
         };
         // Cursor never delivered.
-        let bad_cursor = ack_for(&recorded.retrieval_id, "event-zzz", 62);
+        let bad_cursor = ack_for(&setup.binding, &recorded.retrieval_id, "event-zzz", 62);
         assert_eq!(
             setup
                 .store
                 .acknowledge_retrieved_batch(&setup.binding, &bad_cursor),
             Err(PersistError::Unauthorized)
         );
-        // Unknown retrieval.
-        let mut bad_retrieval = ack_for(&recorded.retrieval_id, "event-a", 63);
-        bad_retrieval.retrieval_id = RetrievalId::fixture(99);
+        // Unknown retrieval with a correctly derived digest.
+        let unknown_id = RetrievalId::fixture(99);
+        let bad_retrieval = ack_for(&setup.binding, &unknown_id, "event-a", 63);
         assert_eq!(
             setup
                 .store
@@ -3611,7 +4010,7 @@ mod tests {
             Err(PersistError::Unauthorized)
         );
         // Binding without the acknowledge operation.
-        let op = ack_for(&recorded.retrieval_id, "event-a", 64);
+        let op = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 64);
         let narrowed = ValidatedHelperBinding {
             grant_ref: setup.binding.grant_ref.clone(),
             seat_id: setup.binding.seat_id.clone(),
@@ -3659,7 +4058,7 @@ mod tests {
             IdempotentResult::Recorded(result) => result,
             IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
         };
-        let partial = ack_for(&recorded.retrieval_id, "event-a", 72);
+        let partial = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 72);
         setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &partial)
@@ -3674,7 +4073,7 @@ mod tests {
             Ok(RearmJoinResult::WaitingForHandled)
         );
         // Full handled coverage without terminal waits for terminal.
-        let full = ack_for(&recorded.retrieval_id, "event-b", 73);
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 73);
         setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &full)
@@ -3723,7 +4122,7 @@ mod tests {
             IdempotentResult::Recorded(result) => result,
             IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
         };
-        let full = ack_for(&recorded.retrieval_id, "event-b", 82);
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 82);
         setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &full)
@@ -3775,7 +4174,7 @@ mod tests {
             IdempotentResult::Recorded(result) => result,
             IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
         };
-        let full = ack_for(&recorded.retrieval_id, "event-b", 92);
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 92);
         setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &full)
@@ -3783,12 +4182,636 @@ mod tests {
         let snapshot = setup.store.recover_authority_state().expect("snapshot");
         assert_eq!(snapshot.helper_grants.len(), 1);
         assert_eq!(snapshot.retrieve_replays.len(), 1);
+        assert_eq!(snapshot.retrieval_bindings.len(), 1);
+        assert_eq!(
+            snapshot.retrieval_bindings[0].retrieval_id,
+            recorded.retrieval_id
+        );
         assert_eq!(snapshot.ack_replays.len(), 1);
+        assert_eq!(snapshot.ack_replays[0].retrieval_id, recorded.retrieval_id);
         assert_eq!(snapshot.handled_coverage.len(), 1);
         assert!(snapshot.rearmed_joins.is_empty());
         let rendered = format!("{snapshot:?}");
         assert!(!rendered.contains("test-a"), "{rendered}");
         assert!(!rendered.contains("test-b"), "{rendered}");
+    }
+
+    #[test]
+    fn helper_forged_grant_ref_rejected() {
+        let mut setup = helper_store();
+        let mut forged = mutated_binding(&setup.binding);
+        forged.grant_ref = VerifierRef::fixture(10);
+        let exchange = retrieve_for(&forged, 101);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Err(PersistError::Unauthorized)
+        );
+        assert!(setup.store.retrieve_replays.is_empty());
+        assert!(setup.store.retrievals.is_empty());
+        // The forged ref also fails materialize and ack admission.
+        let good = retrieve_for(&setup.binding, 102);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&good)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        assert_eq!(
+            setup.store.materialize_claimed_batch(&forged, &recorded),
+            Err(PersistError::Unauthorized)
+        );
+        let ack = ack_for(&forged, &recorded.retrieval_id, "event-a", 103);
+        assert_eq!(
+            setup.store.acknowledge_retrieved_batch(&forged, &ack),
+            Err(PersistError::Unauthorized)
+        );
+        assert!(setup.store.ack_replays.is_empty());
+    }
+
+    #[test]
+    fn helper_revoke_wrong_ref_rejected() {
+        let mut setup = helper_store();
+        let wrong = HelperRevocationScope {
+            grant_ref: VerifierRef::fixture(10),
+            birth_id: setup.birth.birth_id.clone(),
+            attempt_id: setup.attempt_id.clone(),
+        };
+        assert_eq!(
+            setup.store.revoke_helper_grant(wrong),
+            Err(PersistError::Unauthorized)
+        );
+        // The live grant is unaffected: fresh work still records.
+        let exchange = retrieve_for(&setup.binding, 104);
+        assert!(matches!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Ok(IdempotentResult::Recorded(_))
+        ));
+    }
+
+    #[test]
+    fn helper_rotation_fences_stale_binding_and_scope() {
+        let mut setup = helper_store();
+        let mut rotated = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("stored grant")
+            .clone();
+        rotated.grant_verifier = [0x34; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
+        setup
+            .store
+            .persist_helper_grant(&rotated)
+            .expect("re-issue");
+        // A stale binding presenting the old ref fails on fresh work.
+        let stale = retrieve_for(&setup.binding, 105);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&stale),
+            Err(PersistError::Unauthorized)
+        );
+        // A stale revocation scope cannot affect the replacement grant.
+        let stale_scope = HelperRevocationScope {
+            grant_ref: VerifierRef::fixture(9),
+            birth_id: setup.birth.birth_id.clone(),
+            attempt_id: setup.attempt_id.clone(),
+        };
+        assert_eq!(
+            setup.store.revoke_helper_grant(stale_scope),
+            Err(PersistError::Unauthorized)
+        );
+        // The replacement binding works, and its scope revokes.
+        let mut current = mutated_binding(&setup.binding);
+        current.grant_ref = VerifierRef::fixture(10);
+        let fresh = retrieve_for(&current, 106);
+        assert!(matches!(
+            setup.store.record_retrieve_exchange(&fresh),
+            Ok(IdempotentResult::Recorded(_))
+        ));
+        let current_scope = HelperRevocationScope {
+            grant_ref: VerifierRef::fixture(10),
+            birth_id: setup.birth.birth_id.clone(),
+            attempt_id: setup.attempt_id.clone(),
+        };
+        assert_eq!(
+            setup.store.revoke_helper_grant(current_scope),
+            Ok(IdempotentWrite::Recorded)
+        );
+        // Sticky: the replacement binding now fails too.
+        let after = retrieve_for(&current, 107);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&after),
+            Err(PersistError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn helper_grant_mint_validates_current_authority() {
+        let mut setup = helper_store();
+        let live = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("stored grant")
+            .clone();
+        // Grant for an unknown attempt conflicts.
+        let mut orphan = live.clone();
+        orphan.attempt_id = AttemptId::new("attempt-zzz").expect("attempt");
+        assert_eq!(
+            setup.store.persist_helper_grant(&orphan),
+            Err(PersistError::Conflict)
+        );
+        // Birth not bound to the attempt attachment conflicts.
+        let mut stray = live.clone();
+        stray.birth_id = ControllerBirthId::fixture(77);
+        assert_eq!(
+            setup.store.persist_helper_grant(&stray),
+            Err(PersistError::Conflict)
+        );
+        // Expired lease conflicts.
+        let mut expired = live.clone();
+        expired.lease_until = OffsetDateTime::UNIX_EPOCH - time::Duration::seconds(1);
+        assert_eq!(
+            setup.store.persist_helper_grant(&expired),
+            Err(PersistError::Conflict)
+        );
+        // Controller loss conflicts.
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::ControllerLost],
+        );
+        assert_eq!(
+            setup.store.persist_helper_grant(&live),
+            Err(PersistError::Conflict)
+        );
+        setup.store.turn_facts.remove(&setup.attempt_id);
+        // A recognized terminal alone still permits mint.
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(7),
+                class: crate::controller::TerminalClass::Succeeded,
+            }],
+        );
+        setup
+            .store
+            .persist_helper_grant(&live)
+            .expect("mint under terminal alone");
+        // Full handled coverage plus terminal closes mint.
+        let exchange = retrieve_for(&setup.binding, 108);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 109);
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &full)
+            .expect("full ack");
+        assert_eq!(
+            setup.store.persist_helper_grant(&live),
+            Err(PersistError::Conflict)
+        );
+        // Stale generation after arm advance conflicts.
+        let advanced = PersistedArm {
+            arm_id: setup.birth.arm_id.clone(),
+            generation: setup.birth.generation + 1,
+            seat_id: setup.birth.seat_id.clone(),
+            capability: setup.birth.capability,
+            coverage_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(600),
+        };
+        setup.store.persist_arm(&advanced).expect("advance");
+        assert_eq!(
+            setup.store.persist_helper_grant(&live),
+            Err(PersistError::Conflict)
+        );
+        // A reissue that narrows the operation set is not a valid
+        // replacement even where mint validation passes.
+        setup
+            .store
+            .persist_arm(&PersistedArm {
+                arm_id: setup.birth.arm_id.clone(),
+                generation: setup.birth.generation,
+                seat_id: setup.birth.seat_id.clone(),
+                capability: setup.birth.capability,
+                coverage_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(600),
+            })
+            .expect("restore arm");
+        setup.store.turn_facts.remove(&setup.attempt_id);
+        let mut narrowed = live.clone();
+        narrowed.operations = HelperOperations::retrieve_only();
+        assert_eq!(
+            setup.store.persist_helper_grant(&narrowed),
+            Err(PersistError::Conflict)
+        );
+    }
+
+    #[test]
+    fn controller_detach_expires_grant_without_replay_exception() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 111);
+        match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(_) => {}
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        }
+        setup
+            .store
+            .revoke_controller_attachment(ValidatedAttachmentScope {
+                attempt_id: setup.attempt_id.clone(),
+                birth_id: setup.birth.birth_id.clone(),
+                arm_id: setup.birth.arm_id.clone(),
+                generation: setup.birth.generation,
+                verifier_ref: VerifierRef::fixture(8),
+            })
+            .expect("detach");
+        // Exact replay is still refused: revocation is never bypassed.
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Err(PersistError::Unauthorized)
+        );
+        // Fresh work fails, and reissue is no longer eligible.
+        let fresh = retrieve_for(&setup.binding, 112);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&fresh),
+            Err(PersistError::Unauthorized)
+        );
+        let live = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("stored grant")
+            .clone();
+        assert_eq!(
+            setup.store.persist_helper_grant(&live),
+            Err(PersistError::Conflict)
+        );
+    }
+
+    #[test]
+    fn exact_replay_bypasses_lifecycle_fresh_does_not() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 121);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        // Expiry: fresh fails, exact replay returns the recorded result.
+        setup
+            .store
+            .set_now(setup.lease_until + time::Duration::seconds(1));
+        let expired = retrieve_for(&setup.binding, 122);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&expired),
+            Err(PersistError::Unauthorized)
+        );
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Ok(IdempotentResult::ExactReplay(recorded.clone()))
+        );
+        // Controller loss: fresh refused, replay survives.
+        setup.store.set_now(OffsetDateTime::UNIX_EPOCH);
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::ControllerLost],
+        );
+        let lost = retrieve_for(&setup.binding, 123);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&lost),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Ok(IdempotentResult::ExactReplay(recorded.clone()))
+        );
+        // Generation advance: fresh unauthorized, replay survives.
+        setup.store.turn_facts.remove(&setup.attempt_id);
+        setup
+            .store
+            .persist_arm(&PersistedArm {
+                arm_id: setup.birth.arm_id.clone(),
+                generation: setup.birth.generation + 1,
+                seat_id: setup.birth.seat_id.clone(),
+                capability: setup.birth.capability,
+                coverage_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(600),
+            })
+            .expect("advance");
+        let advanced = retrieve_for(&setup.binding, 124);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&advanced),
+            Err(PersistError::Unauthorized)
+        );
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Ok(IdempotentResult::ExactReplay(recorded.clone()))
+        );
+        assert_eq!(setup.store.retrieve_replays.len(), 1);
+        // Revocation ends even replay.
+        setup
+            .store
+            .persist_arm(&PersistedArm {
+                arm_id: setup.birth.arm_id.clone(),
+                generation: setup.birth.generation,
+                seat_id: setup.birth.seat_id.clone(),
+                capability: setup.birth.capability,
+                coverage_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(600),
+            })
+            .expect("restore arm");
+        setup
+            .store
+            .revoke_helper_grant(HelperRevocationScope {
+                grant_ref: VerifierRef::fixture(9),
+                birth_id: setup.birth.birth_id.clone(),
+                attempt_id: setup.attempt_id.clone(),
+            })
+            .expect("revoke");
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Err(PersistError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn retrieve_fresh_refused_after_handled_and_terminal() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 131);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 132);
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &full)
+            .expect("full ack");
+        // Full handling alone still permits a late retrieve.
+        let late = retrieve_for(&setup.binding, 133);
+        assert!(matches!(
+            setup.store.record_retrieve_exchange(&late),
+            Ok(IdempotentResult::Recorded(_))
+        ));
+        // Full handling plus recognized terminal closes fresh retrieval.
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(7),
+                class: crate::controller::TerminalClass::Succeeded,
+            }],
+        );
+        let closed = retrieve_for(&setup.binding, 134);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&closed),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(setup.store.retrieve_replays.len(), 2);
+        // Exact prior replay still returns its recorded result.
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&exchange),
+            Ok(IdempotentResult::ExactReplay(recorded))
+        );
+    }
+
+    #[test]
+    fn materialize_representation_cannot_mint_authority() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 141);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        // Re-presentation after expiry still serves the recorded batch,
+        // but no fresh authority can be created from old metadata.
+        setup
+            .store
+            .set_now(setup.lease_until + time::Duration::seconds(1));
+        setup
+            .store
+            .materialize_claimed_batch(&setup.binding, &recorded)
+            .expect("materialize after expiry");
+        let fresh = retrieve_for(&setup.binding, 142);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&fresh),
+            Err(PersistError::Unauthorized)
+        );
+        // Revocation ends re-presentation too.
+        setup.store.set_now(OffsetDateTime::UNIX_EPOCH);
+        setup
+            .store
+            .revoke_helper_grant(HelperRevocationScope {
+                grant_ref: VerifierRef::fixture(9),
+                birth_id: setup.birth.birth_id.clone(),
+                attempt_id: setup.attempt_id.clone(),
+            })
+            .expect("revoke");
+        assert_eq!(
+            setup
+                .store
+                .materialize_claimed_batch(&setup.binding, &recorded),
+            Err(PersistError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn ack_fresh_refused_after_loss_replay_survives() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 151);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 152);
+        let accepted = match setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &first)
+            .expect("ack")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first ack must record"),
+        };
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::ControllerLost],
+        );
+        let lost = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 153);
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &lost),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(setup.store.ack_replays.len(), 1);
+        let coverage = setup
+            .store
+            .handled
+            .get(&setup.attempt_id)
+            .expect("coverage");
+        assert_eq!(coverage.cursor.as_str(), "event-a");
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &first),
+            Ok(IdempotentResult::ExactReplay(accepted))
+        );
+    }
+
+    #[test]
+    fn second_binding_cannot_reuse_retrieval() {
+        let mut setup = helper_store();
+        let mut second = mutated_binding(&setup.binding);
+        second.lease_until += time::Duration::seconds(30);
+        let first = retrieve_for(&setup.binding, 161);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&first)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        // The second binding is independently valid: its own retrieve
+        // records.
+        let own = retrieve_for(&second, 162);
+        assert!(matches!(
+            setup.store.record_retrieve_exchange(&own),
+            Ok(IdempotentResult::Recorded(_))
+        ));
+        // But it cannot materialize or acknowledge the first binding's
+        // retrieval.
+        assert_eq!(
+            setup.store.materialize_claimed_batch(&second, &recorded),
+            Err(PersistError::Unauthorized)
+        );
+        let cross = ack_for(&second, &recorded.retrieval_id, "event-a", 163);
+        assert_eq!(
+            setup.store.acknowledge_retrieved_batch(&second, &cross),
+            Err(PersistError::Unauthorized)
+        );
+        // Origin binding replay and materialize are intact.
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&first),
+            Ok(IdempotentResult::ExactReplay(recorded.clone()))
+        );
+        setup
+            .store
+            .materialize_claimed_batch(&setup.binding, &recorded)
+            .expect("origin materialize");
+    }
+
+    #[test]
+    fn ack_changed_fields_with_reused_digest_conflict() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 171);
+        let recorded = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 172);
+        let accepted = match setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &first)
+            .expect("ack")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("first ack must record"),
+        };
+        // The recorded digest reused over a changed cursor conflicts.
+        let mut reused = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 172);
+        reused.canonical_body_digest = first.canonical_body_digest.clone();
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &reused),
+            Err(PersistError::Conflict)
+        );
+        // A correctly recomputed digest over changed fields still
+        // conflicts on the retained request identity.
+        let rebound = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 172);
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &rebound),
+            Err(PersistError::Conflict)
+        );
+        // A changed retrieval likewise conflicts.
+        let other = retrieve_for(&setup.binding, 173);
+        let recorded_other = match setup
+            .store
+            .record_retrieve_exchange(&other)
+            .expect("second retrieve")
+        {
+            IdempotentResult::Recorded(result) => result,
+            IdempotentResult::ExactReplay(_) => panic!("new retrieve must record"),
+        };
+        let swapped = ack_for(&setup.binding, &recorded_other.retrieval_id, "event-a", 172);
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &swapped),
+            Err(PersistError::Conflict)
+        );
+        // No mutation: one replay, coverage still at the first cursor.
+        assert_eq!(setup.store.ack_replays.len(), 1);
+        let coverage = setup
+            .store
+            .handled
+            .get(&setup.attempt_id)
+            .expect("coverage");
+        assert_eq!(coverage.cursor.as_str(), "event-a");
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &first),
+            Ok(IdempotentResult::ExactReplay(accepted))
+        );
+    }
+
+    #[test]
+    fn retrieve_reused_nonce_over_changed_binding_conflicts() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 181);
+        match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("retrieve")
+        {
+            IdempotentResult::Recorded(_) => {}
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        }
+        // Same nonce with a correctly derived digest for a changed
+        // binding still conflicts on the recorded identity.
+        let mut second = mutated_binding(&setup.binding);
+        second.lease_until += time::Duration::seconds(30);
+        let rebound = retrieve_for(&second, 181);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&rebound),
+            Err(PersistError::Conflict)
+        );
+        assert_eq!(setup.store.retrieve_replays.len(), 1);
     }
 
     #[test]
