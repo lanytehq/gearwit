@@ -63,6 +63,138 @@ private_id!(PrivateNativeRef);
 private_id!(RequestNonce);
 private_id!(ActiveObservationFingerprint);
 private_id!(ActiveObservationEvidenceRef);
+private_id!(ClaimPayloadRef);
+private_id!(RetrievalId);
+private_id!(ClaimDigest);
+private_id!(CanonicalBodyDigest);
+
+/// Length- and charset-bounded semantic token.
+///
+/// Validation: 1..=MAX bytes; every byte is ASCII graphic or space
+/// (`0x20..=0x7E`). Control characters, DEL, and non-ASCII bytes are
+/// rejected. The class deliberately admits spaces so provider and producer
+/// labels (for example the fixed `codex-cli` producer constant) validate;
+/// family discipline comes from the distinct Rust newtype per use, not from
+/// the shared class. Bounds differ per family (ids and refs 256, provider
+/// and producer labels 64).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BoundedToken<const MAX: usize>(String);
+
+impl<const MAX: usize> BoundedToken<MAX> {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX
+            || !value.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+        {
+            return Err("invalid bounded token");
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Length-bounded untrusted body text. Empty is allowed; only the byte cap
+/// is enforced. Bodies are data, never authority. Content is redacted from
+/// debug output; only the length is shown.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BoundedBody<const MAX: usize>(String);
+
+impl<const MAX: usize> fmt::Debug for BoundedBody<MAX> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundedBody")
+            .field("len", &self.0.len())
+            .field("body", &"[redacted]")
+            .finish()
+    }
+}
+
+impl<const MAX: usize> BoundedBody<MAX> {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        if value.len() > MAX {
+            return Err("body exceeds bound");
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Length-bounded vector. Bounds are element counts, enforced at
+/// construction; the inner vector is never directly mutable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedVec<T, const MIN: usize, const MAX: usize>(Vec<T>);
+
+impl<T, const MIN: usize, const MAX: usize> BoundedVec<T, MIN, MAX> {
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T, const MIN: usize, const MAX: usize> TryFrom<Vec<T>> for BoundedVec<T, MIN, MAX> {
+    type Error = &'static str;
+
+    fn try_from(values: Vec<T>) -> Result<Self, Self::Error> {
+        if values.len() < MIN || values.len() > MAX {
+            return Err("vector length outside bounds");
+        }
+        Ok(Self(values))
+    }
+}
+
+/// Range-bounded counter for aggregates and counts.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BoundedUsize<const MIN: usize, const MAX: usize>(usize);
+
+impl<const MIN: usize, const MAX: usize> TryFrom<usize> for BoundedUsize<MIN, MAX> {
+    type Error = &'static str;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        if value < MIN || value > MAX {
+            return Err("value outside bounds");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<const MIN: usize, const MAX: usize> BoundedUsize<MIN, MAX> {
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+macro_rules! bounded_token_newtype {
+    ($name:ident, $max:expr) => {
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(BoundedToken<$max>);
+
+        impl $name {
+            pub(crate) fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+                Ok(Self(BoundedToken::new(value)?))
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+        }
+    };
+}
+
+bounded_token_newtype!(EventRef, 256);
+bounded_token_newtype!(ProviderName, 64);
+bounded_token_newtype!(ActorName, 256);
 
 /// Closed authority scope for private native coordinates.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +322,34 @@ impl ControllerBirthId {
     }
 }
 
+impl ClaimPayloadRef {
+    pub(crate) fn random() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+}
+
+impl RetrievalId {
+    pub(crate) fn random() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+}
+
+impl ClaimDigest {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl CanonicalBodyDigest {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// The only managed native capability.
 ///
 /// ```compile_fail
@@ -302,7 +462,7 @@ pub struct ObservationScope {
 #[derive(Debug)]
 pub struct ReconciliationScope {
     pub(crate) correlation: PersistedTurnCorrelation,
-    pub(crate) evidence_ref: VerifierRef,
+    pub(crate) native_write_evidence_ref: VerifierRef,
 }
 
 /// Controller-local single-flight lane retained from probe through write.
@@ -875,7 +1035,7 @@ impl Controller for FakeController {
         if self.reject_reconciliation_binding {
             return Err(ControllerReconcileError::BindingRejected);
         }
-        let _ = (&scope.correlation, &scope.evidence_ref);
+        let _ = (&scope.correlation, &scope.native_write_evidence_ref);
         Ok(self.reconciliation.clone())
     }
 }
@@ -1007,5 +1167,78 @@ mod tests {
             &PrivateNativeRef::fixture(2),
             OffsetDateTime::UNIX_EPOCH,
         ));
+    }
+
+    #[test]
+    fn bounded_token_accepts_valid_rejects_malformed() {
+        assert_eq!(
+            BoundedToken::<8>::new("event-a").expect("valid").as_str(),
+            "event-a"
+        );
+        // Fixed producer labels contain spaces and must validate.
+        BoundedToken::<64>::new("codex-cli 0.152.1").expect("producer version");
+        BoundedToken::<64>::new("thread/read-v2").expect("producer dialect");
+        assert!(BoundedToken::<8>::new("").is_err());
+        assert!(BoundedToken::<8>::new("123456789").is_err());
+        assert!(BoundedToken::<8>::new("has\nnewline").is_err());
+        assert!(BoundedToken::<8>::new("has\ttab").is_err());
+        assert!(BoundedToken::<8>::new("non-ascii-é").is_err());
+        assert!(BoundedToken::<8>::new("has\x7fdel").is_err());
+    }
+
+    #[test]
+    fn bounded_body_enforces_cap_only() {
+        assert!(BoundedBody::<4>::new("").is_ok());
+        assert!(BoundedBody::<4>::new("test").is_ok());
+        assert!(BoundedBody::<4>::new("toolong").is_err());
+    }
+
+    #[test]
+    fn bounded_body_redacts_content() {
+        let rendered = format!("{:?}", BoundedBody::<64>::new("secret-body").expect("body"));
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(!rendered.contains("secret-body"), "{rendered}");
+    }
+
+    #[test]
+    fn bounded_vec_enforces_count() {
+        assert!(BoundedVec::<u8, 1, 2>::try_from(vec![]).is_err());
+        assert!(BoundedVec::<u8, 1, 2>::try_from(vec![1]).is_ok());
+        assert!(BoundedVec::<u8, 1, 2>::try_from(vec![1, 2]).is_ok());
+        assert!(BoundedVec::<u8, 1, 2>::try_from(vec![1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn bounded_usize_enforces_range() {
+        assert!(BoundedUsize::<1, 3>::try_from(0).is_err());
+        assert_eq!(
+            BoundedUsize::<1, 3>::try_from(2).expect("in range").get(),
+            2
+        );
+        assert!(BoundedUsize::<1, 3>::try_from(4).is_err());
+    }
+
+    #[test]
+    fn token_newtypes_carry_family_bounds() {
+        assert!(EventRef::new("event-a").is_ok());
+        assert!(EventRef::new("x".repeat(256)).is_ok());
+        assert!(EventRef::new("x".repeat(257)).is_err());
+        assert!(ProviderName::new("test").is_ok());
+        assert!(ProviderName::new("x".repeat(64)).is_ok());
+        assert!(ProviderName::new("x".repeat(65)).is_err());
+        assert!(ActorName::new("actor-a").is_ok());
+        assert!(ActorName::new("").is_err());
+    }
+
+    #[test]
+    fn claim_byte_identities_redact_debug() {
+        for rendered in [
+            format!("{:?}", ClaimPayloadRef::fixture(1)),
+            format!("{:?}", RetrievalId::fixture(2)),
+            format!("{:?}", ClaimDigest::fixture(3)),
+            format!("{:?}", CanonicalBodyDigest::fixture(4)),
+        ] {
+            assert!(rendered.contains("[redacted]"), "{rendered}");
+        }
     }
 }

@@ -1,17 +1,19 @@
 //! Sealed semantic persistence port for native-controller authority.
 
 use crate::controller::{
-    ActiveObservationEvidenceRef, ActiveObservationFingerprint, ActiveObservationProof, ArmId,
-    AttemptId, ClaimRequestId, ControllerBirthId, ManagedCapability, NativeCoordinateKind,
-    NativeCoordinateScope, NativeMutationEpoch, NativeTurnFact, NativeWriteReservation,
-    OpenedNativeCoordinate, PersistedTurnCorrelation, PrivateNativeRef, ReconciliationDisposition,
-    ReconciliationScope, RequestNonce, SeatId, SecretNativeCoordinate, SignalId,
-    ValidatedIdlePermit, VerifierRef,
+    ActiveObservationEvidenceRef, ActiveObservationFingerprint, ActiveObservationProof, ActorName,
+    ArmId, AttemptId, BoundedBody, BoundedToken, BoundedUsize, BoundedVec, CanonicalBodyDigest,
+    ClaimDigest, ClaimPayloadRef, ClaimRequestId, ControllerBirthId, EventRef, ManagedCapability,
+    NativeCoordinateKind, NativeCoordinateScope, NativeMutationEpoch, NativeTurnFact,
+    NativeWriteReservation, OpenedNativeCoordinate, PersistedTurnCorrelation, PrivateNativeRef,
+    ProviderName, ReconciliationDisposition, ReconciliationScope, RequestNonce, RetrievalId,
+    SeatId, SecretNativeCoordinate, SignalId, ValidatedIdlePermit, VerifierRef,
 };
 use gearwit_protocol::ProviderEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
@@ -25,7 +27,10 @@ pub struct PersistedArm {
     pub coverage_until: OffsetDateTime,
 }
 
-/// Metadata-only claim record used by general recovery.
+/// Metadata-only claim record used by general recovery. Content identity is
+/// the immutable [`ClaimPayloadRef`]; the digest binds the canonical claim
+/// encoding. `attempt_id` is a retained shipped extension (recovery keys
+/// claims by attempt) beyond the frozen field set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedClaimRecord {
     pub attempt_id: AttemptId,
@@ -33,16 +38,181 @@ pub struct PersistedClaimRecord {
     pub arm_id: ArmId,
     pub generation: u64,
     pub signal_id: SignalId,
-    pub event_refs: Vec<String>,
+    pub event_refs: BoundedVec<EventRef, 1, 64>,
+    pub claim_digest: ClaimDigest,
+    pub payload_ref: ClaimPayloadRef,
     pub claimed_at: OffsetDateTime,
 }
 
-/// Admission input. Event content is stored in the fake's isolated payload map
-/// and never appears in [`RecoverySnapshot`].
+/// One validated provider event inside a claimed batch. This is the bounded
+/// host-side form of the wire [`ProviderEvent`]; conversion validates every
+/// bound at the admission boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderEventRecord {
+    pub(crate) event_ref: EventRef,
+    pub(crate) provider: ProviderName,
+    pub(crate) actor: Option<ActorName>,
+    pub(crate) observed_at: OffsetDateTime,
+    pub(crate) body: BoundedBody<4096>,
+}
+
+impl TryFrom<&ProviderEvent> for ProviderEventRecord {
+    type Error = &'static str;
+
+    fn try_from(event: &ProviderEvent) -> Result<Self, Self::Error> {
+        if event.observed_at.len() > 64 {
+            return Err("timestamp exceeds bound");
+        }
+        let observed_at = OffsetDateTime::parse(
+            &event.observed_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| "timestamp is not RFC 3339")?;
+        Ok(Self {
+            event_ref: EventRef::new(event.event_ref.clone())?,
+            provider: ProviderName::new(event.provider.clone())?,
+            actor: event
+                .actor
+                .as_ref()
+                .map(|actor| ActorName::new(actor.clone()))
+                .transpose()?,
+            observed_at,
+            body: BoundedBody::new(event.body.clone())?,
+        })
+    }
+}
+
+/// Immutable bounded private claim payload: 1–64 validated events with at
+/// most 131,072 aggregate body bytes. Stored once under its
+/// [`ClaimPayloadRef`]; replay and retrieve resolve through the ref, never a
+/// second body copy. Debug shows counts only; bodies stay redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BoundedClaimPayload {
+    pub(crate) events: BoundedVec<ProviderEventRecord, 1, 64>,
+    pub(crate) aggregate_body_bytes: BoundedUsize<0, 131_072>,
+}
+
+impl TryFrom<Vec<ProviderEventRecord>> for BoundedClaimPayload {
+    type Error = &'static str;
+
+    fn try_from(events: Vec<ProviderEventRecord>) -> Result<Self, Self::Error> {
+        let aggregate: usize = events.iter().map(|event| event.body.as_str().len()).sum();
+        Ok(Self {
+            events: BoundedVec::try_from(events)?,
+            aggregate_body_bytes: BoundedUsize::try_from(aggregate)?,
+        })
+    }
+}
+
+impl fmt::Debug for BoundedClaimPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundedClaimPayload")
+            .field("event_count", &self.events.as_slice().len())
+            .field("aggregate_body_bytes", &self.aggregate_body_bytes.get())
+            .finish()
+    }
+}
+
+/// Admission input. Event content travels as one validated
+/// [`BoundedClaimPayload`] and is stored under its [`ClaimPayloadRef`]; it
+/// never appears in [`RecoverySnapshot`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimAdmission {
-    pub(crate) record: PersistedClaimRecord,
-    pub(crate) events: Vec<ProviderEvent>,
+    pub(crate) request_id: ClaimRequestId,
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) signal_id: SignalId,
+    pub(crate) event_refs: BoundedVec<EventRef, 1, 64>,
+    pub(crate) claim_digest: ClaimDigest,
+    pub(crate) payload: BoundedClaimPayload,
+    pub(crate) claimed_at: OffsetDateTime,
+}
+
+/// Canonical claim digest over the validated admission fields in fixed order.
+/// The encoding is length-prefixed and unambiguous: domain tag, request id,
+/// arm id, generation, signal id, ordered event refs, then the ordered event
+/// records (ref, provider, actor presence + value, RFC 3339 time, body).
+/// Any validated-field change yields a different digest; transport framing
+/// never enters it.
+pub(crate) fn canonical_claim_digest(
+    request_id: &ClaimRequestId,
+    arm_id: &ArmId,
+    generation: u64,
+    signal_id: &SignalId,
+    event_refs: &BoundedVec<EventRef, 1, 64>,
+    payload: &BoundedClaimPayload,
+) -> ClaimDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gearwit.claim-digest.v1\0");
+    mac_field(&mut hasher, request_id.as_str().as_bytes());
+    mac_field(&mut hasher, arm_id.as_str().as_bytes());
+    mac_field(&mut hasher, &generation.to_le_bytes());
+    mac_field(&mut hasher, signal_id.as_str().as_bytes());
+    for event_ref in event_refs.as_slice() {
+        mac_field(&mut hasher, event_ref.as_str().as_bytes());
+    }
+    for event in payload.events.as_slice() {
+        mac_field(&mut hasher, event.event_ref.as_str().as_bytes());
+        mac_field(&mut hasher, event.provider.as_str().as_bytes());
+        match &event.actor {
+            Some(actor) => {
+                mac_field(&mut hasher, b"\x01");
+                mac_field(&mut hasher, actor.as_str().as_bytes());
+            }
+            None => mac_field(&mut hasher, b"\x00"),
+        }
+        mac_field(
+            &mut hasher,
+            &event.observed_at.unix_timestamp_nanos().to_le_bytes(),
+        );
+        mac_field(&mut hasher, event.body.as_str().as_bytes());
+    }
+    ClaimDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Test-only admission constructor over validated wire events. Panics on
+/// invalid fixture input; production admissions validate through authority.
+#[cfg(test)]
+pub(crate) fn claim_admission_fixture(
+    request_id: &str,
+    arm_id: ArmId,
+    generation: u64,
+    signal_id: SignalId,
+    events: &[ProviderEvent],
+    claimed_at: OffsetDateTime,
+) -> ClaimAdmission {
+    let records: Vec<ProviderEventRecord> = events
+        .iter()
+        .map(|event| ProviderEventRecord::try_from(event).expect("fixture event"))
+        .collect();
+    let event_refs = BoundedVec::try_from(
+        records
+            .iter()
+            .map(|record| record.event_ref.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("fixture refs");
+    let payload = BoundedClaimPayload::try_from(records).expect("fixture payload");
+    let request_id = ClaimRequestId::new(request_id).expect("fixture request id");
+    let claim_digest = canonical_claim_digest(
+        &request_id,
+        &arm_id,
+        generation,
+        &signal_id,
+        &event_refs,
+        &payload,
+    );
+    ClaimAdmission {
+        request_id,
+        arm_id,
+        generation,
+        signal_id,
+        event_refs,
+        claim_digest,
+        payload,
+        claimed_at,
+    }
 }
 
 /// Durable attachment bound to one controller birth.
@@ -145,8 +315,8 @@ pub struct PersistedActiveObservationEvidence {
     pub mutation_epoch: NativeMutationEpoch,
     pub observed_at: OffsetDateTime,
     pub fingerprint: ActiveObservationFingerprint,
-    pub producer_version: String,
-    pub producer_dialect: String,
+    pub producer_version: BoundedToken<64>,
+    pub producer_dialect: BoundedToken<64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +343,14 @@ pub enum IdempotentWrite {
     ExactReplay,
 }
 
+/// Idempotent operation result carrying the recorded value. Exact replays
+/// return the stored value, never a recomputed one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdempotentResult<T> {
+    Recorded(T),
+    ExactReplay(T),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReserveBirthOutcome {
     Reserved,
@@ -181,16 +359,17 @@ pub enum ReserveBirthOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClaimOutcome {
+pub enum AdmissionOutcome {
     Admitted,
     ExactReplay,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionRecord {
-    pub outcome: ClaimOutcome,
+    pub outcome: AdmissionOutcome,
     pub attempt_id: AttemptId,
     pub verifier_ref: VerifierRef,
+    pub payload_ref: ClaimPayloadRef,
 }
 
 /// Sealed semantic commits. Callers cannot provide raw ids to mutate state.
@@ -207,11 +386,43 @@ pub struct PreparedDispatchCommit {
     pub(crate) correlation: PersistedTurnCorrelation,
 }
 
+/// Pre-write conclusions expressible without an active observation. Held is
+/// deliberately unconstructible here: it is recorded only through
+/// [`Persist::record_active_hold`] with its atomic evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NonActivePreWriteConclusion {
+    IdleStateUnproven,
+    IdleEpochInvalidated {
+        probe_id: RequestNonce,
+        expected_epoch: NativeMutationEpoch,
+        observed_epoch: NativeMutationEpoch,
+    },
+}
+
+impl From<NonActivePreWriteConclusion> for PreWriteConclusion {
+    fn from(conclusion: NonActivePreWriteConclusion) -> Self {
+        match conclusion {
+            NonActivePreWriteConclusion::IdleStateUnproven => Self::IdleStateUnproven,
+            NonActivePreWriteConclusion::IdleEpochInvalidated {
+                probe_id,
+                expected_epoch,
+                observed_epoch,
+            } => Self::IdleEpochInvalidated {
+                probe_id,
+                expected_epoch,
+                observed_epoch,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreWriteConclusionCommit {
     pub(crate) attempt_id: AttemptId,
     pub(crate) signal_id: SignalId,
-    pub(crate) conclusion: PreWriteConclusion,
+    pub(crate) conclusion: NonActivePreWriteConclusion,
+    /// Authority-stamped record time. The store has no clock; the stamp is
+    /// carried on the commit as a retained shipped extension.
     pub(crate) recorded_at: OffsetDateTime,
 }
 
@@ -240,6 +451,193 @@ pub struct ValidatedAttachmentScope {
     pub(crate) arm_id: ArmId,
     pub(crate) generation: u64,
     pub(crate) verifier_ref: VerifierRef,
+}
+
+/// Closed Gate-1 helper operation set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperOperation {
+    Retrieve,
+    Acknowledge,
+}
+
+/// Operations granted to one helper binding. Closed to retrieve plus
+/// acknowledge; no other operation is expressible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HelperOperations {
+    retrieve: bool,
+    acknowledge: bool,
+}
+
+impl HelperOperations {
+    #[must_use]
+    pub(crate) const fn all() -> Self {
+        Self {
+            retrieve: true,
+            acknowledge: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn retrieve_only() -> Self {
+        Self {
+            retrieve: true,
+            acknowledge: false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn allows(self, operation: HelperOperation) -> bool {
+        match operation {
+            HelperOperation::Retrieve => self.retrieve,
+            HelperOperation::Acknowledge => self.acknowledge,
+        }
+    }
+}
+
+/// Reviewed helper executable identity bound at grant mint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelperExecutableIdentity {
+    pub(crate) image_digest: [u8; 32],
+    pub(crate) file_identity: BoundedToken<256>,
+    pub(crate) build_identity: BoundedToken<256>,
+}
+
+/// Durable helper-grant verifier record. Only the keyed verifier digest is
+/// persisted; raw grant material never crosses the port. The verifier
+/// compares in fixed time and is redacted from debug output.
+#[derive(Clone)]
+pub struct PersistedHelperGrant {
+    pub(crate) grant_verifier: [u8; 32],
+    pub(crate) seat_id: SeatId,
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) birth_id: ControllerBirthId,
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) signal_id: SignalId,
+    pub(crate) claim_digest: ClaimDigest,
+    pub(crate) operations: HelperOperations,
+    pub(crate) lease_until: OffsetDateTime,
+    pub(crate) executable_identity: HelperExecutableIdentity,
+    pub(crate) revoked: bool,
+}
+
+impl fmt::Debug for PersistedHelperGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedHelperGrant")
+            .field("grant_verifier", &"[redacted]")
+            .field("seat_id", &self.seat_id)
+            .field("arm_id", &self.arm_id)
+            .field("generation", &self.generation)
+            .field("birth_id", &self.birth_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("signal_id", &self.signal_id)
+            .field("claim_digest", &self.claim_digest)
+            .field("operations", &self.operations)
+            .field("lease_until", &self.lease_until)
+            .field("executable_identity", &self.executable_identity)
+            .field("revoked", &self.revoked)
+            .finish()
+    }
+}
+
+impl PartialEq for PersistedHelperGrant {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.grant_verifier.ct_eq(&other.grant_verifier))
+            && self.seat_id == other.seat_id
+            && self.arm_id == other.arm_id
+            && self.generation == other.generation
+            && self.birth_id == other.birth_id
+            && self.attempt_id == other.attempt_id
+            && self.signal_id == other.signal_id
+            && self.claim_digest == other.claim_digest
+            && self.operations == other.operations
+            && self.lease_until == other.lease_until
+            && self.executable_identity == other.executable_identity
+            && self.revoked == other.revoked
+    }
+}
+
+impl Eq for PersistedHelperGrant {}
+
+/// Validated live helper binding. Sealed, connection-bound, and non-Clone;
+/// production construction is the claimed-batch face after authentication.
+#[derive(Debug)]
+pub struct ValidatedHelperBinding {
+    pub(crate) grant_ref: VerifierRef,
+    pub(crate) seat_id: SeatId,
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) birth_id: ControllerBirthId,
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) signal_id: SignalId,
+    pub(crate) claim_digest: ClaimDigest,
+    pub(crate) operations: HelperOperations,
+    pub(crate) lease_until: OffsetDateTime,
+}
+
+/// One retrieve call: the validated binding plus the request nonce and the
+/// canonical digest of the validated request body.
+#[derive(Debug)]
+pub struct RetrieveExchange {
+    pub(crate) binding: ValidatedHelperBinding,
+    pub(crate) request_id: RequestNonce,
+    pub(crate) canonical_body_digest: CanonicalBodyDigest,
+}
+
+/// Content-free recorded retrieve result. Content resolves only through the
+/// immutable [`ClaimPayloadRef`]; no body is duplicated here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedRetrieveResult {
+    pub(crate) retrieval_id: RetrievalId,
+    pub(crate) claim_payload_ref: ClaimPayloadRef,
+    pub(crate) newest_event_ref: EventRef,
+    pub(crate) event_count: u8,
+    pub(crate) retrieved_at: OffsetDateTime,
+}
+
+/// One acknowledge call over an exact prior retrieval.
+#[derive(Debug)]
+pub struct AcknowledgeRequest {
+    pub(crate) request_id: RequestNonce,
+    pub(crate) retrieval_id: RetrievalId,
+    pub(crate) cursor: EventRef,
+    pub(crate) canonical_body_digest: CanonicalBodyDigest,
+}
+
+/// Content-free recorded acknowledgment with the daemon-stamped accept time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcknowledgeResult {
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) signal_id: SignalId,
+    pub(crate) cursor: EventRef,
+    pub(crate) accepted_at: OffsetDateTime,
+}
+
+/// Sealed complete arm/generation/attempt/signal binding for the re-arm join.
+#[derive(Debug)]
+pub struct RearmJoinScope {
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) signal_id: SignalId,
+}
+
+/// Sealed grant/controller/attempt binding for helper-grant revocation.
+#[derive(Debug)]
+pub struct HelperRevocationScope {
+    pub(crate) grant_ref: VerifierRef,
+    pub(crate) birth_id: ControllerBirthId,
+    pub(crate) attempt_id: AttemptId,
+}
+
+/// Re-arm join outcome. Waiting branches name exactly which side is missing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RearmJoinResult {
+    Rearmed,
+    AlreadyRearmed,
+    WaitingForHandled,
+    WaitingForRecognizedTerminal,
 }
 
 /// Metadata for a reservation. Recovery can classify it but cannot remint its
@@ -294,6 +692,7 @@ pub enum PersistError {
     Conflict,
     InvalidTransition,
     Unauthorized,
+    PayloadUnavailable,
     StorageUnavailable,
 }
 
@@ -368,7 +767,7 @@ pub trait Persist: sealed::Sealed {
     ) -> Result<IdempotentWrite, PersistError>;
     fn record_reconciliation_fact(
         &mut self,
-        scope: &ReconciliationScope,
+        scope: ReconciliationScope,
         disposition: &ReconciliationDisposition,
     ) -> Result<IdempotentWrite, PersistError>;
     fn revoke_controller_attachment(
@@ -390,7 +789,7 @@ struct RecoveryCoordinate {
 pub struct FakePersist {
     arms: BTreeMap<ArmId, PersistedArm>,
     claims: BTreeMap<ClaimRequestId, PersistedClaimRecord>,
-    payloads: BTreeMap<ClaimRequestId, Vec<ProviderEvent>>,
+    payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
     claim_attempts: BTreeMap<ClaimRequestId, AttemptId>,
     attachments: BTreeMap<AttemptId, PersistedControllerAttachment>,
     births: BTreeMap<ControllerBirthId, PersistedControllerBirth>,
@@ -576,7 +975,7 @@ impl Persist for SharedFakePersist {
 
     fn record_reconciliation_fact(
         &mut self,
-        scope: &ReconciliationScope,
+        scope: ReconciliationScope,
         disposition: &ReconciliationDisposition,
     ) -> Result<IdempotentWrite, PersistError> {
         self.with_store(|store| store.record_reconciliation_fact(scope, disposition))
@@ -640,57 +1039,69 @@ impl Persist for FakePersist {
         admission: &ClaimAdmission,
         attachment: &PersistedControllerAttachment,
     ) -> Result<AdmissionRecord, PersistError> {
-        if let Some(existing) = self.claims.get(&admission.record.request_id) {
-            if existing.arm_id == admission.record.arm_id
-                && existing.generation == admission.record.generation
-                && existing.signal_id == admission.record.signal_id
-                && existing.event_refs == admission.record.event_refs
-                && self.payloads.get(&admission.record.request_id) == Some(&admission.events)
+        if let Some(existing) = self.claims.get(&admission.request_id) {
+            let payload_matches = self
+                .payloads
+                .get(&existing.payload_ref)
+                .is_some_and(|stored| stored == &admission.payload);
+            if existing.arm_id == admission.arm_id
+                && existing.generation == admission.generation
+                && existing.signal_id == admission.signal_id
+                && existing.event_refs == admission.event_refs
+                && existing.claim_digest == admission.claim_digest
+                && payload_matches
             {
                 let attempt_id = self
                     .claim_attempts
-                    .get(&admission.record.request_id)
+                    .get(&admission.request_id)
                     .ok_or(PersistError::InvalidTransition)?;
                 let stored = self
                     .attachments
                     .get(attempt_id)
                     .ok_or(PersistError::InvalidTransition)?;
                 return Ok(AdmissionRecord {
-                    outcome: ClaimOutcome::ExactReplay,
+                    outcome: AdmissionOutcome::ExactReplay,
                     attempt_id: attempt_id.clone(),
                     verifier_ref: stored.verifier_ref.clone(),
+                    payload_ref: existing.payload_ref.clone(),
                 });
             }
             return Err(PersistError::Conflict);
         }
         if self.claims.values().any(|claim| {
-            claim.arm_id == admission.record.arm_id
-                && claim.generation == admission.record.generation
+            claim.arm_id == admission.arm_id && claim.generation == admission.generation
         }) {
             return Err(PersistError::Conflict);
         }
         if self.attachments.contains_key(&attachment.attempt_id) {
             return Err(PersistError::Conflict);
         }
-        self.claims.insert(
-            admission.record.request_id.clone(),
-            admission.record.clone(),
-        );
-        self.payloads.insert(
-            admission.record.request_id.clone(),
-            admission.events.clone(),
-        );
-        self.claim_attempts.insert(
-            admission.record.request_id.clone(),
-            attachment.attempt_id.clone(),
-        );
+        let payload_ref =
+            ClaimPayloadRef::random().map_err(|_| PersistError::StorageUnavailable)?;
+        let record = PersistedClaimRecord {
+            attempt_id: attachment.attempt_id.clone(),
+            request_id: admission.request_id.clone(),
+            arm_id: admission.arm_id.clone(),
+            generation: admission.generation,
+            signal_id: admission.signal_id.clone(),
+            event_refs: admission.event_refs.clone(),
+            claim_digest: admission.claim_digest.clone(),
+            payload_ref: payload_ref.clone(),
+            claimed_at: admission.claimed_at,
+        };
+        self.claims.insert(admission.request_id.clone(), record);
+        self.payloads
+            .insert(payload_ref.clone(), admission.payload.clone());
+        self.claim_attempts
+            .insert(admission.request_id.clone(), attachment.attempt_id.clone());
         self.attachments
             .insert(attachment.attempt_id.clone(), attachment.clone());
         self.attempt_seq = self.attempt_seq.saturating_add(1);
         Ok(AdmissionRecord {
-            outcome: ClaimOutcome::Admitted,
+            outcome: AdmissionOutcome::Admitted,
             attempt_id: attachment.attempt_id.clone(),
             verifier_ref: attachment.verifier_ref.clone(),
+            payload_ref,
         })
     }
 
@@ -874,7 +1285,7 @@ impl Persist for FakePersist {
         let record = PersistedPreWriteConclusion {
             attempt_id: commit.attempt_id.clone(),
             signal_id: commit.signal_id,
-            conclusion: commit.conclusion,
+            conclusion: commit.conclusion.into(),
             recorded_at: commit.recorded_at,
         };
         if let Some(existing) = self.prewrite.get(&commit.attempt_id) {
@@ -992,8 +1403,10 @@ impl Persist for FakePersist {
             mutation_epoch: proof.mutation_epoch,
             observed_at: proof.observed_at,
             fingerprint,
-            producer_version: proof.producer_version,
-            producer_dialect: proof.producer_dialect,
+            producer_version: BoundedToken::new(proof.producer_version)
+                .map_err(|_| PersistError::InvalidTransition)?,
+            producer_dialect: BoundedToken::new(proof.producer_dialect)
+                .map_err(|_| PersistError::InvalidTransition)?,
         };
         let conclusion = PersistedPreWriteConclusion {
             attempt_id: proof.attempt_id.clone(),
@@ -1204,7 +1617,7 @@ impl Persist for FakePersist {
 
     fn record_reconciliation_fact(
         &mut self,
-        scope: &ReconciliationScope,
+        scope: ReconciliationScope,
         disposition: &ReconciliationDisposition,
     ) -> Result<IdempotentWrite, PersistError> {
         let id = scope.correlation.attempt_id.clone();
@@ -1214,7 +1627,7 @@ impl Persist for FakePersist {
             .ok_or(PersistError::InvalidTransition)?;
         if reservation.correlation != scope.correlation
             || self.write_evidence.get(&id) != Some(&NativeWriteEvidence::Unknown)
-            || self.write_evidence_refs.get(&id) != Some(&scope.evidence_ref)
+            || self.write_evidence_refs.get(&id) != Some(&scope.native_write_evidence_ref)
         {
             return Err(PersistError::Unauthorized);
         }
@@ -1595,26 +2008,23 @@ mod tests {
             turn_ref: None,
         };
         let attachment_verifier = VerifierRef::fixture(8);
+        let admission = claim_admission_fixture(
+            "claim-a",
+            birth.arm_id.clone(),
+            birth.generation,
+            correlation.signal_id.clone(),
+            &[ProviderEvent {
+                provider: "test".to_owned(),
+                event_ref: "event-a".to_owned(),
+                actor: None,
+                observed_at: "1970-01-01T00:00:00Z".to_owned(),
+                body: "test".to_owned(),
+            }],
+            OffsetDateTime::UNIX_EPOCH,
+        );
         store
             .admit_claim(
-                &ClaimAdmission {
-                    record: PersistedClaimRecord {
-                        attempt_id: correlation.attempt_id.clone(),
-                        request_id: ClaimRequestId::new("claim-a").expect("claim"),
-                        arm_id: birth.arm_id.clone(),
-                        generation: birth.generation,
-                        signal_id: correlation.signal_id.clone(),
-                        event_refs: vec!["event-a".to_owned()],
-                        claimed_at: OffsetDateTime::UNIX_EPOCH,
-                    },
-                    events: vec![ProviderEvent {
-                        provider: "test".to_owned(),
-                        event_ref: "event-a".to_owned(),
-                        actor: None,
-                        observed_at: "1970-01-01T00:00:00Z".to_owned(),
-                        body: "test".to_owned(),
-                    }],
-                },
+                &admission,
                 &PersistedControllerAttachment {
                     attempt_id: correlation.attempt_id.clone(),
                     birth_id: birth.birth_id.clone(),
@@ -1921,5 +2331,233 @@ mod tests {
         let rendered = format!("{snapshot:?}");
         assert!(!rendered.contains("native-thread-private"));
         assert!(!rendered.contains("native-turn-private"));
+    }
+
+    fn wire_event(event_ref: &str, body: &str) -> ProviderEvent {
+        ProviderEvent {
+            provider: "test".to_owned(),
+            event_ref: event_ref.to_owned(),
+            actor: None,
+            observed_at: "1970-01-01T00:00:00Z".to_owned(),
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn canonical_claim_digest_deterministic_and_field_sensitive() {
+        let admission = claim_admission_fixture(
+            "claim-a",
+            ArmId::new("arm-a").expect("arm"),
+            1,
+            SignalId::new("signal-a").expect("signal"),
+            &[wire_event("event-a", "test")],
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let digest_of = |admission: &ClaimAdmission| {
+            canonical_claim_digest(
+                &admission.request_id,
+                &admission.arm_id,
+                admission.generation,
+                &admission.signal_id,
+                &admission.event_refs,
+                &admission.payload,
+            )
+        };
+        let baseline = digest_of(&admission);
+        assert_eq!(digest_of(&admission), baseline);
+
+        let mut variant = admission.clone();
+        variant.generation = 2;
+        assert_ne!(digest_of(&variant), baseline);
+
+        let mut variant = admission.clone();
+        variant.signal_id = SignalId::new("signal-b").expect("signal");
+        assert_ne!(digest_of(&variant), baseline);
+
+        let changed_body = claim_admission_fixture(
+            "claim-a",
+            ArmId::new("arm-a").expect("arm"),
+            1,
+            SignalId::new("signal-a").expect("signal"),
+            &[wire_event("event-a", "changed")],
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_ne!(digest_of(&changed_body), baseline);
+        assert_ne!(changed_body.claim_digest, admission.claim_digest);
+    }
+
+    #[test]
+    fn admission_replay_returns_stored_ref_and_conflicts_on_changed_digest() {
+        let mut store = FakePersist::default();
+        let (birth, create) = birth();
+        store
+            .reserve_controller_birth(&birth, &create)
+            .expect("reserve");
+        let attachment = PersistedControllerAttachment {
+            attempt_id: AttemptId::new("attempt-a").expect("attempt"),
+            birth_id: birth.birth_id.clone(),
+            seat_id: birth.seat_id.clone(),
+            arm_id: birth.arm_id.clone(),
+            generation: birth.generation,
+            capability: birth.capability,
+            lease_until: birth.lease_until,
+            verifier_ref: VerifierRef::fixture(8),
+            revoked: false,
+        };
+        let admission = claim_admission_fixture(
+            "claim-a",
+            birth.arm_id.clone(),
+            birth.generation,
+            SignalId::new("signal-a").expect("signal"),
+            &[wire_event("event-a", "test")],
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let first = store.admit_claim(&admission, &attachment).expect("admit");
+        assert_eq!(first.outcome, AdmissionOutcome::Admitted);
+        let replay = store.admit_claim(&admission, &attachment).expect("replay");
+        assert_eq!(replay.outcome, AdmissionOutcome::ExactReplay);
+        assert_eq!(replay.payload_ref, first.payload_ref);
+        assert_eq!(replay.attempt_id, first.attempt_id);
+
+        let changed = claim_admission_fixture(
+            "claim-a",
+            birth.arm_id.clone(),
+            birth.generation,
+            SignalId::new("signal-a").expect("signal"),
+            &[wire_event("event-a", "changed")],
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            store.admit_claim(&changed, &attachment),
+            Err(PersistError::Conflict)
+        );
+    }
+
+    #[test]
+    fn provider_event_record_conversion_negatives() {
+        let valid = ProviderEventRecord::try_from(&wire_event("event-a", "test")).expect("valid");
+        assert_eq!(valid.event_ref.as_str(), "event-a");
+        assert_eq!(valid.provider.as_str(), "test");
+        assert!(valid.actor.is_none());
+
+        let mut bad_time = wire_event("event-a", "test");
+        bad_time.observed_at = "not-a-time".to_owned();
+        assert!(ProviderEventRecord::try_from(&bad_time).is_err());
+
+        let mut long_time = wire_event("event-a", "test");
+        long_time.observed_at = "x".repeat(65);
+        assert!(ProviderEventRecord::try_from(&long_time).is_err());
+
+        assert!(ProviderEventRecord::try_from(&wire_event("", "test")).is_err());
+
+        let mut long_provider = wire_event("event-a", "test");
+        long_provider.provider = "x".repeat(65);
+        assert!(ProviderEventRecord::try_from(&long_provider).is_err());
+
+        let mut bad_actor = wire_event("event-a", "test");
+        bad_actor.actor = Some("has\nnewline".to_owned());
+        assert!(ProviderEventRecord::try_from(&bad_actor).is_err());
+
+        let mut long_body = wire_event("event-a", "test");
+        long_body.body = "x".repeat(4097);
+        assert!(ProviderEventRecord::try_from(&long_body).is_err());
+    }
+
+    #[test]
+    fn bounded_payload_aggregate_enforced() {
+        let records = |count: usize| -> Vec<ProviderEventRecord> {
+            (0..count)
+                .map(|index| {
+                    ProviderEventRecord::try_from(&wire_event(
+                        &format!("event-{index}"),
+                        &"x".repeat(4096),
+                    ))
+                    .expect("record")
+                })
+                .collect()
+        };
+        assert!(BoundedClaimPayload::try_from(records(32)).is_ok());
+        assert!(BoundedClaimPayload::try_from(records(33)).is_err());
+        assert!(BoundedClaimPayload::try_from(records(0)).is_err());
+
+        let payload = BoundedClaimPayload::try_from(vec![
+            ProviderEventRecord::try_from(&wire_event("event-a", "secret-marker"))
+                .expect("record"),
+        ])
+        .expect("payload");
+        let rendered = format!("{payload:?}");
+        assert!(!rendered.contains("secret-marker"), "{rendered}");
+    }
+
+    #[test]
+    fn helper_operations_closed_set() {
+        let all = HelperOperations::all();
+        assert!(all.allows(HelperOperation::Retrieve));
+        assert!(all.allows(HelperOperation::Acknowledge));
+        let retrieve_only = HelperOperations::retrieve_only();
+        assert!(retrieve_only.allows(HelperOperation::Retrieve));
+        assert!(!retrieve_only.allows(HelperOperation::Acknowledge));
+    }
+
+    #[test]
+    fn grant_verifier_redacted_and_compared() {
+        let grant = PersistedHelperGrant {
+            grant_verifier: [0x5a; 32],
+            seat_id: SeatId::new("seat-a").expect("seat"),
+            arm_id: ArmId::new("arm-a").expect("arm"),
+            generation: 1,
+            birth_id: ControllerBirthId::fixture(1),
+            attempt_id: AttemptId::new("attempt-a").expect("attempt"),
+            signal_id: SignalId::new("signal-a").expect("signal"),
+            claim_digest: ClaimDigest::fixture(3),
+            operations: HelperOperations::all(),
+            lease_until: OffsetDateTime::UNIX_EPOCH,
+            executable_identity: HelperExecutableIdentity {
+                image_digest: [0x11; 32],
+                file_identity: BoundedToken::new("gearwit-helper").expect("file"),
+                build_identity: BoundedToken::new("build-1").expect("build"),
+            },
+            revoked: false,
+        };
+        assert_eq!(grant, grant.clone());
+        let rendered = format!("{grant:?}");
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("5a"));
+        let mut rotated = grant.clone();
+        rotated.grant_verifier = [0x5b; 32];
+        assert_ne!(grant, rotated);
+    }
+
+    #[test]
+    fn non_active_conclusion_mapping() {
+        assert_eq!(
+            PreWriteConclusion::from(NonActivePreWriteConclusion::IdleStateUnproven),
+            PreWriteConclusion::IdleStateUnproven
+        );
+        let invalidated = NonActivePreWriteConclusion::IdleEpochInvalidated {
+            probe_id: RequestNonce::fixture(4),
+            expected_epoch: NativeMutationEpoch {
+                birth_id: ControllerBirthId::fixture(1),
+                sequence: 1,
+            },
+            observed_epoch: NativeMutationEpoch {
+                birth_id: ControllerBirthId::fixture(1),
+                sequence: 2,
+            },
+        };
+        assert_eq!(
+            PreWriteConclusion::from(invalidated.clone()),
+            PreWriteConclusion::IdleEpochInvalidated {
+                probe_id: RequestNonce::fixture(4),
+                expected_epoch: NativeMutationEpoch {
+                    birth_id: ControllerBirthId::fixture(1),
+                    sequence: 1,
+                },
+                observed_epoch: NativeMutationEpoch {
+                    birth_id: ControllerBirthId::fixture(1),
+                    sequence: 2,
+                },
+            }
+        );
     }
 }
