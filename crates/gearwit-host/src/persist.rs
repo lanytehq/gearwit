@@ -6,8 +6,8 @@ use crate::controller::{
     ClaimDigest, ClaimPayloadRef, ClaimRequestId, ControllerBirthId, EventRef, ManagedCapability,
     NativeCoordinateKind, NativeCoordinateScope, NativeMutationEpoch, NativeTurnFact,
     NativeWriteReservation, OpenedNativeCoordinate, PersistedTurnCorrelation, PrivateNativeRef,
-    ProviderName, ReconciliationDisposition, ReconciliationScope, RequestNonce, RetrievalId,
-    SeatId, SecretNativeCoordinate, SignalId, ValidatedIdlePermit, VerifierRef,
+    ProducerLabel, ProviderName, ReconciliationDisposition, ReconciliationScope, RequestNonce,
+    RetrievalId, SeatId, SecretNativeCoordinate, SignalId, ValidatedIdlePermit, VerifierRef,
 };
 use gearwit_protocol::ProviderEvent;
 use std::collections::{BTreeMap, BTreeSet};
@@ -315,8 +315,8 @@ pub struct PersistedActiveObservationEvidence {
     pub mutation_epoch: NativeMutationEpoch,
     pub observed_at: OffsetDateTime,
     pub fingerprint: ActiveObservationFingerprint,
-    pub producer_version: BoundedToken<64>,
-    pub producer_dialect: BoundedToken<64>,
+    pub producer_version: ProducerLabel,
+    pub producer_dialect: ProducerLabel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -535,7 +535,7 @@ impl fmt::Debug for PersistedHelperGrant {
             .field("claim_digest", &self.claim_digest)
             .field("operations", &self.operations)
             .field("lease_until", &self.lease_until)
-            .field("executable_identity", &self.executable_identity)
+            .field("executable_identity", &"[redacted]")
             .field("revoked", &self.revoked)
             .finish()
     }
@@ -1039,6 +1039,30 @@ impl Persist for FakePersist {
         admission: &ClaimAdmission,
         attachment: &PersistedControllerAttachment,
     ) -> Result<AdmissionRecord, PersistError> {
+        // The sealed port never trusts caller-supplied identity: recompute
+        // the canonical digest and verify the ordered refs match the
+        // bounded payload before any store mutation. The same validation
+        // applies to future decoded-media recovery.
+        let recomputed = canonical_claim_digest(
+            &admission.request_id,
+            &admission.arm_id,
+            admission.generation,
+            &admission.signal_id,
+            &admission.event_refs,
+            &admission.payload,
+        );
+        if recomputed != admission.claim_digest {
+            return Err(PersistError::Conflict);
+        }
+        let refs_match_payload = admission.event_refs.as_slice().iter().eq(admission
+            .payload
+            .events
+            .as_slice()
+            .iter()
+            .map(|record| &record.event_ref));
+        if !refs_match_payload {
+            return Err(PersistError::Conflict);
+        }
         if let Some(existing) = self.claims.get(&admission.request_id) {
             let payload_matches = self
                 .payloads
@@ -1403,9 +1427,9 @@ impl Persist for FakePersist {
             mutation_epoch: proof.mutation_epoch,
             observed_at: proof.observed_at,
             fingerprint,
-            producer_version: BoundedToken::new(proof.producer_version)
+            producer_version: ProducerLabel::new(proof.producer_version)
                 .map_err(|_| PersistError::InvalidTransition)?,
-            producer_dialect: BoundedToken::new(proof.producer_dialect)
+            producer_dialect: ProducerLabel::new(proof.producer_dialect)
                 .map_err(|_| PersistError::InvalidTransition)?,
         };
         let conclusion = PersistedPreWriteConclusion {
@@ -2434,6 +2458,93 @@ mod tests {
     }
 
     #[test]
+    fn admission_forged_digest_and_ref_mismatch_leave_no_state() {
+        let mut store = FakePersist::default();
+        let (birth, create) = birth();
+        store
+            .reserve_controller_birth(&birth, &create)
+            .expect("reserve");
+        let attachment = PersistedControllerAttachment {
+            attempt_id: AttemptId::new("attempt-a").expect("attempt"),
+            birth_id: birth.birth_id.clone(),
+            seat_id: birth.seat_id.clone(),
+            arm_id: birth.arm_id.clone(),
+            generation: birth.generation,
+            capability: birth.capability,
+            lease_until: birth.lease_until,
+            verifier_ref: VerifierRef::fixture(8),
+            revoked: false,
+        };
+        let admission = claim_admission_fixture(
+            "claim-a",
+            birth.arm_id.clone(),
+            birth.generation,
+            SignalId::new("signal-a").expect("signal"),
+            &[
+                wire_event("event-a", "test-a"),
+                wire_event("event-b", "test-b"),
+            ],
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        // Forged digest over consistent refs/payload.
+        let mut forged = admission.clone();
+        let mut digest_bytes = forged.claim_digest.0;
+        digest_bytes[0] ^= 0x01;
+        forged.claim_digest = ClaimDigest::from_bytes(digest_bytes);
+        assert_eq!(
+            store.admit_claim(&forged, &attachment),
+            Err(PersistError::Conflict)
+        );
+        // Reordered refs with a matching recomputed digest still fail the
+        // ordered refs-vs-payload check.
+        let mut reordered = admission.clone();
+        let swapped: Vec<EventRef> = reordered
+            .event_refs
+            .as_slice()
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        reordered.event_refs = BoundedVec::try_from(swapped).expect("refs");
+        reordered.claim_digest = canonical_claim_digest(
+            &reordered.request_id,
+            &reordered.arm_id,
+            reordered.generation,
+            &reordered.signal_id,
+            &reordered.event_refs,
+            &reordered.payload,
+        );
+        assert_eq!(
+            store.admit_claim(&reordered, &attachment),
+            Err(PersistError::Conflict)
+        );
+        // Dropped ref with a matching recomputed digest fails the same way.
+        let mut dropped = admission.clone();
+        let prefix: Vec<EventRef> = dropped.event_refs.as_slice()[..1].to_vec();
+        dropped.event_refs = BoundedVec::try_from(prefix).expect("refs");
+        dropped.claim_digest = canonical_claim_digest(
+            &dropped.request_id,
+            &dropped.arm_id,
+            dropped.generation,
+            &dropped.signal_id,
+            &dropped.event_refs,
+            &dropped.payload,
+        );
+        assert_eq!(
+            store.admit_claim(&dropped, &attachment),
+            Err(PersistError::Conflict)
+        );
+        // Zero state change: nothing recorded, and the valid admission
+        // still lands as a fresh write.
+        let snapshot = store.recover_authority_state().expect("snapshot");
+        assert!(snapshot.claims.is_empty());
+        let record = store
+            .admit_claim(&admission, &attachment)
+            .expect("valid admit");
+        assert_eq!(record.outcome, AdmissionOutcome::Admitted);
+    }
+
+    #[test]
     fn provider_event_record_conversion_negatives() {
         let valid = ProviderEventRecord::try_from(&wire_event("event-a", "test")).expect("valid");
         assert_eq!(valid.event_ref.as_str(), "event-a");
@@ -2481,8 +2592,7 @@ mod tests {
         assert!(BoundedClaimPayload::try_from(records(0)).is_err());
 
         let payload = BoundedClaimPayload::try_from(vec![
-            ProviderEventRecord::try_from(&wire_event("event-a", "secret-marker"))
-                .expect("record"),
+            ProviderEventRecord::try_from(&wire_event("event-a", "secret-marker")).expect("record"),
         ])
         .expect("payload");
         let rendered = format!("{payload:?}");
@@ -2523,6 +2633,8 @@ mod tests {
         let rendered = format!("{grant:?}");
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("5a"));
+        assert!(!rendered.contains("gearwit-helper"), "{rendered}");
+        assert!(!rendered.contains("build-1"), "{rendered}");
         let mut rotated = grant.clone();
         rotated.grant_verifier = [0x5b; 32];
         assert_ne!(grant, rotated);

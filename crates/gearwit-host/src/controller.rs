@@ -70,13 +70,13 @@ private_id!(CanonicalBodyDigest);
 
 /// Length- and charset-bounded semantic token.
 ///
-/// Validation: 1..=MAX bytes; every byte is ASCII graphic or space
-/// (`0x20..=0x7E`). Control characters, DEL, and non-ASCII bytes are
-/// rejected. The class deliberately admits spaces so provider and producer
-/// labels (for example the fixed `codex-cli` producer constant) validate;
-/// family discipline comes from the distinct Rust newtype per use, not from
-/// the shared class. Bounds differ per family (ids and refs 256, provider
-/// and producer labels 64).
+/// Validation: 1..=MAX bytes; every byte is ASCII alphanumeric or one of
+/// `-_:.`. This restores the prior safe-token boundary: whitespace,
+/// control characters, DEL, non-ASCII bytes, and all other punctuation are
+/// rejected, keeping event refs, cursors, and provider slugs compatible
+/// with the admitted contracts. Family discipline comes from the distinct
+/// Rust newtype per use. Producer labels that require spaces use the
+/// separate [`ProducerLabel`] type and are never valid here.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BoundedToken<const MAX: usize>(String);
 
@@ -85,9 +85,36 @@ impl<const MAX: usize> BoundedToken<MAX> {
         let value = value.into();
         if value.is_empty()
             || value.len() > MAX
-            || !value.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
         {
             return Err("invalid bounded token");
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Space-capable internal producer label: 1..=64 bytes of ASCII graphic or
+/// space. This exists only for fixed producer version/dialect labels (which
+/// contain spaces) at the evidence boundary. It is never a valid event ref,
+/// cursor, provider, or actor identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProducerLabel(String);
+
+impl ProducerLabel {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+        {
+            return Err("invalid producer label");
         }
         Ok(Self(value))
     }
@@ -1175,15 +1202,36 @@ mod tests {
             BoundedToken::<8>::new("event-a").expect("valid").as_str(),
             "event-a"
         );
-        // Fixed producer labels contain spaces and must validate.
-        BoundedToken::<64>::new("codex-cli 0.152.1").expect("producer version");
-        BoundedToken::<64>::new("thread/read-v2").expect("producer dialect");
+        assert!(BoundedToken::<9>::new("a:b_c.d-1").is_ok());
         assert!(BoundedToken::<8>::new("").is_err());
         assert!(BoundedToken::<8>::new("123456789").is_err());
+        // Whitespace in any position is rejected.
+        assert!(BoundedToken::<8>::new("has space").is_err());
+        assert!(BoundedToken::<8>::new(" lead").is_err());
+        assert!(BoundedToken::<8>::new("trail ").is_err());
+        assert!(BoundedToken::<8>::new("   ").is_err());
         assert!(BoundedToken::<8>::new("has\nnewline").is_err());
         assert!(BoundedToken::<8>::new("has\ttab").is_err());
         assert!(BoundedToken::<8>::new("non-ascii-é").is_err());
         assert!(BoundedToken::<8>::new("has\x7fdel").is_err());
+        assert!(BoundedToken::<8>::new("has/slash").is_err());
+        assert!(BoundedToken::<8>::new("has\"quote").is_err());
+    }
+
+    #[test]
+    fn producer_label_accepts_fixed_labels_only() {
+        // Fixed producer labels contain spaces and must validate here.
+        assert_eq!(
+            ProducerLabel::new("codex-cli 0.152.1")
+                .expect("producer version")
+                .as_str(),
+            "codex-cli 0.152.1"
+        );
+        ProducerLabel::new("thread/read-v2").expect("producer dialect");
+        assert!(ProducerLabel::new("").is_err());
+        assert!(ProducerLabel::new("x".repeat(65)).is_err());
+        assert!(ProducerLabel::new("has\nnewline").is_err());
+        assert!(ProducerLabel::new("non-ascii-é").is_err());
     }
 
     #[test]
@@ -1223,11 +1271,16 @@ mod tests {
         assert!(EventRef::new("event-a").is_ok());
         assert!(EventRef::new("x".repeat(256)).is_ok());
         assert!(EventRef::new("x".repeat(257)).is_err());
+        assert!(EventRef::new("event a").is_err());
+        assert!(EventRef::new(" event-a").is_err());
+        assert!(EventRef::new("event-a ").is_err());
         assert!(ProviderName::new("test").is_ok());
         assert!(ProviderName::new("x".repeat(64)).is_ok());
         assert!(ProviderName::new("x".repeat(65)).is_err());
+        assert!(ProviderName::new("has space").is_err());
         assert!(ActorName::new("actor-a").is_ok());
         assert!(ActorName::new("").is_err());
+        assert!(ActorName::new("actor a").is_err());
     }
 
     #[test]
