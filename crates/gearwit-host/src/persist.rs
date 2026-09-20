@@ -42,6 +42,7 @@ pub struct PersistedClaimRecord {
     pub claim_digest: ClaimDigest,
     pub payload_ref: ClaimPayloadRef,
     pub claimed_at: OffsetDateTime,
+    pub(crate) coverage: Option<ClaimCoverageEvidence>,
 }
 
 /// One validated provider event inside a claimed batch. This is the bounded
@@ -127,14 +128,62 @@ pub struct ClaimAdmission {
     pub(crate) claim_digest: ClaimDigest,
     pub(crate) payload: BoundedClaimPayload,
     pub(crate) claimed_at: OffsetDateTime,
+    pub(crate) coverage: Option<ClaimCoverageEvidence>,
+}
+
+/// Sealed, bounded claim-coverage proof. Presence or absence participates in
+/// [`ClaimDigest`]. The event-batch digest is computed independently of this
+/// record so coverage identity cannot be circular.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimCoverageEvidence {
+    pub(crate) request_id: ClaimRequestId,
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) signal_id: SignalId,
+    pub(crate) provider: ProviderName,
+    pub(crate) drain_filter_scope: BoundedToken<64>,
+    pub(crate) drain_baseline: EventRef,
+    pub(crate) event_batch_digest: [u8; 32],
+    pub(crate) covered_through: EventRef,
+    pub(crate) source_evidence_id: [u8; 32],
+}
+
+/// Independent digest of the ordered event-ref batch. Coverage evidence
+/// stores this value; it is not derived from the coverage record itself.
+pub(crate) fn canonical_event_batch_digest(event_refs: &BoundedVec<EventRef, 1, 64>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gearwit.claim-event-batch.v1\0");
+    for event_ref in event_refs.as_slice() {
+        mac_field(&mut hasher, event_ref.as_str().as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn mac_coverage(hasher: &mut blake3::Hasher, coverage: Option<&ClaimCoverageEvidence>) {
+    match coverage {
+        None => mac_field(hasher, b"\x00"),
+        Some(evidence) => {
+            mac_field(hasher, b"\x01");
+            mac_field(hasher, evidence.request_id.as_str().as_bytes());
+            mac_field(hasher, evidence.arm_id.as_str().as_bytes());
+            mac_field(hasher, &evidence.generation.to_le_bytes());
+            mac_field(hasher, evidence.signal_id.as_str().as_bytes());
+            mac_field(hasher, evidence.provider.as_str().as_bytes());
+            mac_field(hasher, evidence.drain_filter_scope.as_str().as_bytes());
+            mac_field(hasher, evidence.drain_baseline.as_str().as_bytes());
+            mac_field(hasher, &evidence.event_batch_digest);
+            mac_field(hasher, evidence.covered_through.as_str().as_bytes());
+            mac_field(hasher, &evidence.source_evidence_id);
+        }
+    }
 }
 
 /// Canonical claim digest over the validated admission fields in fixed order.
 /// The encoding is length-prefixed and unambiguous: domain tag, request id,
 /// arm id, generation, signal id, ordered event refs, then the ordered event
-/// records (ref, provider, actor presence + value, RFC 3339 time, body).
-/// Any validated-field change yields a different digest; transport framing
-/// never enters it.
+/// records (ref, provider, actor presence + value, RFC 3339 time, body),
+/// then coverage presence and fields. Any validated-field change yields a
+/// different digest; transport framing never enters it.
 pub(crate) fn canonical_claim_digest(
     request_id: &ClaimRequestId,
     arm_id: &ArmId,
@@ -142,6 +191,7 @@ pub(crate) fn canonical_claim_digest(
     signal_id: &SignalId,
     event_refs: &BoundedVec<EventRef, 1, 64>,
     payload: &BoundedClaimPayload,
+    coverage: Option<&ClaimCoverageEvidence>,
 ) -> ClaimDigest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gearwit.claim-digest.v1\0");
@@ -168,7 +218,62 @@ pub(crate) fn canonical_claim_digest(
         );
         mac_field(&mut hasher, event.body.as_str().as_bytes());
     }
+    mac_coverage(&mut hasher, coverage);
     ClaimDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+fn coverage_admission_invalid(admission: &ClaimAdmission) -> bool {
+    let Some(evidence) = admission.coverage.as_ref() else {
+        return false;
+    };
+    evidence.request_id != admission.request_id
+        || evidence.arm_id != admission.arm_id
+        || evidence.generation != admission.generation
+        || evidence.signal_id != admission.signal_id
+        || evidence.event_batch_digest != canonical_event_batch_digest(&admission.event_refs)
+        || !admission
+            .event_refs
+            .as_slice()
+            .iter()
+            .any(|event_ref| event_ref == &evidence.covered_through)
+        || !admission
+            .event_refs
+            .as_slice()
+            .iter()
+            .any(|event_ref| event_ref == &evidence.drain_baseline)
+}
+
+fn proved_ack_index(
+    claim: &PersistedClaimRecord,
+    refs: &[EventRef],
+) -> Result<usize, PersistError> {
+    match claim.coverage.as_ref() {
+        None => Ok(0),
+        Some(evidence) => {
+            if !coverage_evidence_matches(claim, evidence) {
+                return Err(PersistError::Unauthorized);
+            }
+            refs.iter()
+                .position(|event_ref| event_ref == &evidence.covered_through)
+                .ok_or(PersistError::Unauthorized)
+        }
+    }
+}
+
+fn coverage_evidence_matches(
+    claim: &PersistedClaimRecord,
+    evidence: &ClaimCoverageEvidence,
+) -> bool {
+    evidence.request_id == claim.request_id
+        && evidence.arm_id == claim.arm_id
+        && evidence.generation == claim.generation
+        && evidence.signal_id == claim.signal_id
+        && evidence.event_batch_digest == canonical_event_batch_digest(&claim.event_refs)
+        && claim
+            .event_refs
+            .as_slice()
+            .iter()
+            .any(|event_ref| event_ref == &evidence.covered_through)
 }
 
 /// Test-only admission constructor over validated wire events. Panics on
@@ -195,6 +300,14 @@ pub(crate) fn claim_admission_fixture(
     .expect("fixture refs");
     let payload = BoundedClaimPayload::try_from(records).expect("fixture payload");
     let request_id = ClaimRequestId::new(request_id).expect("fixture request id");
+    let coverage = Some(synthetic_claim_coverage(
+        &request_id,
+        &arm_id,
+        generation,
+        &signal_id,
+        &event_refs,
+        &payload,
+    ));
     let claim_digest = canonical_claim_digest(
         &request_id,
         &arm_id,
@@ -202,6 +315,7 @@ pub(crate) fn claim_admission_fixture(
         &signal_id,
         &event_refs,
         &payload,
+        coverage.as_ref(),
     );
     ClaimAdmission {
         request_id,
@@ -212,6 +326,31 @@ pub(crate) fn claim_admission_fixture(
         claim_digest,
         payload,
         claimed_at,
+        coverage,
+    }
+}
+
+/// Test-only contiguous-prefix coverage through the newest admitted event.
+#[cfg(test)]
+pub(crate) fn synthetic_claim_coverage(
+    request_id: &ClaimRequestId,
+    arm_id: &ArmId,
+    generation: u64,
+    signal_id: &SignalId,
+    event_refs: &BoundedVec<EventRef, 1, 64>,
+    payload: &BoundedClaimPayload,
+) -> ClaimCoverageEvidence {
+    ClaimCoverageEvidence {
+        request_id: request_id.clone(),
+        arm_id: arm_id.clone(),
+        generation,
+        signal_id: signal_id.clone(),
+        provider: payload.events.as_slice()[0].provider.clone(),
+        drain_filter_scope: BoundedToken::new("fixture-drain").expect("scope"),
+        drain_baseline: event_refs.as_slice()[0].clone(),
+        event_batch_digest: canonical_event_batch_digest(event_refs),
+        covered_through: event_refs.as_slice()[event_refs.as_slice().len() - 1].clone(),
+        source_evidence_id: [0x42; 32],
     }
 }
 
@@ -613,6 +752,43 @@ pub struct RecordedRetrieveResult {
     pub(crate) retrieved_at: OffsetDateTime,
 }
 
+/// Private provenance of a materialization permit. Fresh use revalidates
+/// current generation/lease/lifecycle; exact replay alone receives the
+/// frozen timing exception.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PermitProvenance {
+    Fresh,
+    ExactReplay,
+}
+
+/// Private, non-Clone, non-serializable permit minted only after store
+/// validation. Recorded metadata never authorizes content access by itself.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ClaimMaterializationPermit {
+    grant_ref: VerifierRef,
+    binding_digest: [u8; 32],
+    request_id: RequestNonce,
+    retrieval_id: RetrievalId,
+    claim_digest: ClaimDigest,
+    payload_ref: ClaimPayloadRef,
+    provenance: PermitProvenance,
+}
+
+/// Recorded retrieve metadata paired with a consuming materialization permit.
+#[derive(Debug, Eq, PartialEq)]
+pub struct AuthorizedRetrieve {
+    pub recorded: RecordedRetrieveResult,
+    pub permit: ClaimMaterializationPermit,
+}
+
+/// Retired grant identity. Rotation fences both the grant-ref and the
+/// verifier; neither may be reintroduced as a live credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedRetiredGrant {
+    pub(crate) grant_ref: VerifierRef,
+    pub(crate) grant_verifier: [u8; 32],
+}
+
 /// One acknowledge call over an exact prior retrieval.
 #[derive(Debug)]
 pub struct AcknowledgeRequest {
@@ -755,6 +931,7 @@ pub struct RecoverySnapshot {
     pub prewrite_conclusions: Vec<PersistedPreWriteConclusion>,
     pub active_observations: Vec<PersistedActiveObservationEvidence>,
     pub helper_grants: Vec<PersistedHelperGrant>,
+    pub retired_helper_grants: Vec<PersistedRetiredGrant>,
     pub retrieve_replays: Vec<PersistedRetrieveReplay>,
     pub retrieval_bindings: Vec<PersistedRetrievalRecord>,
     pub ack_replays: Vec<PersistedAckReplay>,
@@ -858,11 +1035,11 @@ pub trait Persist: sealed::Sealed {
     fn record_retrieve_exchange(
         &mut self,
         exchange: &RetrieveExchange,
-    ) -> Result<IdempotentResult<RecordedRetrieveResult>, PersistError>;
+    ) -> Result<IdempotentResult<AuthorizedRetrieve>, PersistError>;
     fn materialize_claimed_batch(
         &self,
         binding: &ValidatedHelperBinding,
-        recorded: &RecordedRetrieveResult,
+        permit: ClaimMaterializationPermit,
     ) -> Result<BoundedClaimPayload, PersistError>;
     fn acknowledge_retrieved_batch(
         &mut self,
@@ -904,6 +1081,7 @@ pub struct FakePersist {
     turn_facts: BTreeMap<AttemptId, Vec<NativeTurnFact>>,
     reconciliations: BTreeMap<AttemptId, ReconciliationDisposition>,
     grants: Vec<PersistedHelperGrant>,
+    retired_grants: Vec<PersistedRetiredGrant>,
     retrieve_replays: BTreeMap<RequestNonce, PersistedRetrieveReplay>,
     ack_replays: BTreeMap<RequestNonce, PersistedAckReplay>,
     retrievals: BTreeMap<RetrievalId, PersistedRetrievalRecord>,
@@ -942,6 +1120,7 @@ impl Default for FakePersist {
             turn_facts: BTreeMap::new(),
             reconciliations: BTreeMap::new(),
             grants: Vec::new(),
+            retired_grants: Vec::new(),
             retrieve_replays: BTreeMap::new(),
             ack_replays: BTreeMap::new(),
             retrievals: BTreeMap::new(),
@@ -1112,16 +1291,16 @@ impl Persist for SharedFakePersist {
     fn record_retrieve_exchange(
         &mut self,
         exchange: &RetrieveExchange,
-    ) -> Result<IdempotentResult<RecordedRetrieveResult>, PersistError> {
+    ) -> Result<IdempotentResult<AuthorizedRetrieve>, PersistError> {
         self.with_store(|store| store.record_retrieve_exchange(exchange))
     }
 
     fn materialize_claimed_batch(
         &self,
         binding: &ValidatedHelperBinding,
-        recorded: &RecordedRetrieveResult,
+        permit: ClaimMaterializationPermit,
     ) -> Result<BoundedClaimPayload, PersistError> {
-        self.with_store(|store| store.materialize_claimed_batch(binding, recorded))
+        self.with_store(|store| store.materialize_claimed_batch(binding, permit))
     }
 
     fn acknowledge_retrieved_batch(
@@ -1212,6 +1391,7 @@ pub(crate) fn canonical_ack_body_digest(
 /// metadata, handled coverage, and join positions. No bodies included.
 struct HelperSnapshotSections {
     grants: Vec<PersistedHelperGrant>,
+    retired_grants: Vec<PersistedRetiredGrant>,
     retrieve_replays: Vec<PersistedRetrieveReplay>,
     retrieval_bindings: Vec<PersistedRetrievalRecord>,
     ack_replays: Vec<PersistedAckReplay>,
@@ -1231,6 +1411,7 @@ impl FakePersist {
     fn helper_snapshot(&self) -> HelperSnapshotSections {
         HelperSnapshotSections {
             grants: self.grants.clone(),
+            retired_grants: self.retired_grants.clone(),
             retrieve_replays: self.retrieve_replays.values().cloned().collect(),
             retrieval_bindings: self.retrievals.values().cloned().collect(),
             ack_replays: self.ack_replays.values().cloned().collect(),
@@ -1268,6 +1449,46 @@ impl FakePersist {
         self.grants
             .iter_mut()
             .find(|grant| grant.birth_id == *birth_id && grant.attempt_id == *attempt_id)
+    }
+
+    fn quarantine_reserved_ownership(&mut self) {
+        for state in self.ownership.values_mut() {
+            if let ThreadOwnershipState::Reserved { create_attempt_id } = state {
+                *state = ThreadOwnershipState::Unknown {
+                    create_attempt_id: create_attempt_id.clone(),
+                };
+            }
+        }
+    }
+
+    fn helper_request_nonce_collision(&self) -> bool {
+        self.retrieve_replays
+            .keys()
+            .any(|nonce| self.ack_replays.contains_key(nonce))
+    }
+
+    fn grant_identity_retired(&self, grant: &PersistedHelperGrant) -> bool {
+        self.retired_grants.iter().any(|retired| {
+            retired.grant_ref == grant.grant_ref
+                || bool::from(retired.grant_verifier.ct_eq(&grant.grant_verifier))
+        })
+    }
+
+    fn mint_retrieve_permit(
+        binding: &ValidatedHelperBinding,
+        request_id: &RequestNonce,
+        recorded: &RecordedRetrieveResult,
+        provenance: PermitProvenance,
+    ) -> ClaimMaterializationPermit {
+        ClaimMaterializationPermit {
+            grant_ref: binding.grant_ref.clone(),
+            binding_digest: canonical_binding_digest(binding),
+            request_id: request_id.clone(),
+            retrieval_id: recorded.retrieval_id.clone(),
+            claim_digest: binding.claim_digest.clone(),
+            payload_ref: recorded.claim_payload_ref.clone(),
+            provenance,
+        }
     }
 
     fn claim_for_attempt(&self, attempt_id: &AttemptId) -> Option<&PersistedClaimRecord> {
@@ -1311,16 +1532,33 @@ impl FakePersist {
             return Err(PersistError::Conflict);
         }
         let arm = self.arms.get(&grant.arm_id).ok_or(PersistError::Conflict)?;
-        if arm.generation != grant.generation {
+        if arm.generation != grant.generation
+            || arm.seat_id != grant.seat_id
+            || arm.capability != attachment.capability
+            || arm.coverage_until <= self.now
+        {
             return Err(PersistError::Conflict);
         }
-        if grant.lease_until <= self.now {
+        if attachment.generation != grant.generation || attachment.lease_until <= self.now {
             return Err(PersistError::Conflict);
         }
-        if self.attempt_lost(&grant.attempt_id) {
+        if birth.generation != grant.generation
+            || birth.capability != attachment.capability
+            || birth.lease_until <= self.now
+        {
             return Err(PersistError::Conflict);
         }
-        if self.handled_complete(&grant.attempt_id) && self.attempt_terminal(&grant.attempt_id) {
+        if grant.lease_until <= self.now
+            || grant.lease_until > attachment.lease_until
+            || grant.lease_until > birth.lease_until
+            || grant.lease_until > arm.coverage_until
+        {
+            return Err(PersistError::Conflict);
+        }
+        if self.attempt_lost(&grant.attempt_id)
+            || self.handled_complete(&grant.attempt_id)
+            || self.attempt_terminal(&grant.attempt_id)
+        {
             return Err(PersistError::Conflict);
         }
         Ok(())
@@ -1349,8 +1587,9 @@ impl FakePersist {
             || grant.generation != binding.generation
             || grant.signal_id != binding.signal_id
             || grant.claim_digest != binding.claim_digest
+            || grant.operations != binding.operations
+            || grant.lease_until != binding.lease_until
             || !grant.operations.allows(operation)
-            || !binding.operations.allows(operation)
         {
             return Err(PersistError::Unauthorized);
         }
@@ -1433,6 +1672,9 @@ impl FakePersist {
         let grant = self
             .helper_grant(&binding.birth_id, &binding.attempt_id)
             .ok_or(PersistError::Unauthorized)?;
+        if grant.operations != binding.operations || grant.lease_until != binding.lease_until {
+            return Err(PersistError::Unauthorized);
+        }
         if grant.lease_until <= self.now || binding.lease_until <= self.now {
             return Err(PersistError::Unauthorized);
         }
@@ -1440,7 +1682,10 @@ impl FakePersist {
             .arms
             .get(&binding.arm_id)
             .ok_or(PersistError::Unauthorized)?;
-        if arm.generation != binding.generation {
+        if arm.generation != binding.generation
+            || arm.seat_id != binding.seat_id
+            || arm.coverage_until <= self.now
+        {
             return Err(PersistError::Unauthorized);
         }
         let attachment = self
@@ -1450,34 +1695,38 @@ impl FakePersist {
         if attachment.birth_id != binding.birth_id
             || attachment.seat_id != binding.seat_id
             || attachment.arm_id != binding.arm_id
+            || attachment.generation != binding.generation
+            || attachment.capability != arm.capability
+            || attachment.lease_until <= self.now
         {
             return Err(PersistError::Unauthorized);
         }
-        if !self.births.contains_key(&binding.birth_id) {
+        let birth = self
+            .births
+            .get(&binding.birth_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if birth.revoked
+            || birth.arm_id != binding.arm_id
+            || birth.seat_id != binding.seat_id
+            || birth.generation != binding.generation
+            || birth.capability != arm.capability
+            || birth.lease_until <= self.now
+        {
             return Err(PersistError::Unauthorized);
         }
-        if self.attempt_lost(&binding.attempt_id) {
+        if grant.lease_until > attachment.lease_until
+            || grant.lease_until > birth.lease_until
+            || grant.lease_until > arm.coverage_until
+        {
+            return Err(PersistError::Unauthorized);
+        }
+        if self.attempt_lost(&binding.attempt_id)
+            || self.handled_complete(&binding.attempt_id)
+            || self.attempt_terminal(&binding.attempt_id)
+        {
             return Err(PersistError::InvalidTransition);
         }
-        match operation {
-            // Fresh retrieval needs an unconsumed, unclosed attempt: fully
-            // handled plus terminal closes it. Either state alone still
-            // permits retrieval so a late helper can complete the join.
-            HelperOperation::Retrieve => {
-                if self.handled_complete(&binding.attempt_id)
-                    && self.attempt_terminal(&binding.attempt_id)
-                {
-                    return Err(PersistError::InvalidTransition);
-                }
-            }
-            // Fresh acknowledgment needs incomplete coverage; terminal alone
-            // still permits the ack that completes the join.
-            HelperOperation::Acknowledge => {
-                if self.handled_complete(&binding.attempt_id) {
-                    return Err(PersistError::InvalidTransition);
-                }
-            }
-        }
+        let _ = operation;
         Ok(())
     }
 
@@ -1542,6 +1791,7 @@ impl Persist for FakePersist {
             &admission.signal_id,
             &admission.event_refs,
             &admission.payload,
+            admission.coverage.as_ref(),
         );
         if recomputed != admission.claim_digest {
             return Err(PersistError::Conflict);
@@ -1555,6 +1805,9 @@ impl Persist for FakePersist {
         if !refs_match_payload {
             return Err(PersistError::Conflict);
         }
+        if coverage_admission_invalid(admission) {
+            return Err(PersistError::Conflict);
+        }
         if let Some(existing) = self.claims.get(&admission.request_id) {
             let payload_matches = self
                 .payloads
@@ -1565,6 +1818,7 @@ impl Persist for FakePersist {
                 && existing.signal_id == admission.signal_id
                 && existing.event_refs == admission.event_refs
                 && existing.claim_digest == admission.claim_digest
+                && existing.coverage == admission.coverage
                 && payload_matches
             {
                 let attempt_id = self
@@ -1604,6 +1858,7 @@ impl Persist for FakePersist {
             claim_digest: admission.claim_digest.clone(),
             payload_ref: payload_ref.clone(),
             claimed_at: admission.claimed_at,
+            coverage: admission.coverage.clone(),
         };
         self.claims.insert(admission.request_id.clone(), record);
         self.payloads
@@ -2185,7 +2440,10 @@ impl Persist for FakePersist {
 
     fn persist_helper_grant(&mut self, grant: &PersistedHelperGrant) -> Result<(), PersistError> {
         self.validate_grant_mint(grant)?;
-        if let Some(existing) = self.helper_grant_mut(&grant.birth_id, &grant.attempt_id) {
+        if self.grant_identity_retired(grant) {
+            return Err(PersistError::Conflict);
+        }
+        if let Some(existing) = self.helper_grant(&grant.birth_id, &grant.attempt_id) {
             if existing == grant {
                 return Ok(());
             }
@@ -2207,7 +2465,14 @@ impl Persist for FakePersist {
             {
                 return Err(PersistError::Conflict);
             }
-            *existing = grant.clone();
+            let retired = PersistedRetiredGrant {
+                grant_ref: existing.grant_ref.clone(),
+                grant_verifier: existing.grant_verifier,
+            };
+            if let Some(slot) = self.helper_grant_mut(&grant.birth_id, &grant.attempt_id) {
+                *slot = grant.clone();
+            }
+            self.retired_grants.push(retired);
             return Ok(());
         }
         self.grants.push(grant.clone());
@@ -2236,7 +2501,7 @@ impl Persist for FakePersist {
     fn record_retrieve_exchange(
         &mut self,
         exchange: &RetrieveExchange,
-    ) -> Result<IdempotentResult<RecordedRetrieveResult>, PersistError> {
+    ) -> Result<IdempotentResult<AuthorizedRetrieve>, PersistError> {
         // Mandatory on every call including replay: complete binding
         // authentication plus sticky revocation. Lifecycle/timing below
         // applies to unseen requests only.
@@ -2247,11 +2512,23 @@ impl Persist for FakePersist {
         if recomputed != exchange.canonical_body_digest {
             return Err(PersistError::Conflict);
         }
+        if self.ack_replays.contains_key(&exchange.request_id) {
+            return Err(PersistError::Conflict);
+        }
         if let Some(stored) = self.retrieve_replays.get(&exchange.request_id) {
             return if stored.binding_digest == binding_digest
                 && stored.canonical_body_digest == exchange.canonical_body_digest
             {
-                Ok(IdempotentResult::ExactReplay(stored.result.clone()))
+                let permit = Self::mint_retrieve_permit(
+                    &exchange.binding,
+                    &exchange.request_id,
+                    &stored.result,
+                    PermitProvenance::ExactReplay,
+                );
+                Ok(IdempotentResult::ExactReplay(AuthorizedRetrieve {
+                    recorded: stored.result.clone(),
+                    permit,
+                }))
             } else {
                 Err(PersistError::Conflict)
             };
@@ -2290,38 +2567,52 @@ impl Persist for FakePersist {
                 result: result.clone(),
             },
         );
-        Ok(IdempotentResult::Recorded(result))
+        let permit = Self::mint_retrieve_permit(
+            &exchange.binding,
+            &exchange.request_id,
+            &result,
+            PermitProvenance::Fresh,
+        );
+        Ok(IdempotentResult::Recorded(AuthorizedRetrieve {
+            recorded: result,
+            permit,
+        }))
     }
 
     fn materialize_claimed_batch(
         &self,
         binding: &ValidatedHelperBinding,
-        recorded: &RecordedRetrieveResult,
+        permit: ClaimMaterializationPermit,
     ) -> Result<BoundedClaimPayload, PersistError> {
-        // Exact re-presentation: complete binding authentication plus
-        // sticky revocation, then the originating binding identity. Like
-        // replay, this bypasses lifecycle/timing; unlike fresh work it
-        // creates no authority, so presenting old metadata cannot mint any.
         self.authenticate_binding(binding, HelperOperation::Retrieve)?;
         self.enforce_unrevoked(binding)?;
-        let stored = self
-            .retrievals
-            .get(&recorded.retrieval_id)
-            .ok_or(PersistError::Unauthorized)?;
-        if stored.result != *recorded {
+        if permit.grant_ref != binding.grant_ref
+            || permit.binding_digest != canonical_binding_digest(binding)
+            || permit.claim_digest != binding.claim_digest
+        {
             return Err(PersistError::Unauthorized);
         }
-        if stored.binding_digest != canonical_binding_digest(binding) {
+        let stored = self
+            .retrievals
+            .get(&permit.retrieval_id)
+            .ok_or(PersistError::Unauthorized)?;
+        if stored.binding_digest != permit.binding_digest
+            || stored.result.retrieval_id != permit.retrieval_id
+            || stored.result.claim_payload_ref != permit.payload_ref
+        {
             return Err(PersistError::Unauthorized);
         }
         let claim = self
             .claim_for_attempt(&binding.attempt_id)
             .ok_or(PersistError::Unauthorized)?;
-        if claim.payload_ref != recorded.claim_payload_ref {
+        if claim.payload_ref != permit.payload_ref || claim.claim_digest != permit.claim_digest {
             return Err(PersistError::Unauthorized);
         }
+        if permit.provenance == PermitProvenance::Fresh {
+            self.authorize_fresh_use(binding, HelperOperation::Retrieve)?;
+        }
         self.payloads
-            .get(&recorded.claim_payload_ref)
+            .get(&permit.payload_ref)
             .cloned()
             .ok_or(PersistError::PayloadUnavailable)
     }
@@ -2344,6 +2635,9 @@ impl Persist for FakePersist {
             &request.cursor,
         );
         if recomputed != request.canonical_body_digest {
+            return Err(PersistError::Conflict);
+        }
+        if self.retrieve_replays.contains_key(&request.request_id) {
             return Err(PersistError::Conflict);
         }
         if let Some(stored) = self.ack_replays.get(&request.request_id) {
@@ -2378,6 +2672,10 @@ impl Persist for FakePersist {
             .iter()
             .position(|event_ref| event_ref == &request.cursor)
             .ok_or(PersistError::Unauthorized)?;
+        let proved_through = proved_ack_index(&claim, refs)?;
+        if position > proved_through {
+            return Err(PersistError::InvalidTransition);
+        }
         let newest_position = refs
             .len()
             .checked_sub(1)
@@ -2461,13 +2759,7 @@ impl Persist for FakePersist {
     }
 
     fn recover_authority_state(&mut self) -> Result<RecoverySnapshot, PersistError> {
-        for state in self.ownership.values_mut() {
-            if let ThreadOwnershipState::Reserved { create_attempt_id } = state {
-                *state = ThreadOwnershipState::Unknown {
-                    create_attempt_id: create_attempt_id.clone(),
-                };
-            }
-        }
+        self.quarantine_reserved_ownership();
         let interrupted_facts: Vec<_> = self
             .write_evidence
             .iter()
@@ -2504,6 +2796,9 @@ impl Persist for FakePersist {
             if let Some(reservation) = self.reservations.get_mut(&attempt_id) {
                 reservation.concluded = true;
             }
+        }
+        if self.helper_request_nonce_collision() {
+            return Err(PersistError::Conflict);
         }
         let helper_sections = self.helper_snapshot();
         Ok(RecoverySnapshot {
@@ -2551,6 +2846,7 @@ impl Persist for FakePersist {
             prewrite_conclusions: self.prewrite.values().cloned().collect(),
             active_observations: self.active_observations.values().cloned().collect(),
             helper_grants: helper_sections.grants,
+            retired_helper_grants: helper_sections.retired_grants,
             retrieve_replays: helper_sections.retrieve_replays,
             retrieval_bindings: helper_sections.retrieval_bindings,
             ack_replays: helper_sections.ack_replays,
@@ -3161,6 +3457,7 @@ mod tests {
                 &admission.signal_id,
                 &admission.event_refs,
                 &admission.payload,
+                admission.coverage.as_ref(),
             )
         };
         let baseline = digest_of(&admission);
@@ -3289,6 +3586,7 @@ mod tests {
             &reordered.signal_id,
             &reordered.event_refs,
             &reordered.payload,
+            reordered.coverage.as_ref(),
         );
         assert_eq!(
             store.admit_claim(&reordered, &attachment),
@@ -3305,6 +3603,7 @@ mod tests {
             &dropped.signal_id,
             &dropped.event_refs,
             &dropped.payload,
+            dropped.coverage.as_ref(),
         );
         assert_eq!(
             store.admit_claim(&dropped, &attachment),
@@ -3439,6 +3738,9 @@ mod tests {
     fn helper_store_events(events: &[(&str, &str)]) -> HelperSetup {
         let mut store = FakePersist::default();
         let (birth, create) = birth();
+        let lease_until = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+        let mut birth = birth;
+        birth.lease_until = lease_until;
         store
             .reserve_controller_birth(&birth, &create)
             .expect("reserve");
@@ -3451,7 +3753,6 @@ mod tests {
                 coverage_until: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(600),
             })
             .expect("arm");
-        let lease_until = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
         let attempt_id = AttemptId::new("attempt-a").expect("attempt");
         let signal_id = SignalId::new("signal-a").expect("signal");
         let wire: Vec<ProviderEvent> = events
@@ -3516,6 +3817,27 @@ mod tests {
             binding,
             attempt_id,
             lease_until,
+        }
+    }
+
+    fn expect_recorded_retrieve(
+        result: Result<IdempotentResult<AuthorizedRetrieve>, PersistError>,
+    ) -> AuthorizedRetrieve {
+        match result.expect("retrieve") {
+            IdempotentResult::Recorded(authorized) => authorized,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        }
+    }
+
+    fn assert_retrieve_replay(
+        result: Result<IdempotentResult<AuthorizedRetrieve>, PersistError>,
+        expected: &RecordedRetrieveResult,
+    ) {
+        match result.expect("replay") {
+            IdempotentResult::ExactReplay(authorized) => {
+                assert_eq!(&authorized.recorded, expected);
+            }
+            IdempotentResult::Recorded(_) => panic!("expected exact retrieve replay"),
         }
     }
 
@@ -3652,14 +3974,8 @@ mod tests {
         let at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7);
         setup.store.set_now(at);
         let exchange = retrieve_for(&setup.binding, 21);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         assert_eq!(recorded.newest_event_ref.as_str(), "event-b");
         assert_eq!(recorded.event_count, 2);
         assert_eq!(recorded.retrieved_at, at);
@@ -3669,11 +3985,7 @@ mod tests {
             .expect("claim");
         assert_eq!(recorded.claim_payload_ref, claim.payload_ref);
 
-        let replay = setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("replay");
-        assert_eq!(replay, IdempotentResult::ExactReplay(recorded.clone()));
+        assert_retrieve_replay(setup.store.record_retrieve_exchange(&exchange), &recorded);
 
         // Same nonce, changed body digest conflicts.
         let mut conflict = retrieve_for(&setup.binding, 21);
@@ -3682,13 +3994,13 @@ mod tests {
             setup.store.record_retrieve_exchange(&conflict),
             Err(PersistError::Conflict)
         );
-        // Same nonce, changed binding conflicts: the sealed digest no
-        // longer matches the presented fields.
+        // Same nonce, changed binding fails authentication before replay
+        // lookup: lease identity must match the grant exactly.
         let mut rebound = retrieve_for(&setup.binding, 21);
         rebound.binding.lease_until += time::Duration::seconds(1);
         assert_eq!(
             setup.store.record_retrieve_exchange(&rebound),
-            Err(PersistError::Conflict)
+            Err(PersistError::Unauthorized)
         );
         // Neither rejection mutated the replay registry.
         assert_eq!(setup.store.retrieve_replays.len(), 1);
@@ -3758,17 +4070,11 @@ mod tests {
     fn materialize_round_trip_and_mismatches() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 41);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let payload = setup
             .store
-            .materialize_claimed_batch(&setup.binding, &recorded)
+            .materialize_claimed_batch(&setup.binding, authorized.permit)
             .expect("materialize");
         let bodies: Vec<&str> = payload
             .events
@@ -3778,30 +4084,29 @@ mod tests {
             .collect();
         assert_eq!(bodies, vec!["test-a", "test-b"]);
 
-        // Unknown retrieval fails closed.
-        let mut unknown = recorded.clone();
-        unknown.retrieval_id = RetrievalId::fixture(99);
-        assert_eq!(
+        // A substituted binding cannot consume the origin permit.
+        let mut forged = mutated_binding(&setup.binding);
+        forged.grant_ref = VerifierRef::fixture(10);
+        let again = expect_recorded_retrieve(
             setup
                 .store
-                .materialize_claimed_batch(&setup.binding, &unknown),
-            Err(PersistError::Unauthorized)
+                .record_retrieve_exchange(&retrieve_for(&setup.binding, 42)),
         );
-        // Tampered recorded result fails closed.
-        let mut tampered = recorded.clone();
-        tampered.newest_event_ref = EventRef::new("event-a").expect("ref");
         assert_eq!(
-            setup
-                .store
-                .materialize_claimed_batch(&setup.binding, &tampered),
+            setup.store.materialize_claimed_batch(&forged, again.permit),
             Err(PersistError::Unauthorized)
         );
         // Missing payload fails closed.
+        let missing = expect_recorded_retrieve(
+            setup
+                .store
+                .record_retrieve_exchange(&retrieve_for(&setup.binding, 43)),
+        );
         assert!(setup.store.drop_payload(&recorded.claim_payload_ref));
         assert_eq!(
             setup
                 .store
-                .materialize_claimed_batch(&setup.binding, &recorded),
+                .materialize_claimed_batch(&setup.binding, missing.permit),
             Err(PersistError::PayloadUnavailable)
         );
     }
@@ -3838,14 +4143,8 @@ mod tests {
         let at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(9);
         setup.store.set_now(at);
         let exchange = retrieve_for(&setup.binding, 51);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         // Partial prefix coverage.
         let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 52);
         let accepted = match setup
@@ -3925,14 +4224,8 @@ mod tests {
             ("event-c", "test-c"),
         ]);
         let exchange = retrieve_for(&setup.binding, 58);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 59);
         let accepted = match setup
             .store
@@ -3984,14 +4277,8 @@ mod tests {
     fn acknowledge_rejects_unknown_cursor_retrieval_and_operation() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 61);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         // Cursor never delivered.
         let bad_cursor = ack_for(&setup.binding, &recorded.retrieval_id, "event-zzz", 62);
         assert_eq!(
@@ -4050,14 +4337,8 @@ mod tests {
         );
         // Handled without newest and without terminal still waits for handled.
         let exchange = retrieve_for(&setup.binding, 71);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let partial = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 72);
         setup
             .store
@@ -4114,14 +4395,8 @@ mod tests {
     fn rearm_join_rejects_mismatched_scope() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 81);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 82);
         setup
             .store
@@ -4166,14 +4441,8 @@ mod tests {
     fn snapshot_carries_helper_sections_without_bodies() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 91);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 92);
         setup
             .store
@@ -4210,16 +4479,12 @@ mod tests {
         assert!(setup.store.retrievals.is_empty());
         // The forged ref also fails materialize and ack admission.
         let good = retrieve_for(&setup.binding, 102);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&good)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&good));
+        let recorded = authorized.recorded.clone();
         assert_eq!(
-            setup.store.materialize_claimed_batch(&forged, &recorded),
+            setup
+                .store
+                .materialize_claimed_batch(&forged, authorized.permit),
             Err(PersistError::Unauthorized)
         );
         let ack = ack_for(&forged, &recorded.retrieval_id, "event-a", 103);
@@ -4344,7 +4609,7 @@ mod tests {
             Err(PersistError::Conflict)
         );
         setup.store.turn_facts.remove(&setup.attempt_id);
-        // A recognized terminal alone still permits mint.
+        // Terminal alone, handled-only, or both each refuse mint.
         setup.store.turn_facts.insert(
             setup.attempt_id.clone(),
             vec![NativeTurnFact::Terminal {
@@ -4352,25 +4617,30 @@ mod tests {
                 class: crate::controller::TerminalClass::Succeeded,
             }],
         );
-        setup
-            .store
-            .persist_helper_grant(&live)
-            .expect("mint under terminal alone");
-        // Full handled coverage plus terminal closes mint.
+        assert_eq!(
+            setup.store.persist_helper_grant(&live),
+            Err(PersistError::Conflict)
+        );
+        setup.store.turn_facts.remove(&setup.attempt_id);
         let exchange = retrieve_for(&setup.binding, 108);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 109);
         setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &full)
             .expect("full ack");
+        assert_eq!(
+            setup.store.persist_helper_grant(&live),
+            Err(PersistError::Conflict)
+        );
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(7),
+                class: crate::controller::TerminalClass::Succeeded,
+            }],
+        );
         assert_eq!(
             setup.store.persist_helper_grant(&live),
             Err(PersistError::Conflict)
@@ -4457,14 +4727,8 @@ mod tests {
     fn exact_replay_bypasses_lifecycle_fresh_does_not() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 121);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         // Expiry: fresh fails, exact replay returns the recorded result.
         setup
             .store
@@ -4474,10 +4738,7 @@ mod tests {
             setup.store.record_retrieve_exchange(&expired),
             Err(PersistError::Unauthorized)
         );
-        assert_eq!(
-            setup.store.record_retrieve_exchange(&exchange),
-            Ok(IdempotentResult::ExactReplay(recorded.clone()))
-        );
+        assert_retrieve_replay(setup.store.record_retrieve_exchange(&exchange), &recorded);
         // Controller loss: fresh refused, replay survives.
         setup.store.set_now(OffsetDateTime::UNIX_EPOCH);
         setup.store.turn_facts.insert(
@@ -4489,10 +4750,7 @@ mod tests {
             setup.store.record_retrieve_exchange(&lost),
             Err(PersistError::InvalidTransition)
         );
-        assert_eq!(
-            setup.store.record_retrieve_exchange(&exchange),
-            Ok(IdempotentResult::ExactReplay(recorded.clone()))
-        );
+        assert_retrieve_replay(setup.store.record_retrieve_exchange(&exchange), &recorded);
         // Generation advance: fresh unauthorized, replay survives.
         setup.store.turn_facts.remove(&setup.attempt_id);
         setup
@@ -4510,10 +4768,7 @@ mod tests {
             setup.store.record_retrieve_exchange(&advanced),
             Err(PersistError::Unauthorized)
         );
-        assert_eq!(
-            setup.store.record_retrieve_exchange(&exchange),
-            Ok(IdempotentResult::ExactReplay(recorded.clone()))
-        );
+        assert_retrieve_replay(setup.store.record_retrieve_exchange(&exchange), &recorded);
         assert_eq!(setup.store.retrieve_replays.len(), 1);
         // Revocation ends even replay.
         setup
@@ -4544,26 +4799,20 @@ mod tests {
     fn retrieve_fresh_refused_after_handled_and_terminal() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 131);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 132);
         setup
             .store
             .acknowledge_retrieved_batch(&setup.binding, &full)
             .expect("full ack");
-        // Full handling alone still permits a late retrieve.
+        // Handled-only, terminal-only, and both each refuse fresh retrieve.
         let late = retrieve_for(&setup.binding, 133);
-        assert!(matches!(
+        assert_eq!(
             setup.store.record_retrieve_exchange(&late),
-            Ok(IdempotentResult::Recorded(_))
-        ));
-        // Full handling plus recognized terminal closes fresh retrieval.
+            Err(PersistError::InvalidTransition)
+        );
+        setup.store.handled.remove(&setup.attempt_id);
         setup.store.turn_facts.insert(
             setup.attempt_id.clone(),
             vec![NativeTurnFact::Terminal {
@@ -4571,46 +4820,49 @@ mod tests {
                 class: crate::controller::TerminalClass::Succeeded,
             }],
         );
-        let closed = retrieve_for(&setup.binding, 134);
+        let terminal_only = retrieve_for(&setup.binding, 134);
         assert_eq!(
-            setup.store.record_retrieve_exchange(&closed),
+            setup.store.record_retrieve_exchange(&terminal_only),
             Err(PersistError::InvalidTransition)
         );
-        assert_eq!(setup.store.retrieve_replays.len(), 2);
-        // Exact prior replay still returns its recorded result.
-        assert_eq!(
-            setup.store.record_retrieve_exchange(&exchange),
-            Ok(IdempotentResult::ExactReplay(recorded))
-        );
+        assert_eq!(setup.store.retrieve_replays.len(), 1);
+        assert_retrieve_replay(setup.store.record_retrieve_exchange(&exchange), &recorded);
     }
 
     #[test]
     fn materialize_representation_cannot_mint_authority() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 141);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
-        // Re-presentation after expiry still serves the recorded batch,
-        // but no fresh authority can be created from old metadata.
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         setup
             .store
             .set_now(setup.lease_until + time::Duration::seconds(1));
+        // A fresh permit revalidates lifecycle and fails after expiry.
+        assert_eq!(
+            setup
+                .store
+                .materialize_claimed_batch(&setup.binding, authorized.permit),
+            Err(PersistError::Unauthorized)
+        );
+        let replay = match setup
+            .store
+            .record_retrieve_exchange(&exchange)
+            .expect("replay")
+        {
+            IdempotentResult::ExactReplay(authorized) => authorized,
+            IdempotentResult::Recorded(_) => panic!("expected exact retrieve replay"),
+        };
+        assert_eq!(replay.recorded, recorded);
         setup
             .store
-            .materialize_claimed_batch(&setup.binding, &recorded)
-            .expect("materialize after expiry");
+            .materialize_claimed_batch(&setup.binding, replay.permit)
+            .expect("exact-replay permit after expiry");
         let fresh = retrieve_for(&setup.binding, 142);
         assert_eq!(
             setup.store.record_retrieve_exchange(&fresh),
             Err(PersistError::Unauthorized)
         );
-        // Revocation ends re-presentation too.
         setup.store.set_now(OffsetDateTime::UNIX_EPOCH);
         setup
             .store
@@ -4620,26 +4872,19 @@ mod tests {
                 attempt_id: setup.attempt_id.clone(),
             })
             .expect("revoke");
-        assert_eq!(
-            setup
-                .store
-                .materialize_claimed_batch(&setup.binding, &recorded),
-            Err(PersistError::Unauthorized)
-        );
+        let after_revoke = match setup.store.record_retrieve_exchange(&exchange) {
+            Err(PersistError::Unauthorized) => true,
+            other => panic!("expected unauthorized replay after revoke, got {other:?}"),
+        };
+        assert!(after_revoke);
     }
 
     #[test]
     fn ack_fresh_refused_after_loss_replay_survives() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 151);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 152);
         let accepted = match setup
             .store
@@ -4678,28 +4923,33 @@ mod tests {
     #[test]
     fn second_binding_cannot_reuse_retrieval() {
         let mut setup = helper_store();
-        let mut second = mutated_binding(&setup.binding);
-        second.lease_until += time::Duration::seconds(30);
         let first = retrieve_for(&setup.binding, 161);
-        let recorded = match setup
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&first));
+        let recorded = authorized.recorded.clone();
+        let mut rotated = setup
             .store
-            .record_retrieve_exchange(&first)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
-        // The second binding is independently valid: its own retrieve
-        // records.
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("stored grant")
+            .clone();
+        rotated.grant_verifier = [0x34; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
+        setup
+            .store
+            .persist_helper_grant(&rotated)
+            .expect("re-issue");
+        let mut second = mutated_binding(&setup.binding);
+        second.grant_ref = VerifierRef::fixture(10);
+        // Replacement binding is independently valid but cannot consume the
+        // originating retrieval or its permit.
         let own = retrieve_for(&second, 162);
         assert!(matches!(
             setup.store.record_retrieve_exchange(&own),
             Ok(IdempotentResult::Recorded(_))
         ));
-        // But it cannot materialize or acknowledge the first binding's
-        // retrieval.
         assert_eq!(
-            setup.store.materialize_claimed_batch(&second, &recorded),
+            setup
+                .store
+                .materialize_claimed_batch(&second, authorized.permit),
             Err(PersistError::Unauthorized)
         );
         let cross = ack_for(&second, &recorded.retrieval_id, "event-a", 163);
@@ -4707,29 +4957,19 @@ mod tests {
             setup.store.acknowledge_retrieved_batch(&second, &cross),
             Err(PersistError::Unauthorized)
         );
-        // Origin binding replay and materialize are intact.
+        // Origin binding is fenced by rotation.
         assert_eq!(
             setup.store.record_retrieve_exchange(&first),
-            Ok(IdempotentResult::ExactReplay(recorded.clone()))
+            Err(PersistError::Unauthorized)
         );
-        setup
-            .store
-            .materialize_claimed_batch(&setup.binding, &recorded)
-            .expect("origin materialize");
     }
 
     #[test]
     fn ack_changed_fields_with_reused_digest_conflict() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 171);
-        let recorded = match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        };
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         let first = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 172);
         let accepted = match setup
             .store
@@ -4759,14 +4999,8 @@ mod tests {
         );
         // A changed retrieval likewise conflicts.
         let other = retrieve_for(&setup.binding, 173);
-        let recorded_other = match setup
-            .store
-            .record_retrieve_exchange(&other)
-            .expect("second retrieve")
-        {
-            IdempotentResult::Recorded(result) => result,
-            IdempotentResult::ExactReplay(_) => panic!("new retrieve must record"),
-        };
+        let recorded_other =
+            expect_recorded_retrieve(setup.store.record_retrieve_exchange(&other)).recorded;
         let swapped = ack_for(&setup.binding, &recorded_other.retrieval_id, "event-a", 172);
         assert_eq!(
             setup
@@ -4794,24 +5028,131 @@ mod tests {
     fn retrieve_reused_nonce_over_changed_binding_conflicts() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 181);
-        match setup
-            .store
-            .record_retrieve_exchange(&exchange)
-            .expect("retrieve")
-        {
-            IdempotentResult::Recorded(_) => {}
-            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
-        }
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
         // Same nonce with a correctly derived digest for a changed
-        // binding still conflicts on the recorded identity.
+        // binding fails authentication (exact lease identity).
         let mut second = mutated_binding(&setup.binding);
         second.lease_until += time::Duration::seconds(30);
         let rebound = retrieve_for(&second, 181);
         assert_eq!(
             setup.store.record_retrieve_exchange(&rebound),
+            Err(PersistError::Unauthorized)
+        );
+        assert_eq!(setup.store.retrieve_replays.len(), 1);
+        // Shared nonce namespace: ACK cannot reuse a Retrieve nonce.
+        let ack = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 181);
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &ack),
+            Err(PersistError::Conflict)
+        );
+        assert!(setup.store.ack_replays.is_empty());
+        let ack_ok = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 182);
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &ack_ok)
+            .expect("ack");
+        let retrieve_reuse = retrieve_for(&setup.binding, 182);
+        assert_eq!(
+            setup.store.record_retrieve_exchange(&retrieve_reuse),
             Err(PersistError::Conflict)
         );
         assert_eq!(setup.store.retrieve_replays.len(), 1);
+    }
+
+    #[test]
+    fn retired_grant_cannot_be_resurrected() {
+        let mut setup = helper_store();
+        let original = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("stored grant")
+            .clone();
+        let mut rotated = original.clone();
+        rotated.grant_verifier = [0x34; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
+        setup
+            .store
+            .persist_helper_grant(&rotated)
+            .expect("rotate to B");
+        assert_eq!(
+            setup.store.persist_helper_grant(&original),
+            Err(PersistError::Conflict)
+        );
+        let mut alias = original.clone();
+        alias.grant_ref = VerifierRef::fixture(11);
+        assert_eq!(
+            setup.store.persist_helper_grant(&alias),
+            Err(PersistError::Conflict)
+        );
+        setup
+            .store
+            .persist_helper_grant(&rotated)
+            .expect("current grant remains idempotent");
+        let snapshot = setup.store.recover_authority_state().expect("recover");
+        assert_eq!(snapshot.retired_helper_grants.len(), 1);
+        assert_eq!(
+            snapshot.retired_helper_grants[0].grant_ref,
+            VerifierRef::fixture(9)
+        );
+    }
+
+    #[test]
+    fn ack_refuses_unproven_newest_jump() {
+        let mut setup = helper_store_events(&[
+            ("event-a", "test-a"),
+            ("event-b", "test-b"),
+            ("event-c", "test-c"),
+        ]);
+        let claim_id = setup
+            .store
+            .claim_for_attempt(&setup.attempt_id)
+            .expect("claim")
+            .request_id
+            .clone();
+        if let Some(claim) = setup.store.claims.get_mut(&claim_id) {
+            claim.coverage = None;
+        }
+        let authorized = expect_recorded_retrieve(
+            setup
+                .store
+                .record_retrieve_exchange(&retrieve_for(&setup.binding, 191)),
+        );
+        let jump = ack_for(
+            &setup.binding,
+            &authorized.recorded.retrieval_id,
+            "event-c",
+            192,
+        );
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &jump),
+            Err(PersistError::InvalidTransition)
+        );
+        assert!(setup.store.handled.is_empty());
+        let first = ack_for(
+            &setup.binding,
+            &authorized.recorded.retrieval_id,
+            "event-a",
+            193,
+        );
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &first)
+            .expect("first event without proof");
+        assert_eq!(
+            setup
+                .store
+                .handled
+                .get(&setup.attempt_id)
+                .expect("coverage")
+                .cursor
+                .as_str(),
+            "event-a"
+        );
     }
 
     #[test]
