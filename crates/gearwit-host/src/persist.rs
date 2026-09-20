@@ -141,6 +141,7 @@ pub struct ClaimDrainWitness {
     pub(crate) provider: ProviderName,
     pub(crate) drain_filter_scope: BoundedToken<64>,
     pub(crate) event_refs: BoundedVec<EventRef, 1, 64>,
+    pub(crate) source_evidence_id: [u8; 32],
 }
 
 /// Sealed, bounded claim-coverage proof. Presence or absence participates in
@@ -247,6 +248,7 @@ fn mac_drain_witness(hasher: &mut blake3::Hasher, witness: Option<&ClaimDrainWit
             for event_ref in drain.event_refs.as_slice() {
                 mac_field(hasher, event_ref.as_str().as_bytes());
             }
+            mac_field(hasher, &drain.source_evidence_id);
         }
     }
 }
@@ -264,6 +266,20 @@ fn covered_drain_prefix<'a>(
         .iter()
         .position(|event_ref| event_ref == &evidence.covered_through)?;
     Some(&drain[..=covered_at])
+}
+
+fn insert_unique<K: Ord, V>(
+    map: &mut BTreeMap<K, V>,
+    key: K,
+    value: V,
+) -> Result<(), PersistError> {
+    match map.entry(key) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(value);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(_) => Err(PersistError::Conflict),
+    }
 }
 
 fn claim_is_drain_prefix(claim_refs: &[EventRef], drain: &[EventRef]) -> bool {
@@ -292,6 +308,8 @@ fn coverage_pair_invalid(
                 || evidence.provider != witness.provider
                 || evidence.drain_filter_scope != witness.drain_filter_scope
                 || evidence.source_evidence_id == [0; 32]
+                || witness.source_evidence_id == [0; 32]
+                || evidence.source_evidence_id != witness.source_evidence_id
                 || evidence.event_batch_digest != canonical_event_batch_digest(event_refs)
                 || prefix.is_none()
                 || !claim_is_drain_prefix(event_refs.as_slice(), witness.event_refs.as_slice())
@@ -423,6 +441,7 @@ pub(crate) fn synthetic_drain_witness(
         provider: payload.events.as_slice()[0].provider.clone(),
         drain_filter_scope: BoundedToken::new("fixture-drain").expect("scope"),
         event_refs: event_refs.clone(),
+        source_evidence_id: [0x42; 32],
     }
 }
 
@@ -447,7 +466,7 @@ pub(crate) fn synthetic_claim_coverage(
         drain_baseline: drain.event_refs.as_slice()[0].clone(),
         event_batch_digest: canonical_event_batch_digest(event_refs),
         covered_through: event_refs.as_slice()[event_refs.as_slice().len() - 1].clone(),
-        source_evidence_id: [0x42; 32],
+        source_evidence_id: drain.source_evidence_id,
     }
 }
 
@@ -1584,6 +1603,14 @@ impl FakePersist {
                 return Err(PersistError::Conflict);
             }
             if let Some(payload) = payload {
+                let refs_match = claim.event_refs.as_slice().iter().eq(payload
+                    .events
+                    .as_slice()
+                    .iter()
+                    .map(|record| &record.event_ref));
+                if !refs_match {
+                    return Err(PersistError::Conflict);
+                }
                 let digest = canonical_claim_digest(
                     &claim.request_id,
                     &claim.arm_id,
@@ -1618,51 +1645,183 @@ impl FakePersist {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_lines)]
     fn restore_from_snapshot(
         snapshot: RecoverySnapshot,
         payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
     ) -> Result<Self, PersistError> {
         let mut store = Self::default();
         for arm in snapshot.arms {
-            store.arms.insert(arm.arm_id.clone(), arm);
+            insert_unique(&mut store.arms, arm.arm_id.clone(), arm)?;
         }
         for claim in snapshot.claims {
-            store
-                .claim_attempts
-                .insert(claim.request_id.clone(), claim.attempt_id.clone());
-            store.claims.insert(claim.request_id.clone(), claim);
+            insert_unique(
+                &mut store.claim_attempts,
+                claim.request_id.clone(),
+                claim.attempt_id.clone(),
+            )?;
+            insert_unique(&mut store.claims, claim.request_id.clone(), claim)?;
         }
         store.payloads = payloads;
         for attachment in snapshot.attachments {
-            store
-                .attachments
-                .insert(attachment.attempt_id.clone(), attachment);
+            insert_unique(
+                &mut store.attachments,
+                attachment.attempt_id.clone(),
+                attachment,
+            )?;
         }
         for birth in snapshot.controller_births {
-            store.births.insert(birth.birth_id.clone(), birth);
+            insert_unique(&mut store.births, birth.birth_id.clone(), birth)?;
+        }
+        for ownership in snapshot.ownership {
+            insert_unique(
+                &mut store.ownership,
+                ownership.birth_id.clone(),
+                ownership.state,
+            )?;
+        }
+        for correlation in snapshot.turn_correlations {
+            insert_unique(
+                &mut store.prepared,
+                correlation.attempt_id.clone(),
+                correlation,
+            )?;
+        }
+        for reservation in snapshot.reservations {
+            insert_unique(
+                &mut store.reservations,
+                reservation.correlation.attempt_id.clone(),
+                reservation,
+            )?;
+        }
+        for evidence in snapshot.native_write_evidence {
+            insert_unique(
+                &mut store.write_evidence,
+                evidence.correlation.attempt_id.clone(),
+                evidence.evidence,
+            )?;
+            insert_unique(
+                &mut store.write_evidence_refs,
+                evidence.correlation.attempt_id.clone(),
+                evidence.evidence_ref,
+            )?;
+        }
+        for facts in snapshot.native_turn_facts {
+            insert_unique(&mut store.turn_facts, facts.attempt_id.clone(), facts.facts)?;
+        }
+        for reconciliation in snapshot.reconciliations {
+            insert_unique(
+                &mut store.reconciliations,
+                reconciliation.attempt_id.clone(),
+                reconciliation.disposition,
+            )?;
+        }
+        for conclusion in snapshot.prewrite_conclusions {
+            insert_unique(
+                &mut store.prewrite,
+                conclusion.attempt_id.clone(),
+                conclusion,
+            )?;
+        }
+        for observation in snapshot.active_observations {
+            insert_unique(
+                &mut store.active_observations,
+                observation.attempt_id.clone(),
+                observation,
+            )?;
         }
         store.grants = snapshot.helper_grants;
         store.retired_grants = snapshot.retired_helper_grants;
         for replay in snapshot.retrieve_replays {
-            store
-                .retrieve_replays
-                .insert(replay.request_id.clone(), replay);
+            insert_unique(
+                &mut store.retrieve_replays,
+                replay.request_id.clone(),
+                replay,
+            )?;
         }
         for record in snapshot.retrieval_bindings {
-            store.retrievals.insert(record.retrieval_id.clone(), record);
+            insert_unique(&mut store.retrievals, record.retrieval_id.clone(), record)?;
         }
         for replay in snapshot.ack_replays {
-            store.ack_replays.insert(replay.request_id.clone(), replay);
+            insert_unique(&mut store.ack_replays, replay.request_id.clone(), replay)?;
         }
         for coverage in snapshot.handled_coverage {
-            store.handled.insert(coverage.attempt_id.clone(), coverage);
+            insert_unique(&mut store.handled, coverage.attempt_id.clone(), coverage)?;
+        }
+        for join in snapshot.rearmed_joins {
+            let key = (
+                join.arm_id.clone(),
+                join.generation,
+                join.attempt_id.clone(),
+                join.signal_id.clone(),
+            );
+            if !store.rearmed.insert(key) {
+                return Err(PersistError::Conflict);
+            }
         }
         store.attempt_seq = snapshot.attempt_seq;
         if store.helper_request_nonce_collision() {
             return Err(PersistError::Conflict);
         }
         store.validate_recovered_coverage()?;
+        store.validate_restored_helper_invariants()?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    fn validate_restored_helper_invariants(&self) -> Result<(), PersistError> {
+        let mut grant_keys = BTreeSet::new();
+        for grant in &self.grants {
+            if !grant_keys.insert((grant.birth_id.clone(), grant.attempt_id.clone())) {
+                return Err(PersistError::Conflict);
+            }
+            if self.grant_identity_retired(grant) {
+                return Err(PersistError::Conflict);
+            }
+        }
+        for replay in self.retrieve_replays.values() {
+            let stored = self
+                .retrievals
+                .get(&replay.result.retrieval_id)
+                .ok_or(PersistError::Conflict)?;
+            if stored.binding_digest != replay.binding_digest || stored.result != replay.result {
+                return Err(PersistError::Conflict);
+            }
+        }
+        for replay in self.ack_replays.values() {
+            let stored = self
+                .retrievals
+                .get(&replay.retrieval_id)
+                .ok_or(PersistError::Conflict)?;
+            if stored.result.retrieval_id != replay.retrieval_id {
+                return Err(PersistError::Conflict);
+            }
+        }
+        for coverage in self.handled.values() {
+            let claim = self
+                .claim_for_attempt(&coverage.attempt_id)
+                .ok_or(PersistError::Conflict)?;
+            if !claim
+                .event_refs
+                .as_slice()
+                .iter()
+                .any(|event_ref| event_ref == &coverage.cursor)
+            {
+                return Err(PersistError::Conflict);
+            }
+        }
+        for (arm_id, generation, attempt_id, signal_id) in &self.rearmed {
+            let claim = self
+                .claim_for_attempt(attempt_id)
+                .ok_or(PersistError::Conflict)?;
+            if claim.arm_id != *arm_id
+                || claim.generation != *generation
+                || claim.signal_id != *signal_id
+            {
+                return Err(PersistError::Conflict);
+            }
+        }
+        Ok(())
     }
 
     fn mint_retrieve_permit(
@@ -5442,7 +5601,7 @@ mod tests {
             .coverage
             .as_mut()
             .expect("coverage")
-            .source_evidence_id = [0; 32];
+            .source_evidence_id = [0x43; 32];
         assert!(coverage_pair_invalid(
             claim.coverage.as_ref(),
             claim.drain_witness.as_ref(),
@@ -5600,14 +5759,11 @@ mod tests {
         let exchange = retrieve_for(&setup.binding, 211);
         let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
         let recorded = authorized.recorded.clone();
-        let mut rotated = setup
+        let ack = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 212);
+        setup
             .store
-            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
-            .expect("grant")
-            .clone();
-        rotated.grant_verifier = [0x34; 32];
-        rotated.grant_ref = VerifierRef::fixture(10);
-        setup.store.persist_helper_grant(&rotated).expect("rotate");
+            .acknowledge_retrieved_batch(&setup.binding, &ack)
+            .expect("ack");
         let payloads = setup.store.payloads.clone();
         let snapshot = setup.store.recover_authority_state().expect("snapshot");
         let rendered = format!("{snapshot:?}");
@@ -5615,36 +5771,150 @@ mod tests {
         let mut restored = FakePersist::restore_from_snapshot(snapshot.clone(), payloads.clone())
             .expect("restore");
         restored.set_now(setup.store.now);
-        let mut current = mutated_binding(&setup.binding);
-        current.grant_ref = VerifierRef::fixture(10);
-        let replayed = expect_recorded_retrieve(
-            restored.record_retrieve_exchange(&retrieve_for(&current, 212)),
-        );
+        assert_retrieve_replay(restored.record_retrieve_exchange(&exchange), &recorded);
+        let replayed = match restored
+            .record_retrieve_exchange(&exchange)
+            .expect("replay permit")
+        {
+            IdempotentResult::ExactReplay(authorized) => authorized,
+            IdempotentResult::Recorded(_) => panic!("expected retrieve replay"),
+        };
         restored
-            .materialize_claimed_batch(&current, replayed.permit)
+            .materialize_claimed_batch(&setup.binding, replayed.permit)
             .expect("restored materialize");
-        assert_eq!(
-            restored.record_retrieve_exchange(&exchange),
-            Err(PersistError::Unauthorized)
-        );
-        let mut resurrected = rotated.clone();
-        resurrected.grant_ref = VerifierRef::fixture(9);
-        resurrected.grant_verifier = [0x33; 32];
-        assert_eq!(
-            restored.persist_helper_grant(&resurrected),
-            Err(PersistError::Conflict)
-        );
-        let mut swapped = snapshot;
+        assert!(matches!(
+            restored.acknowledge_retrieved_batch(&setup.binding, &ack),
+            Ok(IdempotentResult::ExactReplay(_))
+        ));
+        let mut swapped = snapshot.clone();
         swapped.claims[0]
             .coverage
             .as_mut()
             .expect("coverage")
             .provider = ProviderName::new("other").expect("provider");
         assert!(matches!(
-            FakePersist::restore_from_snapshot(swapped, payloads),
+            FakePersist::restore_from_snapshot(swapped, payloads.clone()),
             Err(PersistError::Conflict)
         ));
-        let _ = recorded;
+        let mut duplicate = snapshot.clone();
+        duplicate.claims.push(duplicate.claims[0].clone());
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(duplicate, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut overlap = snapshot.clone();
+        overlap.retired_helper_grants.push(PersistedRetiredGrant {
+            grant_ref: VerifierRef::fixture(9),
+            grant_verifier: [0x33; 32],
+        });
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(overlap, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut shortened = snapshot.clone();
+        shortened.claims[0].event_refs =
+            BoundedVec::try_from(vec![EventRef::new("event-a").expect("ref")]).expect("refs");
+        shortened.claims[0].claim_digest = canonical_claim_digest(
+            &shortened.claims[0].request_id,
+            &shortened.claims[0].arm_id,
+            shortened.claims[0].generation,
+            &shortened.claims[0].signal_id,
+            &shortened.claims[0].event_refs,
+            payloads
+                .get(&shortened.claims[0].payload_ref)
+                .expect("payload"),
+            shortened.claims[0].coverage.as_ref(),
+            shortened.claims[0].drain_witness.as_ref(),
+        );
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(shortened, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut swapped_replay = snapshot;
+        swapped_replay.retrieve_replays[0].binding_digest = [0x11; 32];
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(swapped_replay, payloads),
+            Err(PersistError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn restore_preserves_terminal_loss_and_rearm() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 221);
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
+        let full = ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 222);
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &full)
+            .expect("full ack");
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(7),
+                class: crate::controller::TerminalClass::Succeeded,
+            }],
+        );
+        let join = || RearmJoinScope {
+            arm_id: setup.binding.arm_id.clone(),
+            generation: setup.binding.generation,
+            attempt_id: setup.attempt_id.clone(),
+            signal_id: setup.binding.signal_id.clone(),
+        };
+        assert_eq!(
+            setup.store.try_rearm_join(join()),
+            Ok(RearmJoinResult::Rearmed)
+        );
+        let payloads = setup.store.payloads.clone();
+        let snapshot = setup.store.recover_authority_state().expect("snapshot");
+        let mut restored = FakePersist::restore_from_snapshot(snapshot, payloads).expect("restore");
+        restored.set_now(setup.store.now);
+        assert_eq!(
+            restored.record_retrieve_exchange(&retrieve_for(&setup.binding, 223)),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(
+            restored.acknowledge_retrieved_batch(
+                &setup.binding,
+                &ack_for(&setup.binding, &recorded.retrieval_id, "event-b", 224)
+            ),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_retrieve_replay(restored.record_retrieve_exchange(&exchange), &recorded);
+        assert_eq!(
+            restored.try_rearm_join(join()),
+            Ok(RearmJoinResult::AlreadyRearmed)
+        );
+
+        let mut lost = helper_store();
+        let lost_exchange = retrieve_for(&lost.binding, 231);
+        let lost_recorded =
+            expect_recorded_retrieve(lost.store.record_retrieve_exchange(&lost_exchange)).recorded;
+        lost.store.turn_facts.insert(
+            lost.attempt_id.clone(),
+            vec![NativeTurnFact::ControllerLost],
+        );
+        let lost_payloads = lost.store.payloads.clone();
+        let lost_snapshot = lost.store.recover_authority_state().expect("snapshot");
+        let mut lost_restored =
+            FakePersist::restore_from_snapshot(lost_snapshot, lost_payloads).expect("restore");
+        lost_restored.set_now(lost.store.now);
+        assert_eq!(
+            lost_restored.record_retrieve_exchange(&retrieve_for(&lost.binding, 232)),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(
+            lost_restored.acknowledge_retrieved_batch(
+                &lost.binding,
+                &ack_for(&lost.binding, &lost_recorded.retrieval_id, "event-a", 233)
+            ),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_retrieve_replay(
+            lost_restored.record_retrieve_exchange(&lost_exchange),
+            &lost_recorded,
+        );
     }
 
     #[test]
