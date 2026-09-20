@@ -447,6 +447,7 @@ impl<P: Persist> DaemonAuthority<P> {
             &event_refs,
             &payload,
             None,
+            None,
         );
         let admission = ClaimAdmission {
             request_id,
@@ -458,6 +459,7 @@ impl<P: Persist> DaemonAuthority<P> {
             payload,
             claimed_at: self.now,
             coverage: None,
+            drain_witness: None,
         };
         let record = self.persist.admit_claim(&admission, &attachment)?;
         if record.outcome == AdmissionOutcome::ExactReplay {
@@ -479,6 +481,7 @@ impl<P: Persist> DaemonAuthority<P> {
             payload_ref: record.payload_ref.clone(),
             claimed_at: admission.claimed_at,
             coverage: admission.coverage.clone(),
+            drain_witness: admission.drain_witness.clone(),
         };
         self.claims.insert(attempt_id.clone(), claim);
         self.attachments.insert(attempt_id.clone(), attachment);

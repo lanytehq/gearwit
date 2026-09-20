@@ -43,6 +43,7 @@ pub struct PersistedClaimRecord {
     pub payload_ref: ClaimPayloadRef,
     pub claimed_at: OffsetDateTime,
     pub(crate) coverage: Option<ClaimCoverageEvidence>,
+    pub(crate) drain_witness: Option<ClaimDrainWitness>,
 }
 
 /// One validated provider event inside a claimed batch. This is the bounded
@@ -129,6 +130,17 @@ pub struct ClaimAdmission {
     pub(crate) payload: BoundedClaimPayload,
     pub(crate) claimed_at: OffsetDateTime,
     pub(crate) coverage: Option<ClaimCoverageEvidence>,
+    pub(crate) drain_witness: Option<ClaimDrainWitness>,
+}
+
+/// Test-only declared provider drain. Production coverage constructors stay
+/// unavailable until drain integration is qualified. Event refs stay in
+/// declared drain order; they are not sorted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimDrainWitness {
+    pub(crate) provider: ProviderName,
+    pub(crate) drain_filter_scope: BoundedToken<64>,
+    pub(crate) event_refs: BoundedVec<EventRef, 1, 64>,
 }
 
 /// Sealed, bounded claim-coverage proof. Presence or absence participates in
@@ -184,6 +196,7 @@ fn mac_coverage(hasher: &mut blake3::Hasher, coverage: Option<&ClaimCoverageEvid
 /// records (ref, provider, actor presence + value, RFC 3339 time, body),
 /// then coverage presence and fields. Any validated-field change yields a
 /// different digest; transport framing never enters it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn canonical_claim_digest(
     request_id: &ClaimRequestId,
     arm_id: &ArmId,
@@ -192,6 +205,7 @@ pub(crate) fn canonical_claim_digest(
     event_refs: &BoundedVec<EventRef, 1, 64>,
     payload: &BoundedClaimPayload,
     coverage: Option<&ClaimCoverageEvidence>,
+    drain_witness: Option<&ClaimDrainWitness>,
 ) -> ClaimDigest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gearwit.claim-digest.v1\0");
@@ -219,61 +233,127 @@ pub(crate) fn canonical_claim_digest(
         mac_field(&mut hasher, event.body.as_str().as_bytes());
     }
     mac_coverage(&mut hasher, coverage);
+    mac_drain_witness(&mut hasher, drain_witness);
     ClaimDigest::from_bytes(*hasher.finalize().as_bytes())
 }
 
+fn mac_drain_witness(hasher: &mut blake3::Hasher, witness: Option<&ClaimDrainWitness>) {
+    match witness {
+        None => mac_field(hasher, b"\x00"),
+        Some(drain) => {
+            mac_field(hasher, b"\x01");
+            mac_field(hasher, drain.provider.as_str().as_bytes());
+            mac_field(hasher, drain.drain_filter_scope.as_str().as_bytes());
+            for event_ref in drain.event_refs.as_slice() {
+                mac_field(hasher, event_ref.as_str().as_bytes());
+            }
+        }
+    }
+}
+
+fn covered_drain_prefix<'a>(
+    evidence: &ClaimCoverageEvidence,
+    witness: &'a ClaimDrainWitness,
+) -> Option<&'a [EventRef]> {
+    let drain = witness.event_refs.as_slice();
+    let baseline = drain.first()?;
+    if baseline != &evidence.drain_baseline {
+        return None;
+    }
+    let covered_at = drain
+        .iter()
+        .position(|event_ref| event_ref == &evidence.covered_through)?;
+    Some(&drain[..=covered_at])
+}
+
+fn claim_is_drain_prefix(claim_refs: &[EventRef], drain: &[EventRef]) -> bool {
+    claim_refs.len() <= drain.len() && drain[..claim_refs.len()] == *claim_refs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coverage_pair_invalid(
+    evidence: Option<&ClaimCoverageEvidence>,
+    witness: Option<&ClaimDrainWitness>,
+    request_id: &ClaimRequestId,
+    arm_id: &ArmId,
+    generation: u64,
+    signal_id: &SignalId,
+    event_refs: &BoundedVec<EventRef, 1, 64>,
+    payload: Option<&BoundedClaimPayload>,
+) -> bool {
+    match (evidence, witness) {
+        (None, None) => false,
+        (Some(evidence), Some(witness)) => {
+            let prefix = covered_drain_prefix(evidence, witness);
+            evidence.request_id != *request_id
+                || evidence.arm_id != *arm_id
+                || evidence.generation != generation
+                || evidence.signal_id != *signal_id
+                || evidence.provider != witness.provider
+                || evidence.drain_filter_scope != witness.drain_filter_scope
+                || evidence.source_evidence_id == [0; 32]
+                || evidence.event_batch_digest != canonical_event_batch_digest(event_refs)
+                || prefix.is_none()
+                || !claim_is_drain_prefix(event_refs.as_slice(), witness.event_refs.as_slice())
+                || payload.is_some_and(|payload| {
+                    payload
+                        .events
+                        .as_slice()
+                        .iter()
+                        .any(|event| event.provider != evidence.provider)
+                })
+        }
+        (None, Some(_)) | (Some(_), None) => true,
+    }
+}
+
 fn coverage_admission_invalid(admission: &ClaimAdmission) -> bool {
-    let Some(evidence) = admission.coverage.as_ref() else {
-        return false;
-    };
-    evidence.request_id != admission.request_id
-        || evidence.arm_id != admission.arm_id
-        || evidence.generation != admission.generation
-        || evidence.signal_id != admission.signal_id
-        || evidence.event_batch_digest != canonical_event_batch_digest(&admission.event_refs)
-        || !admission
-            .event_refs
-            .as_slice()
-            .iter()
-            .any(|event_ref| event_ref == &evidence.covered_through)
-        || !admission
-            .event_refs
-            .as_slice()
-            .iter()
-            .any(|event_ref| event_ref == &evidence.drain_baseline)
+    coverage_pair_invalid(
+        admission.coverage.as_ref(),
+        admission.drain_witness.as_ref(),
+        &admission.request_id,
+        &admission.arm_id,
+        admission.generation,
+        &admission.signal_id,
+        &admission.event_refs,
+        Some(&admission.payload),
+    )
 }
 
 fn proved_ack_index(
     claim: &PersistedClaimRecord,
     refs: &[EventRef],
+    payload: Option<&BoundedClaimPayload>,
 ) -> Result<usize, PersistError> {
-    match claim.coverage.as_ref() {
-        None => Ok(0),
-        Some(evidence) => {
-            if !coverage_evidence_matches(claim, evidence) {
+    match (claim.coverage.as_ref(), claim.drain_witness.as_ref()) {
+        (None, None) => Ok(0),
+        (Some(evidence), Some(witness)) => {
+            if coverage_pair_invalid(
+                Some(evidence),
+                Some(witness),
+                &claim.request_id,
+                &claim.arm_id,
+                claim.generation,
+                &claim.signal_id,
+                &claim.event_refs,
+                payload,
+            ) {
                 return Err(PersistError::Unauthorized);
             }
-            refs.iter()
-                .position(|event_ref| event_ref == &evidence.covered_through)
-                .ok_or(PersistError::Unauthorized)
+            let prefix =
+                covered_drain_prefix(evidence, witness).ok_or(PersistError::Unauthorized)?;
+            let mut proved = None;
+            for (index, event_ref) in refs.iter().enumerate() {
+                if prefix.iter().any(|covered| covered == event_ref) {
+                    proved = Some(index);
+                } else {
+                    break;
+                }
+            }
+            proved.ok_or(PersistError::Unauthorized)
         }
+        _ => Err(PersistError::Unauthorized),
     }
-}
-
-fn coverage_evidence_matches(
-    claim: &PersistedClaimRecord,
-    evidence: &ClaimCoverageEvidence,
-) -> bool {
-    evidence.request_id == claim.request_id
-        && evidence.arm_id == claim.arm_id
-        && evidence.generation == claim.generation
-        && evidence.signal_id == claim.signal_id
-        && evidence.event_batch_digest == canonical_event_batch_digest(&claim.event_refs)
-        && claim
-            .event_refs
-            .as_slice()
-            .iter()
-            .any(|event_ref| event_ref == &evidence.covered_through)
 }
 
 /// Test-only admission constructor over validated wire events. Panics on
@@ -300,6 +380,7 @@ pub(crate) fn claim_admission_fixture(
     .expect("fixture refs");
     let payload = BoundedClaimPayload::try_from(records).expect("fixture payload");
     let request_id = ClaimRequestId::new(request_id).expect("fixture request id");
+    let drain_witness = Some(synthetic_drain_witness(&payload, &event_refs));
     let coverage = Some(synthetic_claim_coverage(
         &request_id,
         &arm_id,
@@ -307,6 +388,7 @@ pub(crate) fn claim_admission_fixture(
         &signal_id,
         &event_refs,
         &payload,
+        drain_witness.as_ref().expect("fixture drain"),
     ));
     let claim_digest = canonical_claim_digest(
         &request_id,
@@ -316,6 +398,7 @@ pub(crate) fn claim_admission_fixture(
         &event_refs,
         &payload,
         coverage.as_ref(),
+        drain_witness.as_ref(),
     );
     ClaimAdmission {
         request_id,
@@ -327,6 +410,19 @@ pub(crate) fn claim_admission_fixture(
         payload,
         claimed_at,
         coverage,
+        drain_witness,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_drain_witness(
+    payload: &BoundedClaimPayload,
+    event_refs: &BoundedVec<EventRef, 1, 64>,
+) -> ClaimDrainWitness {
+    ClaimDrainWitness {
+        provider: payload.events.as_slice()[0].provider.clone(),
+        drain_filter_scope: BoundedToken::new("fixture-drain").expect("scope"),
+        event_refs: event_refs.clone(),
     }
 }
 
@@ -339,6 +435,7 @@ pub(crate) fn synthetic_claim_coverage(
     signal_id: &SignalId,
     event_refs: &BoundedVec<EventRef, 1, 64>,
     payload: &BoundedClaimPayload,
+    drain: &ClaimDrainWitness,
 ) -> ClaimCoverageEvidence {
     ClaimCoverageEvidence {
         request_id: request_id.clone(),
@@ -346,8 +443,8 @@ pub(crate) fn synthetic_claim_coverage(
         generation,
         signal_id: signal_id.clone(),
         provider: payload.events.as_slice()[0].provider.clone(),
-        drain_filter_scope: BoundedToken::new("fixture-drain").expect("scope"),
-        drain_baseline: event_refs.as_slice()[0].clone(),
+        drain_filter_scope: drain.drain_filter_scope.clone(),
+        drain_baseline: drain.event_refs.as_slice()[0].clone(),
         event_batch_digest: canonical_event_batch_digest(event_refs),
         covered_through: event_refs.as_slice()[event_refs.as_slice().len() - 1].clone(),
         source_evidence_id: [0x42; 32],
@@ -783,10 +880,20 @@ pub struct AuthorizedRetrieve {
 
 /// Retired grant identity. Rotation fences both the grant-ref and the
 /// verifier; neither may be reintroduced as a live credential.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PersistedRetiredGrant {
     pub(crate) grant_ref: VerifierRef,
     pub(crate) grant_verifier: [u8; 32],
+}
+
+impl fmt::Debug for PersistedRetiredGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedRetiredGrant")
+            .field("grant_ref", &self.grant_ref)
+            .field("grant_verifier", &"[redacted]")
+            .finish()
+    }
 }
 
 /// One acknowledge call over an exact prior retrieval.
@@ -1461,6 +1568,42 @@ impl FakePersist {
         }
     }
 
+    fn validate_recovered_coverage(&self) -> Result<(), PersistError> {
+        for claim in self.claims.values() {
+            let payload = self.payloads.get(&claim.payload_ref);
+            if coverage_pair_invalid(
+                claim.coverage.as_ref(),
+                claim.drain_witness.as_ref(),
+                &claim.request_id,
+                &claim.arm_id,
+                claim.generation,
+                &claim.signal_id,
+                &claim.event_refs,
+                payload,
+            ) {
+                return Err(PersistError::Conflict);
+            }
+            if let Some(payload) = payload {
+                let digest = canonical_claim_digest(
+                    &claim.request_id,
+                    &claim.arm_id,
+                    claim.generation,
+                    &claim.signal_id,
+                    &claim.event_refs,
+                    payload,
+                    claim.coverage.as_ref(),
+                    claim.drain_witness.as_ref(),
+                );
+                if digest != claim.claim_digest {
+                    return Err(PersistError::Conflict);
+                }
+            } else if claim.coverage.is_some() || claim.drain_witness.is_some() {
+                return Err(PersistError::PayloadUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     fn helper_request_nonce_collision(&self) -> bool {
         self.retrieve_replays
             .keys()
@@ -1472,6 +1615,54 @@ impl FakePersist {
             retired.grant_ref == grant.grant_ref
                 || bool::from(retired.grant_verifier.ct_eq(&grant.grant_verifier))
         })
+    }
+
+    #[cfg(test)]
+    fn restore_from_snapshot(
+        snapshot: RecoverySnapshot,
+        payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
+    ) -> Result<Self, PersistError> {
+        let mut store = Self::default();
+        for arm in snapshot.arms {
+            store.arms.insert(arm.arm_id.clone(), arm);
+        }
+        for claim in snapshot.claims {
+            store
+                .claim_attempts
+                .insert(claim.request_id.clone(), claim.attempt_id.clone());
+            store.claims.insert(claim.request_id.clone(), claim);
+        }
+        store.payloads = payloads;
+        for attachment in snapshot.attachments {
+            store
+                .attachments
+                .insert(attachment.attempt_id.clone(), attachment);
+        }
+        for birth in snapshot.controller_births {
+            store.births.insert(birth.birth_id.clone(), birth);
+        }
+        store.grants = snapshot.helper_grants;
+        store.retired_grants = snapshot.retired_helper_grants;
+        for replay in snapshot.retrieve_replays {
+            store
+                .retrieve_replays
+                .insert(replay.request_id.clone(), replay);
+        }
+        for record in snapshot.retrieval_bindings {
+            store.retrievals.insert(record.retrieval_id.clone(), record);
+        }
+        for replay in snapshot.ack_replays {
+            store.ack_replays.insert(replay.request_id.clone(), replay);
+        }
+        for coverage in snapshot.handled_coverage {
+            store.handled.insert(coverage.attempt_id.clone(), coverage);
+        }
+        store.attempt_seq = snapshot.attempt_seq;
+        if store.helper_request_nonce_collision() {
+            return Err(PersistError::Conflict);
+        }
+        store.validate_recovered_coverage()?;
+        Ok(store)
     }
 
     fn mint_retrieve_permit(
@@ -1792,6 +1983,7 @@ impl Persist for FakePersist {
             &admission.event_refs,
             &admission.payload,
             admission.coverage.as_ref(),
+            admission.drain_witness.as_ref(),
         );
         if recomputed != admission.claim_digest {
             return Err(PersistError::Conflict);
@@ -1819,6 +2011,7 @@ impl Persist for FakePersist {
                 && existing.event_refs == admission.event_refs
                 && existing.claim_digest == admission.claim_digest
                 && existing.coverage == admission.coverage
+                && existing.drain_witness == admission.drain_witness
                 && payload_matches
             {
                 let attempt_id = self
@@ -1859,6 +2052,7 @@ impl Persist for FakePersist {
             payload_ref: payload_ref.clone(),
             claimed_at: admission.claimed_at,
             coverage: admission.coverage.clone(),
+            drain_witness: admission.drain_witness.clone(),
         };
         self.claims.insert(admission.request_id.clone(), record);
         self.payloads
@@ -2465,6 +2659,11 @@ impl Persist for FakePersist {
             {
                 return Err(PersistError::Conflict);
             }
+            let same_ref = existing.grant_ref == grant.grant_ref;
+            let same_verifier = bool::from(existing.grant_verifier.ct_eq(&grant.grant_verifier));
+            if same_ref || same_verifier {
+                return Err(PersistError::Conflict);
+            }
             let retired = PersistedRetiredGrant {
                 grant_ref: existing.grant_ref.clone(),
                 grant_verifier: existing.grant_verifier,
@@ -2592,12 +2791,21 @@ impl Persist for FakePersist {
         {
             return Err(PersistError::Unauthorized);
         }
+        let replay = self
+            .retrieve_replays
+            .get(&permit.request_id)
+            .ok_or(PersistError::Unauthorized)?;
         let stored = self
             .retrievals
             .get(&permit.retrieval_id)
             .ok_or(PersistError::Unauthorized)?;
-        if stored.binding_digest != permit.binding_digest
-            || stored.result.retrieval_id != permit.retrieval_id
+        let recomputed = canonical_retrieve_body_digest(&replay.binding_digest, &permit.request_id);
+        if replay.request_id != permit.request_id
+            || replay.binding_digest != permit.binding_digest
+            || replay.canonical_body_digest != recomputed
+            || replay.result.retrieval_id != permit.retrieval_id
+            || replay.result != stored.result
+            || stored.binding_digest != permit.binding_digest
             || stored.result.claim_payload_ref != permit.payload_ref
         {
             return Err(PersistError::Unauthorized);
@@ -2672,7 +2880,8 @@ impl Persist for FakePersist {
             .iter()
             .position(|event_ref| event_ref == &request.cursor)
             .ok_or(PersistError::Unauthorized)?;
-        let proved_through = proved_ack_index(&claim, refs)?;
+        let payload = self.payloads.get(&claim.payload_ref);
+        let proved_through = proved_ack_index(&claim, refs, payload)?;
         if position > proved_through {
             return Err(PersistError::InvalidTransition);
         }
@@ -2800,6 +3009,7 @@ impl Persist for FakePersist {
         if self.helper_request_nonce_collision() {
             return Err(PersistError::Conflict);
         }
+        self.validate_recovered_coverage()?;
         let helper_sections = self.helper_snapshot();
         Ok(RecoverySnapshot {
             arms: self.arms.values().cloned().collect(),
@@ -3458,6 +3668,7 @@ mod tests {
                 &admission.event_refs,
                 &admission.payload,
                 admission.coverage.as_ref(),
+                admission.drain_witness.as_ref(),
             )
         };
         let baseline = digest_of(&admission);
@@ -3587,6 +3798,7 @@ mod tests {
             &reordered.event_refs,
             &reordered.payload,
             reordered.coverage.as_ref(),
+            reordered.drain_witness.as_ref(),
         );
         assert_eq!(
             store.admit_claim(&reordered, &attachment),
@@ -3604,6 +3816,7 @@ mod tests {
             &dropped.event_refs,
             &dropped.payload,
             dropped.coverage.as_ref(),
+            dropped.drain_witness.as_ref(),
         );
         assert_eq!(
             store.admit_claim(&dropped, &attachment),
@@ -3721,6 +3934,13 @@ mod tests {
         rotated.grant_verifier = [0x5b; 32];
         rotated.grant_ref = VerifierRef::fixture(10);
         assert_ne!(grant, rotated);
+        let retired = PersistedRetiredGrant {
+            grant_ref: VerifierRef::fixture(9),
+            grant_verifier: [0x5a; 32],
+        };
+        let rendered_retired = format!("{retired:?}");
+        assert!(rendered_retired.contains("[redacted]"));
+        assert!(!rendered_retired.contains("5a"), "{rendered_retired}");
     }
 
     struct HelperSetup {
@@ -5114,6 +5334,7 @@ mod tests {
             .clone();
         if let Some(claim) = setup.store.claims.get_mut(&claim_id) {
             claim.coverage = None;
+            claim.drain_witness = None;
         }
         let authorized = expect_recorded_retrieve(
             setup
@@ -5153,6 +5374,277 @@ mod tests {
                 .as_str(),
             "event-a"
         );
+    }
+
+    #[test]
+    fn coverage_rejects_swapped_and_sparse_drain() {
+        let setup = helper_store_events(&[
+            ("event-a", "test-a"),
+            ("event-b", "test-b"),
+            ("event-c", "test-c"),
+        ]);
+        let claim_id = setup
+            .store
+            .claim_for_attempt(&setup.attempt_id)
+            .expect("claim")
+            .request_id
+            .clone();
+        let mut claim = setup.store.claims.get(&claim_id).expect("claim").clone();
+        let payload = setup
+            .store
+            .payloads
+            .get(&claim.payload_ref)
+            .expect("payload")
+            .clone();
+        claim.coverage.as_mut().expect("coverage").provider =
+            ProviderName::new("other").expect("provider");
+        assert!(coverage_pair_invalid(
+            claim.coverage.as_ref(),
+            claim.drain_witness.as_ref(),
+            &claim.request_id,
+            &claim.arm_id,
+            claim.generation,
+            &claim.signal_id,
+            &claim.event_refs,
+            Some(&payload),
+        ));
+        claim = setup.store.claims.get(&claim_id).expect("claim").clone();
+        claim
+            .coverage
+            .as_mut()
+            .expect("coverage")
+            .drain_filter_scope = BoundedToken::new("other-drain").expect("scope");
+        assert!(coverage_pair_invalid(
+            claim.coverage.as_ref(),
+            claim.drain_witness.as_ref(),
+            &claim.request_id,
+            &claim.arm_id,
+            claim.generation,
+            &claim.signal_id,
+            &claim.event_refs,
+            Some(&payload),
+        ));
+        claim = setup.store.claims.get(&claim_id).expect("claim").clone();
+        claim.coverage.as_mut().expect("coverage").drain_baseline =
+            EventRef::new("event-b").expect("ref");
+        assert!(coverage_pair_invalid(
+            claim.coverage.as_ref(),
+            claim.drain_witness.as_ref(),
+            &claim.request_id,
+            &claim.arm_id,
+            claim.generation,
+            &claim.signal_id,
+            &claim.event_refs,
+            Some(&payload),
+        ));
+        claim = setup.store.claims.get(&claim_id).expect("claim").clone();
+        claim
+            .coverage
+            .as_mut()
+            .expect("coverage")
+            .source_evidence_id = [0; 32];
+        assert!(coverage_pair_invalid(
+            claim.coverage.as_ref(),
+            claim.drain_witness.as_ref(),
+            &claim.request_id,
+            &claim.arm_id,
+            claim.generation,
+            &claim.signal_id,
+            &claim.event_refs,
+            Some(&payload),
+        ));
+        claim = setup.store.claims.get(&claim_id).expect("claim").clone();
+        let sparse = BoundedVec::try_from(vec![
+            EventRef::new("event-a").expect("ref"),
+            EventRef::new("event-c").expect("ref"),
+        ])
+        .expect("sparse");
+        claim.drain_witness.as_mut().expect("drain").event_refs = sparse;
+        assert!(coverage_pair_invalid(
+            claim.coverage.as_ref(),
+            claim.drain_witness.as_ref(),
+            &claim.request_id,
+            &claim.arm_id,
+            claim.generation,
+            &claim.signal_id,
+            &claim.event_refs,
+            Some(&payload),
+        ));
+    }
+
+    #[test]
+    fn coverage_partial_prefix_refuses_unproved_ack() {
+        let mut setup = helper_store_events(&[
+            ("event-a", "test-a"),
+            ("event-b", "test-b"),
+            ("event-c", "test-c"),
+        ]);
+        let claim_id = setup
+            .store
+            .claim_for_attempt(&setup.attempt_id)
+            .expect("claim")
+            .request_id
+            .clone();
+        if let Some(claim) = setup.store.claims.get_mut(&claim_id) {
+            claim.coverage.as_mut().expect("coverage").covered_through =
+                EventRef::new("event-b").expect("ref");
+        }
+        let authorized = expect_recorded_retrieve(
+            setup
+                .store
+                .record_retrieve_exchange(&retrieve_for(&setup.binding, 201)),
+        );
+        let jump = ack_for(
+            &setup.binding,
+            &authorized.recorded.retrieval_id,
+            "event-c",
+            202,
+        );
+        assert_eq!(
+            setup
+                .store
+                .acknowledge_retrieved_batch(&setup.binding, &jump),
+            Err(PersistError::InvalidTransition)
+        );
+        let handled_before = setup.store.handled.clone();
+        let prefix = ack_for(
+            &setup.binding,
+            &authorized.recorded.retrieval_id,
+            "event-b",
+            203,
+        );
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &prefix)
+            .expect("proved prefix");
+        let regress = ack_for(
+            &setup.binding,
+            &authorized.recorded.retrieval_id,
+            "event-a",
+            204,
+        );
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &regress)
+            .expect("regression");
+        assert_eq!(
+            setup
+                .store
+                .handled
+                .get(&setup.attempt_id)
+                .expect("coverage")
+                .cursor
+                .as_str(),
+            "event-b"
+        );
+        assert_eq!(handled_before.len(), 0);
+    }
+
+    #[test]
+    fn grant_rotation_requires_both_identity_coordinates() {
+        let mut setup = helper_store();
+        let original = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("grant")
+            .clone();
+        let grants_before = setup.store.grants.clone();
+        let retired_before = setup.store.retired_grants.clone();
+        let mut same_ref = original.clone();
+        same_ref.grant_verifier = [0x34; 32];
+        assert_eq!(
+            setup.store.persist_helper_grant(&same_ref),
+            Err(PersistError::Conflict)
+        );
+        let mut same_verifier = original.clone();
+        same_verifier.grant_ref = VerifierRef::fixture(10);
+        assert_eq!(
+            setup.store.persist_helper_grant(&same_verifier),
+            Err(PersistError::Conflict)
+        );
+        let mut lease_only = original.clone();
+        lease_only.lease_until += time::Duration::seconds(1);
+        assert_eq!(
+            setup.store.persist_helper_grant(&lease_only),
+            Err(PersistError::Conflict)
+        );
+        assert_eq!(setup.store.grants, grants_before);
+        assert_eq!(setup.store.retired_grants, retired_before);
+        let mut both = original.clone();
+        both.grant_verifier = [0x34; 32];
+        both.grant_ref = VerifierRef::fixture(10);
+        setup.store.persist_helper_grant(&both).expect("rotate");
+        let stale = HelperRevocationScope {
+            grant_ref: VerifierRef::fixture(9),
+            birth_id: setup.birth.birth_id.clone(),
+            attempt_id: setup.attempt_id.clone(),
+        };
+        assert_eq!(
+            setup.store.revoke_helper_grant(stale),
+            Err(PersistError::Unauthorized)
+        );
+        let current = HelperRevocationScope {
+            grant_ref: VerifierRef::fixture(10),
+            birth_id: setup.birth.birth_id.clone(),
+            attempt_id: setup.attempt_id.clone(),
+        };
+        assert_eq!(
+            setup.store.revoke_helper_grant(current),
+            Ok(IdempotentWrite::Recorded)
+        );
+    }
+
+    #[test]
+    fn restore_from_snapshot_revalidates_and_serves() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 211);
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
+        let mut rotated = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("grant")
+            .clone();
+        rotated.grant_verifier = [0x34; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
+        setup.store.persist_helper_grant(&rotated).expect("rotate");
+        let payloads = setup.store.payloads.clone();
+        let snapshot = setup.store.recover_authority_state().expect("snapshot");
+        let rendered = format!("{snapshot:?}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        let mut restored = FakePersist::restore_from_snapshot(snapshot.clone(), payloads.clone())
+            .expect("restore");
+        restored.set_now(setup.store.now);
+        let mut current = mutated_binding(&setup.binding);
+        current.grant_ref = VerifierRef::fixture(10);
+        let replayed = expect_recorded_retrieve(
+            restored.record_retrieve_exchange(&retrieve_for(&current, 212)),
+        );
+        restored
+            .materialize_claimed_batch(&current, replayed.permit)
+            .expect("restored materialize");
+        assert_eq!(
+            restored.record_retrieve_exchange(&exchange),
+            Err(PersistError::Unauthorized)
+        );
+        let mut resurrected = rotated.clone();
+        resurrected.grant_ref = VerifierRef::fixture(9);
+        resurrected.grant_verifier = [0x33; 32];
+        assert_eq!(
+            restored.persist_helper_grant(&resurrected),
+            Err(PersistError::Conflict)
+        );
+        let mut swapped = snapshot;
+        swapped.claims[0]
+            .coverage
+            .as_mut()
+            .expect("coverage")
+            .provider = ProviderName::new("other").expect("provider");
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(swapped, payloads),
+            Err(PersistError::Conflict)
+        ));
+        let _ = recorded;
     }
 
     #[test]
