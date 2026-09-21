@@ -1073,7 +1073,7 @@ pub struct PersistedReconciliation {
 }
 
 /// General recovery state contains authority metadata only.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecoverySnapshot {
     pub arms: Vec<PersistedArm>,
     pub claims: Vec<PersistedClaimRecord>,

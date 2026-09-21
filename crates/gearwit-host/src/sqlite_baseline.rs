@@ -1454,10 +1454,11 @@ mod tests {
             .expect("ack");
         let before = store.recover_authority_state().expect("before");
         let payloads = store.live.claim_payloads();
+        let extra = ArmId::new("arm-extra").expect("arm");
         store.fault.after_partial_write = true;
         let error = store
             .persist_arm(&PersistedArm {
-                arm_id: ArmId::new("arm-extra").expect("arm"),
+                arm_id: extra.clone(),
                 generation: 2,
                 seat_id: binding.seat_id.clone(),
                 capability: ManagedCapability::HandleClaimedSignal,
@@ -1466,20 +1467,15 @@ mod tests {
             .expect_err("fault");
         assert!(matches!(error, PersistError::StorageUnavailable));
         let live = store.recover_authority_state().expect("live");
-        assert_eq!(live.ack_replays, before.ack_replays);
-        assert_eq!(live.claims, before.claims);
+        assert_eq!(live, before);
         assert_eq!(store.live.claim_payloads(), payloads);
-        assert!(
-            live.arms
-                .iter()
-                .all(|arm| arm.arm_id != ArmId::new("arm-extra").expect("arm"))
-        );
+        assert!(live.arms.iter().all(|arm| arm.arm_id != extra));
         drop(store);
         let mut reopened = SqliteBaseline::open_path(&path);
         let snapshot = reopened.recover_authority_state().expect("sql");
-        assert_eq!(snapshot.ack_replays, before.ack_replays);
-        assert_eq!(snapshot.claims, before.claims);
+        assert_eq!(snapshot, before);
         assert_eq!(reopened.live.claim_payloads(), payloads);
+        assert!(snapshot.arms.iter().all(|arm| arm.arm_id != extra));
         drop(reopened);
         let _ = std::fs::remove_file(&path);
     }
