@@ -75,7 +75,11 @@ pub(crate) enum RequiredOutcome {
 pub(crate) enum CaseEvidence {
     Port,
     SnapshotAdmission,
-    Gap { owner: &'static str },
+    /// Proved by a separate writer process that is killed without cleanup.
+    ProcessCrash,
+    Gap {
+        owner: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +119,18 @@ macro_rules! snap {
             family: CaseFamily::$family,
             required: RequiredOutcome::$required,
             evidence: CaseEvidence::SnapshotAdmission,
+            summary: $summary,
+        }
+    };
+}
+
+macro_rules! crash {
+    ($id:literal, $family:ident, $required:ident, $summary:literal) => {
+        ConformanceCase {
+            id: $id,
+            family: CaseFamily::$family,
+            required: RequiredOutcome::$required,
+            evidence: CaseEvidence::ProcessCrash,
             summary: $summary,
         }
     };
@@ -411,12 +427,24 @@ const CATALOG: &[ConformanceCase] = &[
         AUDIT,
         "a duplicate audit record with changed content, or a conflicting sequence, fails recovery"
     ),
+    crash!(
+        "snapshot.reopened-media.post-commit",
+        Durability,
+        ExactReplay,
+        "SIGKILL after a committed helper transaction; a fresh process replays that retrieve and payload"
+    ),
+    crash!(
+        "snapshot.reopened-media.pre-commit",
+        Durability,
+        NoPartialRecord,
+        "SIGKILL during an open transaction; a fresh process keeps the previous committed pair"
+    ),
     gap!(
         "snapshot.reopened-media",
         Durability,
         FailClosed,
         REOPEN,
-        "process death and reopen from durable media must preserve the required outcomes"
+        "host restart, power loss, and crash windows other than the named process_crash cases stay unproved"
     ),
     gap!(
         "crash.failure-windows",
@@ -2031,6 +2059,9 @@ pub(crate) fn execute<F: ConformanceFixture>(id: &str) -> Result<(), String> {
     let case = case(id).ok_or_else(|| format!("unknown case {id}"))?;
     match case.evidence {
         CaseEvidence::Gap { .. } => Err(inconclusive(id)),
+        CaseEvidence::ProcessCrash => Err(format!(
+            "process-crash fixture is outside this process: {id}"
+        )),
         CaseEvidence::Port => run_port::<F>(id),
         CaseEvidence::SnapshotAdmission => run_snapshot::<F>(id),
     }
@@ -2157,7 +2188,10 @@ mod tests {
     #[test]
     fn every_executable_case_passes_on_the_fake() {
         for case in catalog() {
-            if matches!(case.evidence, CaseEvidence::Gap { .. }) {
+            if matches!(
+                case.evidence,
+                CaseEvidence::Gap { .. } | CaseEvidence::ProcessCrash
+            ) {
                 continue;
             }
             execute::<FakeFixture>(case.id).unwrap_or_else(|error| panic!("{}: {error}", case.id));

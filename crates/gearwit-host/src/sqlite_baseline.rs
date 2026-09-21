@@ -84,6 +84,10 @@ impl SqliteBaseline {
             );",
         )
         .expect("sqlite schema");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("journal mode");
+        conn.pragma_update(None, "synchronous", "FULL")
+            .expect("synchronous");
         let mut store = Self {
             conn,
             live: FakePersist::default(),
@@ -1276,6 +1280,137 @@ fn admit_fractional(
     (binding, admission)
 }
 
+fn binding_from_grant(grant: &PersistedHelperGrant) -> ValidatedHelperBinding {
+    ValidatedHelperBinding {
+        grant_ref: grant.grant_ref.clone(),
+        seat_id: grant.seat_id.clone(),
+        arm_id: grant.arm_id.clone(),
+        generation: grant.generation,
+        birth_id: grant.birth_id.clone(),
+        attempt_id: grant.attempt_id.clone(),
+        signal_id: grant.signal_id.clone(),
+        claim_digest: grant.claim_digest.clone(),
+        operations: grant.operations,
+        lease_until: grant.lease_until,
+    }
+}
+
+fn filesystem_type(path: &Path) -> String {
+    let listed = std::process::Command::new("df")
+        .arg(path)
+        .output()
+        .expect("df");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    let device = listed
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().next())
+        .expect("device");
+    let mounted = std::process::Command::new("mount").output().expect("mount");
+    let mounted = String::from_utf8_lossy(&mounted.stdout);
+    mounted
+        .lines()
+        .find(|line| line.starts_with(device))
+        .and_then(|line| line.split(['(', ',']).nth(1))
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn sqlite_durability(path: &Path) -> (String, i64) {
+    let conn = Connection::open(path).expect("durability open");
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal");
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .expect("synchronous");
+    (journal, synchronous)
+}
+
+fn crash_writer(role: &str) {
+    let path = std::env::var("GEARWIT_CRASH_PATH").expect("path");
+    let path = PathBuf::from(path);
+    let mut store = SqliteBaseline::open_path(&path);
+    let (binding, _, _) = conformance::install_helper(&mut store);
+    let exchange = conformance::retrieve_for(&binding, 41);
+    let authorized = match store.record_retrieve_exchange(&exchange).expect("retrieve") {
+        IdempotentResult::Recorded(authorized) => authorized,
+        IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+    };
+    let request = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 42);
+    store
+        .acknowledge_retrieved_batch(&binding, &request)
+        .expect("ack");
+    if role == "pre" {
+        drop(store);
+        let conn = Connection::open(&path).expect("dirty open");
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE authority_snapshot SET document = 'DIRTY' WHERE id = 1;",
+        )
+        .expect("dirty begin");
+        write_marker(&path, "PRE_COMMIT");
+        println!("PRE_COMMIT");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let _ = conn;
+        return;
+    }
+    write_marker(&path, "POST_COMMIT");
+    println!("POST_COMMIT");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::thread::sleep(std::time::Duration::from_secs(60));
+    let _ = store;
+}
+
+fn write_marker(path: &Path, marker: &str) {
+    let marker_path = path.with_extension("marker");
+    let mut file = std::fs::File::create(&marker_path).expect("marker");
+    std::io::Write::write_all(&mut file, marker.as_bytes()).expect("marker write");
+    std::io::Write::write_all(&mut file, b"\n").expect("marker newline");
+    file.sync_all().expect("marker sync");
+}
+
+fn kill_writer_at(path: &Path, role: &str, marker: &str) {
+    let stderr_path = path.with_extension("stderr");
+    let stderr = std::fs::File::create(&stderr_path).expect("stderr");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+        .arg("--exact")
+        .arg("sqlite_baseline::tests::reopened_media_process_crash")
+        .arg("--nocapture")
+        .env("GEARWIT_CRASH_ROLE", role)
+        .env("GEARWIT_CRASH_PATH", path)
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn writer");
+    let marker_path = path.with_extension("marker");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut reached = false;
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().expect("try wait").is_some() {
+            break;
+        }
+        if let Ok(text) = std::fs::read_to_string(&marker_path)
+            && text.contains(marker)
+        {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        reached,
+        "writer exited before {marker}: {}",
+        std::fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+    child.kill().expect("sigkill");
+    let status = child.wait().expect("wait");
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    assert_eq!(signal, Some(9), "writer status {status:?}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,6 +1419,9 @@ mod tests {
     #[test]
     fn sqlite_matches_every_executable_conformance_case() {
         for case in catalog() {
+            if matches!(case.evidence, CaseEvidence::ProcessCrash) {
+                continue;
+            }
             if matches!(case.evidence, CaseEvidence::Gap { .. }) {
                 let error = execute::<SqliteBaseline>(case.id).expect_err(case.id);
                 assert!(error.contains("inconclusive"), "{error}");
@@ -1658,5 +1796,71 @@ mod tests {
         assert_eq!(count, 0);
         drop(reopened);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopened_media_process_crash() {
+        if let Ok(role) = std::env::var("GEARWIT_CRASH_ROLE") {
+            crash_writer(&role);
+            return;
+        }
+        assert_eq!(std::env::consts::OS, "macos");
+        assert_eq!(std::env::consts::ARCH, "aarch64");
+        let root = std::env::temp_dir().join(format!(
+            "gearwit-process-crash-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("dir");
+        let filesystem = filesystem_type(&root);
+        assert_eq!(filesystem, "apfs");
+
+        let post = root.join("post.sqlite");
+        kill_writer_at(&post, "post", "POST_COMMIT");
+        let (journal, synchronous) = sqlite_durability(&post);
+        assert_eq!(journal, "delete");
+        assert_eq!(synchronous, 2);
+        let mut fresh = SqliteBaseline::open_path(&post);
+        let snapshot = fresh.recover_authority_state().expect("post reopen");
+        assert_eq!(snapshot.claims.len(), 1);
+        assert_eq!(snapshot.retrieve_replays.len(), 1);
+        assert_eq!(snapshot.ack_replays.len(), 1);
+        let binding = binding_from_grant(&snapshot.helper_grants[0]);
+        let exchange = conformance::retrieve_for(&binding, 41);
+        match fresh.record_retrieve_exchange(&exchange).expect("replay") {
+            IdempotentResult::ExactReplay(authorized) => {
+                let payload = fresh
+                    .materialize_claimed_batch(&binding, authorized.permit)
+                    .expect("materialize");
+                assert_eq!(payload.events.as_slice().len(), 2);
+            }
+            IdempotentResult::Recorded(_) => panic!("committed retrieve must replay after SIGKILL"),
+        }
+        drop(fresh);
+
+        let prior = root.join("prior.sqlite");
+        kill_writer_at(&prior, "pre", "PRE_COMMIT");
+        let mut reopened = SqliteBaseline::open_path(&prior);
+        let snapshot = reopened.recover_authority_state().expect("pre reopen");
+        assert_eq!(snapshot.claims.len(), 1);
+        assert!(
+            snapshot
+                .arms
+                .iter()
+                .all(|arm| arm.arm_id.as_str() != "arm-dirty")
+        );
+        let binding = binding_from_grant(&snapshot.helper_grants[0]);
+        let exchange = conformance::retrieve_for(&binding, 41);
+        match reopened
+            .record_retrieve_exchange(&exchange)
+            .expect("prior replay")
+        {
+            IdempotentResult::ExactReplay(_) => {}
+            IdempotentResult::Recorded(_) => {
+                panic!("open transaction must not replace the committed retrieve")
+            }
+        }
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
