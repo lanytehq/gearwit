@@ -67,6 +67,8 @@ pub(crate) enum RequiredOutcome {
     NoPartialRecord,
     Recorded,
     Admitted,
+    FixedTimeComparison,
+    VerifierOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -532,14 +534,14 @@ const CATALOG: &[ConformanceCase] = &[
         Revocation,
         Unauthorized,
         NATIVE,
-        "a stale generation is refused"
+        "fresh helper use and the controller path refuse a stale generation; an authenticated exact helper replay remains valid"
     ),
     gap!(
         "auth.expired-lease",
         Revocation,
         Unauthorized,
         NATIVE,
-        "an expired lease is refused"
+        "fresh helper use and the controller path refuse an expired lease; an authenticated exact helper replay remains valid"
     ),
     gap!(
         "auth.mismatched-controller",
@@ -553,7 +555,7 @@ const CATALOG: &[ConformanceCase] = &[
         Revocation,
         Unauthorized,
         NATIVE,
-        "link loss does not authorize a later use"
+        "fresh helper use and the controller path refuse use after link loss; an authenticated exact helper replay remains valid"
     ),
     gap!(
         "claim.request-id-stable",
@@ -635,7 +637,7 @@ const CATALOG: &[ConformanceCase] = &[
     gap!(
         "grant.verifier-fixed-time",
         Revocation,
-        Conflict,
+        FixedTimeComparison,
         VERIFIER,
         "verifier presentation comparison does not take a data-dependent branch"
     ),
@@ -709,6 +711,146 @@ const CATALOG: &[ConformanceCase] = &[
         NATIVE,
         "an in-progress completion cannot satisfy the handled and terminal join"
     ),
+    gap!(
+        "claim.first-admission-atomic",
+        ClaimAdmission,
+        NoPartialRecord,
+        NATIVE,
+        "the first claim either persists in full or leaves no partial admission"
+    ),
+    gap!(
+        "handled.cursor-atomic",
+        RecoverySnapshot,
+        BothRecordsOrNeither,
+        NATIVE,
+        "handled state and the provider cursor persist together or not at all"
+    ),
+    gap!(
+        "join.handled-and-terminal-succeeds",
+        RecoverySnapshot,
+        Recorded,
+        NATIVE,
+        "a daemon-owned handled cursor plus recognized terminal evidence records the join"
+    ),
+    gap!(
+        "restart.no-active-coordinate-reconstruct",
+        Durability,
+        FailClosed,
+        NATIVE,
+        "restart does not open or reconstruct an active-turn or transient-thread coordinate"
+    ),
+    gap!(
+        "native.durable-unproven-bound",
+        NativeWrite,
+        BothRecordsOrNeither,
+        NATIVE,
+        "durable Unproven is a fully bound path, separate from proof and hold atomicity"
+    ),
+    gap!(
+        "grant.persisted-verifier-only",
+        Revocation,
+        VerifierOnly,
+        VERIFIER,
+        "persisted grant data keeps the verifier and not the raw key"
+    ),
+    gap!(
+        "auth.exact-helper-replay-survives-lease",
+        ReplayIdentity,
+        ExactReplay,
+        NATIVE,
+        "an authenticated exact helper replay remains valid after lease expiry"
+    ),
+    gap!(
+        "custody.raw-artifacts",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "raw authority artifacts expose no private sentinel"
+    ),
+    gap!(
+        "custody.snapshots-and-backups",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "snapshots and backups expose no private sentinel"
+    ),
+    gap!(
+        "custody.incorrect-key",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "incorrect key material refuses recovery and writes no plaintext"
+    ),
+    gap!(
+        "custody.no-plaintext-create",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "key refusal creates no plaintext"
+    ),
+    gap!(
+        "custody.no-plaintext-migrate",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "key refusal migrates no plaintext"
+    ),
+    gap!(
+        "custody.no-plaintext-export",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "key refusal exports no plaintext"
+    ),
+    gap!(
+        "custody.wrong-store-identity",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "the wrong store identity is refused"
+    ),
+    gap!(
+        "custody.unexpected-ancestry",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "unexpected ancestry is refused"
+    ),
+    gap!(
+        "custody.unexpected-generation",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "an unexpected store generation is refused"
+    ),
+    gap!(
+        "retention.steady-state-size",
+        Retention,
+        FailClosed,
+        RETENTION,
+        "post-retention steady-state size stays inside the declared budget"
+    ),
+    gap!(
+        "retention.packing-amplification",
+        Retention,
+        FailClosed,
+        RETENTION,
+        "compaction and packing amplification stay inside the declared budget"
+    ),
+    gap!(
+        "retention.maintenance-scratch",
+        Retention,
+        FailClosed,
+        RETENTION,
+        "maintenance scratch stays inside the declared budget"
+    ),
+    gap!(
+        "retention.sealed-generation-rollover",
+        Retention,
+        FailClosed,
+        RETENTION,
+        "sealed-generation rollover stays inside the declared budget and fails closed past it"
+    ),
 ];
 
 pub(crate) fn case(id: &str) -> Option<&'static ConformanceCase> {
@@ -747,7 +889,7 @@ const MATRIX: &[MatrixRow] = &[
     MatrixRow {
         id: "matrix.claim-atomicity",
         predicates: &[
-            pred!("first admission records one claim" => "op.admit-claim"),
+            pred!("first admission is atomic" => "claim.first-admission-atomic"),
             pred!("identical admission replays" => "op.admit-claim"),
             pred!("forged digest conflicts and leaves the stored claim" => "op.admit-claim"),
         ],
@@ -797,7 +939,8 @@ const MATRIX: &[MatrixRow] = &[
             pred!("stale generation" => "auth.stale-generation"),
             pred!("expired lease" => "auth.expired-lease"),
             pred!("mismatched controller" => "auth.mismatched-controller"),
-            pred!("link loss" => "auth.link-loss"),
+            pred!("link loss on fresh use or the controller path" => "auth.link-loss"),
+            pred!("exact helper replay survives lease expiry" => "auth.exact-helper-replay-survives-lease"),
         ],
     },
     MatrixRow {
@@ -814,7 +957,8 @@ const MATRIX: &[MatrixRow] = &[
         id: "matrix.active-observation",
         predicates: &[
             pred!("proof and held commit together" => "native.active-hold-atomicity"),
-            pred!("changed prehash or fingerprint conflicts" => "native.changed-observation-conflicts"),
+            pred!("changed prehash, fingerprint, or binding conflicts" => "native.changed-observation-conflicts"),
+            pred!("restart does not reconstruct active or transient coordinates" => "restart.no-active-coordinate-reconstruct"),
             pred!("no store key in the controller" => "native.no-store-key"),
         ],
     },
@@ -822,6 +966,7 @@ const MATRIX: &[MatrixRow] = &[
         id: "matrix.rejected-proof",
         predicates: &[
             pred!("rejected proof records neither held nor unproven" => "native.active-hold-atomicity"),
+            pred!("durable unproven is a fully bound path" => "native.durable-unproven-bound"),
         ],
     },
     MatrixRow {
@@ -895,6 +1040,8 @@ const MATRIX: &[MatrixRow] = &[
         id: "matrix.handled-rearm",
         predicates: &[
             pred!("handled cursor closes fresh use" => "replay.fresh-refused-after-handled"),
+            pred!("handled state and provider cursor persist together" => "handled.cursor-atomic"),
+            pred!("recognized terminal records the join" => "join.handled-and-terminal-succeeds"),
             pred!("re-arm waits without handled coverage" => "snapshot.rearm-join-absent-before-handled"),
         ],
     },
@@ -926,6 +1073,7 @@ const MATRIX: &[MatrixRow] = &[
     MatrixRow {
         id: "matrix.verifier-fixed-time-zeroize",
         predicates: &[
+            pred!("persisted grant data is verifier-only" => "grant.persisted-verifier-only"),
             pred!("recovered verifier is redacted" => "grant.verifier-redacted"),
             pred!("comparison is fixed-time" => "grant.verifier-fixed-time"),
             pred!("opened coordinate plaintext is erased" => "op.seal-native-coordinate"),
@@ -943,26 +1091,40 @@ const MATRIX: &[MatrixRow] = &[
         id: "matrix.snapshot-body-free",
         predicates: &[
             pred!("recovery omits provider bodies" => "snapshot.helper-sections-omit-bodies"),
-            pred!("replay resolves through the private claim reference" => "replay.restore.two-claim-substitution"),
+            pred!("an unswapped pair restores through the private claim reference" => "replay.restore.unswapped-pair"),
+            pred!("a substituted result is refused" => "replay.restore.two-claim-substitution"),
         ],
     },
     MatrixRow {
         id: "matrix.private-key-refusal",
         predicates: &[
-            pred!("missing key refuses recovery" => "custody.key-refusal"),
-            pred!("remnants expose no private sentinel" => "custody.redacted-export"),
+            pred!("absent key refuses recovery" => "custody.key-refusal"),
+            pred!("incorrect key refuses recovery" => "custody.incorrect-key"),
+            pred!("raw artifacts expose no sentinel" => "custody.raw-artifacts"),
+            pred!("snapshots and backups expose no sentinel" => "custody.snapshots-and-backups"),
+            pred!("crash remnants expose no sentinel" => "custody.redacted-export"),
+            pred!("no plaintext create" => "custody.no-plaintext-create"),
+            pred!("no plaintext migrate" => "custody.no-plaintext-migrate"),
+            pred!("no plaintext export" => "custody.no-plaintext-export"),
         ],
     },
     MatrixRow {
         id: "matrix.installation-identity",
         predicates: &[
             pred!("wrong installation or second host is refused" => "custody.installation-identity"),
+            pred!("wrong store identity is refused" => "custody.wrong-store-identity"),
+            pred!("unexpected ancestry is refused" => "custody.unexpected-ancestry"),
+            pred!("unexpected store generation is refused" => "custody.unexpected-generation"),
         ],
     },
     MatrixRow {
         id: "matrix.retention",
         predicates: &[
-            pred!("capacity and compaction budget" => "retention.migration-compaction"),
+            pred!("capacity refusal" => "retention.migration-compaction"),
+            pred!("post-retention steady-state size" => "retention.steady-state-size"),
+            pred!("packing amplification" => "retention.packing-amplification"),
+            pred!("maintenance scratch" => "retention.maintenance-scratch"),
+            pred!("sealed-generation rollover" => "retention.sealed-generation-rollover"),
             pred!("migration crash" => "durability.migration-crash"),
             pred!("compaction crash" => "durability.compaction-crash"),
         ],
@@ -1963,6 +2125,22 @@ mod tests {
         ] {
             assert!(case(id).is_some(), "missing alias {id}");
         }
+        assert_eq!(
+            case("grant.verifier-fixed-time")
+                .expect("fixed-time")
+                .required,
+            RequiredOutcome::FixedTimeComparison
+        );
+        let body_free = matrix()
+            .iter()
+            .find(|row| row.id == "matrix.snapshot-body-free")
+            .expect("body-free row");
+        assert!(
+            body_free
+                .predicates
+                .iter()
+                .any(|predicate| { predicate.case_id == "replay.restore.unswapped-pair" })
+        );
     }
 
     #[test]
