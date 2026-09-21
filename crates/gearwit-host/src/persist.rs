@@ -971,12 +971,30 @@ pub enum RearmJoinResult {
     WaitingForRecognizedTerminal,
 }
 
+/// Historical originating helper binding. Content-free; enough to recompute
+/// the binding digest and name the committed claim tuple. Survives grant
+/// rotation without consulting the replacement grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedHelperBindingIdentity {
+    pub(crate) grant_ref: VerifierRef,
+    pub(crate) seat_id: SeatId,
+    pub(crate) arm_id: ArmId,
+    pub(crate) generation: u64,
+    pub(crate) birth_id: ControllerBirthId,
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) signal_id: SignalId,
+    pub(crate) claim_digest: ClaimDigest,
+    pub(crate) operations: HelperOperations,
+    pub(crate) lease_until: OffsetDateTime,
+}
+
 /// Content-free persisted retrieve replay metadata. No body is duplicated;
 /// content resolves through the immutable [`ClaimPayloadRef`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedRetrieveReplay {
     pub(crate) request_id: RequestNonce,
     pub(crate) binding_digest: [u8; 32],
+    pub(crate) origin: PersistedHelperBindingIdentity,
     pub(crate) canonical_body_digest: CanonicalBodyDigest,
     pub(crate) result: RecordedRetrieveResult,
 }
@@ -1001,6 +1019,7 @@ pub struct PersistedAckReplay {
 pub struct PersistedRetrievalRecord {
     pub(crate) retrieval_id: RetrievalId,
     pub(crate) binding_digest: [u8; 32],
+    pub(crate) origin: PersistedHelperBindingIdentity,
     pub(crate) result: RecordedRetrieveResult,
 }
 
@@ -1461,34 +1480,53 @@ impl Persist for SharedFakePersist {
 /// Canonical helper-binding digest for replay identity: the complete live
 /// binding in fixed order. Same binding bytes always digest identically;
 /// any bound-field change yields a different digest.
-fn canonical_binding_digest(binding: &ValidatedHelperBinding) -> [u8; 32] {
+fn snapshot_binding_identity(binding: &ValidatedHelperBinding) -> PersistedHelperBindingIdentity {
+    PersistedHelperBindingIdentity {
+        grant_ref: binding.grant_ref.clone(),
+        seat_id: binding.seat_id.clone(),
+        arm_id: binding.arm_id.clone(),
+        generation: binding.generation,
+        birth_id: binding.birth_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+        signal_id: binding.signal_id.clone(),
+        claim_digest: binding.claim_digest.clone(),
+        operations: binding.operations,
+        lease_until: binding.lease_until,
+    }
+}
+
+fn canonical_binding_identity_digest(origin: &PersistedHelperBindingIdentity) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gearwit.helper-binding.v1\0");
-    mac_field(&mut hasher, binding.grant_ref.bytes());
-    mac_field(&mut hasher, binding.seat_id.as_str().as_bytes());
-    mac_field(&mut hasher, binding.arm_id.as_str().as_bytes());
-    mac_field(&mut hasher, &binding.generation.to_le_bytes());
-    mac_field(&mut hasher, &binding.birth_id.0);
-    mac_field(&mut hasher, binding.attempt_id.as_str().as_bytes());
-    mac_field(&mut hasher, binding.signal_id.as_str().as_bytes());
-    mac_field(&mut hasher, &binding.claim_digest.0);
+    mac_field(&mut hasher, origin.grant_ref.bytes());
+    mac_field(&mut hasher, origin.seat_id.as_str().as_bytes());
+    mac_field(&mut hasher, origin.arm_id.as_str().as_bytes());
+    mac_field(&mut hasher, &origin.generation.to_le_bytes());
+    mac_field(&mut hasher, &origin.birth_id.0);
+    mac_field(&mut hasher, origin.attempt_id.as_str().as_bytes());
+    mac_field(&mut hasher, origin.signal_id.as_str().as_bytes());
+    mac_field(&mut hasher, &origin.claim_digest.0);
     mac_field(
         &mut hasher,
         &[u8::from(
-            binding.operations.allows(HelperOperation::Retrieve),
+            origin.operations.allows(HelperOperation::Retrieve),
         )],
     );
     mac_field(
         &mut hasher,
         &[u8::from(
-            binding.operations.allows(HelperOperation::Acknowledge),
+            origin.operations.allows(HelperOperation::Acknowledge),
         )],
     );
     mac_field(
         &mut hasher,
-        &binding.lease_until.unix_timestamp_nanos().to_le_bytes(),
+        &origin.lease_until.unix_timestamp_nanos().to_le_bytes(),
     );
     *hasher.finalize().as_bytes()
+}
+
+fn canonical_binding_digest(binding: &ValidatedHelperBinding) -> [u8; 32] {
+    canonical_binding_identity_digest(&snapshot_binding_identity(binding))
 }
 
 /// Canonical retrieve-request body digest over the authenticated binding
@@ -1793,7 +1831,7 @@ impl FakePersist {
             }
         }
         for stored in self.retrievals.values() {
-            let claim = self.unique_claim_for_payload(&stored.result.claim_payload_ref)?;
+            let claim = self.claim_for_origin(&stored.origin, stored.binding_digest)?;
             if !retrieve_result_matches_claim(&stored.result, claim) {
                 return Err(PersistError::Conflict);
             }
@@ -1804,12 +1842,13 @@ impl FakePersist {
                 .get(&replay.result.retrieval_id)
                 .ok_or(PersistError::Conflict)?;
             if stored.binding_digest != replay.binding_digest
+                || stored.origin != replay.origin
                 || stored.result != replay.result
                 || stored.retrieval_id != replay.result.retrieval_id
             {
                 return Err(PersistError::Conflict);
             }
-            let claim = self.unique_claim_for_payload(&replay.result.claim_payload_ref)?;
+            let claim = self.claim_for_origin(&replay.origin, replay.binding_digest)?;
             if !retrieve_result_matches_claim(&replay.result, claim) {
                 return Err(PersistError::Conflict);
             }
@@ -1838,7 +1877,7 @@ impl FakePersist {
             if expected != replay.canonical_body_digest {
                 return Err(PersistError::Conflict);
             }
-            let claim = self.unique_claim_for_payload(&stored.result.claim_payload_ref)?;
+            let claim = self.claim_for_origin(&stored.origin, stored.binding_digest)?;
             if replay.result.attempt_id != claim.attempt_id
                 || replay.result.signal_id != claim.signal_id
                 || replay.result.cursor != replay.cursor
@@ -1903,20 +1942,32 @@ impl FakePersist {
     }
 
     #[cfg(test)]
-    fn unique_claim_for_payload(
+    fn claim_for_origin(
         &self,
-        payload_ref: &ClaimPayloadRef,
+        origin: &PersistedHelperBindingIdentity,
+        binding_digest: [u8; 32],
     ) -> Result<&PersistedClaimRecord, PersistError> {
+        if canonical_binding_identity_digest(origin) != binding_digest {
+            return Err(PersistError::Conflict);
+        }
         let mut found = None;
         for claim in self.claims.values() {
-            if claim.payload_ref == *payload_ref {
+            if claim.claim_digest == origin.claim_digest {
                 if found.is_some() {
                     return Err(PersistError::Conflict);
                 }
                 found = Some(claim);
             }
         }
-        found.ok_or(PersistError::Conflict)
+        let claim = found.ok_or(PersistError::Conflict)?;
+        if claim.arm_id != origin.arm_id
+            || claim.generation != origin.generation
+            || claim.attempt_id != origin.attempt_id
+            || claim.signal_id != origin.signal_id
+        {
+            return Err(PersistError::Conflict);
+        }
+        Ok(claim)
     }
 
     fn mint_retrieve_permit(
@@ -3003,11 +3054,13 @@ impl Persist for FakePersist {
             event_count: u8::try_from(refs.len()).map_err(|_| PersistError::InvalidTransition)?,
             retrieved_at: self.now,
         };
+        let origin = snapshot_binding_identity(&exchange.binding);
         self.retrievals.insert(
             result.retrieval_id.clone(),
             PersistedRetrievalRecord {
                 retrieval_id: result.retrieval_id.clone(),
                 binding_digest,
+                origin: origin.clone(),
                 result: result.clone(),
             },
         );
@@ -3016,6 +3069,7 @@ impl Persist for FakePersist {
             PersistedRetrieveReplay {
                 request_id: exchange.request_id.clone(),
                 binding_digest,
+                origin,
                 canonical_body_digest: exchange.canonical_body_digest.clone(),
                 result: result.clone(),
             },
@@ -6012,6 +6066,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn restore_rejects_forged_ack_handled_and_join() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 241);
@@ -6045,7 +6100,42 @@ mod tests {
             Err(PersistError::Conflict)
         ));
         let mut forged_cursor = snapshot.clone();
-        forged_cursor.ack_replays[0].cursor = EventRef::new("event-b").expect("ref");
+        forged_cursor.claims[0]
+            .coverage
+            .as_mut()
+            .expect("coverage")
+            .covered_through = EventRef::new("event-a").expect("ref");
+        let payload = payloads
+            .get(&forged_cursor.claims[0].payload_ref)
+            .expect("payload")
+            .clone();
+        forged_cursor.claims[0].claim_digest = canonical_claim_digest(
+            &forged_cursor.claims[0].request_id,
+            &forged_cursor.claims[0].arm_id,
+            forged_cursor.claims[0].generation,
+            &forged_cursor.claims[0].signal_id,
+            &forged_cursor.claims[0].event_refs,
+            &payload,
+            forged_cursor.claims[0].coverage.as_ref(),
+            forged_cursor.claims[0].drain_witness.as_ref(),
+        );
+        forged_cursor.retrieve_replays[0].origin.claim_digest =
+            forged_cursor.claims[0].claim_digest.clone();
+        forged_cursor.retrieval_bindings[0].origin.claim_digest =
+            forged_cursor.claims[0].claim_digest.clone();
+        forged_cursor.retrieve_replays[0].binding_digest =
+            canonical_binding_identity_digest(&forged_cursor.retrieve_replays[0].origin);
+        forged_cursor.retrieval_bindings[0].binding_digest =
+            forged_cursor.retrieve_replays[0].binding_digest;
+        forged_cursor.retrieve_replays[0].canonical_body_digest = canonical_retrieve_body_digest(
+            &forged_cursor.retrieve_replays[0].binding_digest,
+            &forged_cursor.retrieve_replays[0].request_id,
+        );
+        forged_cursor.ack_replays[0].binding_digest =
+            forged_cursor.retrieve_replays[0].binding_digest;
+        let beyond = EventRef::new("event-b").expect("ref");
+        forged_cursor.ack_replays[0].cursor = beyond.clone();
+        forged_cursor.ack_replays[0].result.cursor = beyond.clone();
         forged_cursor.ack_replays[0].canonical_body_digest = canonical_ack_body_digest(
             &forged_cursor.ack_replays[0].binding_digest,
             &forged_cursor.ack_replays[0].request_id,
@@ -6082,6 +6172,56 @@ mod tests {
             Err(PersistError::Conflict)
         ));
 
+        let mut handled_join = snapshot.clone();
+        handled_join.handled_coverage[0].cursor = EventRef::new("event-b").expect("ref");
+        handled_join.handled_coverage[0].covered_through_newest = true;
+        handled_join.rearmed_joins.push(PersistedRearmJoin {
+            arm_id: setup.binding.arm_id.clone(),
+            generation: setup.binding.generation,
+            attempt_id: setup.attempt_id.clone(),
+            signal_id: setup.binding.signal_id.clone(),
+        });
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(handled_join, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+
+        let mut claim_b = snapshot.claims[0].clone();
+        claim_b.request_id = ClaimRequestId::new("claim-b").expect("claim");
+        claim_b.attempt_id = AttemptId::new("attempt-b").expect("attempt");
+        claim_b.payload_ref = ClaimPayloadRef::random().expect("payload ref");
+        claim_b.claim_digest = canonical_claim_digest(
+            &claim_b.request_id,
+            &claim_b.arm_id,
+            claim_b.generation,
+            &claim_b.signal_id,
+            &claim_b.event_refs,
+            payloads
+                .get(&snapshot.claims[0].payload_ref)
+                .expect("payload"),
+            claim_b.coverage.as_ref(),
+            claim_b.drain_witness.as_ref(),
+        );
+        let mut swapped_claims = snapshot.clone();
+        let mut swapped_payloads = payloads.clone();
+        swapped_payloads.insert(
+            claim_b.payload_ref.clone(),
+            payloads
+                .get(&snapshot.claims[0].payload_ref)
+                .expect("payload")
+                .clone(),
+        );
+        swapped_claims.claims.push(claim_b.clone());
+        swapped_claims.retrieve_replays[0].result.claim_payload_ref = claim_b.payload_ref.clone();
+        swapped_claims.retrieval_bindings[0]
+            .result
+            .claim_payload_ref = claim_b.payload_ref.clone();
+        swapped_claims.ack_replays[0].result.attempt_id = claim_b.attempt_id.clone();
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(swapped_claims, swapped_payloads),
+            Err(PersistError::Conflict)
+        ));
+
         let mut paired = snapshot.clone();
         paired.retrieve_replays[0].result.event_count = 1;
         paired.retrieve_replays[0].result.newest_event_ref = EventRef::new("event-a").expect("ref");
@@ -6115,7 +6255,8 @@ mod tests {
     fn restore_terminal_only_does_not_close_rearm() {
         let mut setup = helper_store();
         let exchange = retrieve_for(&setup.binding, 251);
-        expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded =
+            expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange)).recorded;
         setup.store.turn_facts.insert(
             setup.attempt_id.clone(),
             vec![NativeTurnFact::Terminal {
@@ -6138,6 +6279,18 @@ mod tests {
             restored.try_rearm_join(join),
             Ok(RearmJoinResult::WaitingForHandled)
         );
+        assert_eq!(
+            restored.record_retrieve_exchange(&retrieve_for(&setup.binding, 252)),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_eq!(
+            restored.acknowledge_retrieved_batch(
+                &setup.binding,
+                &ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 253)
+            ),
+            Err(PersistError::InvalidTransition)
+        );
+        assert_retrieve_replay(restored.record_retrieve_exchange(&exchange), &recorded);
         let mut terminal_join = snapshot;
         terminal_join.rearmed_joins.push(PersistedRearmJoin {
             arm_id: setup.binding.arm_id.clone(),
