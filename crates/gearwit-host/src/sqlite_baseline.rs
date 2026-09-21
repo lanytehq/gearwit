@@ -40,6 +40,7 @@ pub(crate) struct SqliteBaseline {
     live: FakePersist,
     path: PathBuf,
     ephemeral: bool,
+    fault_after_partial_write: bool,
 }
 
 impl Drop for SqliteBaseline {
@@ -82,12 +83,13 @@ impl SqliteBaseline {
             live: FakePersist::default(),
             path: path.to_path_buf(),
             ephemeral: false,
+            fault_after_partial_write: false,
         };
-        store.reload();
+        store.reload().expect("empty baseline");
         store
     }
 
-    fn reload(&mut self) {
+    fn reload(&mut self) -> Result<(), PersistError> {
         let document: Option<String> = self
             .conn
             .query_row(
@@ -99,7 +101,7 @@ impl SqliteBaseline {
             .expect("snapshot read");
         let Some(document) = document else {
             self.live = FakePersist::default();
-            return;
+            return Ok(());
         };
         let mut payloads = BTreeMap::new();
         let mut statement = self
@@ -116,14 +118,24 @@ impl SqliteBaseline {
             let payload_ref = ClaimPayloadRef(unhex32(&payload_ref));
             payloads.insert(payload_ref, decode_payload(&document));
         }
-        let snapshot = decode_snapshot(&document);
-        self.live = FakePersist::restore_from_snapshot(snapshot, payloads).expect("reload");
+        let (snapshot, creates) = decode_durable(&document);
+        self.live = FakePersist::restore_from_snapshot(snapshot, payloads)
+            .map_err(|_| PersistError::StorageUnavailable)?;
+        self.live.install_creates(creates);
+        Ok(())
     }
 
     fn commit(&mut self) -> Result<(), PersistError> {
-        let snapshot = self.live.recover_authority_state()?;
+        let creates = self.live.export_creates();
+        let ownership = self.live.export_ownership();
+        let mut image = self.live.clone();
+        let mut snapshot = image.recover_authority_state()?;
+        snapshot.ownership = ownership;
+        if unsupported_section(&snapshot) {
+            return Err(PersistError::StorageUnavailable);
+        }
         let payloads = self.live.claim_payloads();
-        let document = encode_snapshot(&snapshot);
+        let document = encode_durable(&snapshot, &creates);
         let tx = self
             .conn
             .transaction()
@@ -136,6 +148,9 @@ impl SqliteBaseline {
             params![document],
         )
         .map_err(|_| PersistError::StorageUnavailable)?;
+        if self.fault_after_partial_write {
+            return Err(PersistError::StorageUnavailable);
+        }
         for (payload_ref, payload) in payloads {
             tx.execute(
                 "INSERT INTO claim_payload (payload_ref, document) VALUES (?1, ?2)",
@@ -154,7 +169,13 @@ impl SqliteBaseline {
     ) -> Result<T, PersistError> {
         match result {
             Ok(value) => match self.commit() {
-                Ok(()) => Ok(value),
+                Ok(()) => match self.reload() {
+                    Ok(()) => Ok(value),
+                    Err(error) => {
+                        self.live = saved;
+                        Err(error)
+                    }
+                },
                 Err(error) => {
                     self.live = saved;
                     Err(error)
@@ -213,85 +234,69 @@ impl Persist for SqliteBaseline {
 
     fn seal_native_coordinate(
         &mut self,
-        scope: &NativeCoordinateScope,
-        coordinate: &SecretNativeCoordinate,
+        _scope: &NativeCoordinateScope,
+        _coordinate: &SecretNativeCoordinate,
     ) -> Result<PrivateNativeRef, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.seal_native_coordinate(scope, coordinate);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn open_native_coordinate(
         &self,
-        scope: &NativeCoordinateScope,
-        native_ref: &PrivateNativeRef,
+        _scope: &NativeCoordinateScope,
+        _native_ref: &PrivateNativeRef,
     ) -> Result<OpenedNativeCoordinate, PersistError> {
-        self.live.open_native_coordinate(scope, native_ref)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn record_dispatch_prepared(
         &mut self,
-        commit: PreparedDispatchCommit,
+        _commit: PreparedDispatchCommit,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.record_dispatch_prepared(commit);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn record_prewrite_conclusion(
         &mut self,
-        commit: PreWriteConclusionCommit,
+        _commit: PreWriteConclusionCommit,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.record_prewrite_conclusion(commit);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn record_active_hold(
         &mut self,
-        commit: ActiveHoldCommit,
+        _commit: ActiveHoldCommit,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.record_active_hold(commit);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn reserve_native_turn_write(
         &mut self,
-        idle: ValidatedIdlePermit,
-        correlation: &PersistedTurnCorrelation,
+        _idle: ValidatedIdlePermit,
+        _correlation: &PersistedTurnCorrelation,
     ) -> Result<NativeWriteReservation, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.reserve_native_turn_write(idle, correlation);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn record_native_write_evidence(
         &mut self,
-        commit: NativeWriteEvidenceCommit,
+        _commit: NativeWriteEvidenceCommit,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.record_native_write_evidence(commit);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn record_native_turn_fact(
         &mut self,
-        commit: NativeTurnFactCommit,
+        _commit: NativeTurnFactCommit,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.record_native_turn_fact(commit);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn record_reconciliation_fact(
         &mut self,
-        scope: ReconciliationScope,
-        disposition: &ReconciliationDisposition,
+        _scope: ReconciliationScope,
+        _disposition: &ReconciliationDisposition,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.record_reconciliation_fact(scope, disposition);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn revoke_controller_attachment(
@@ -382,11 +387,24 @@ impl ConformanceFixture for SqliteBaseline {
         snapshot: RecoverySnapshot,
         payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
     ) -> Result<Self::Store, PersistError> {
+        if unsupported_section(&snapshot) {
+            return Err(PersistError::StorageUnavailable);
+        }
         let mut store = Self::open();
         store.live = FakePersist::restore_from_snapshot(snapshot, payloads)?;
         store.commit()?;
+        store.reload()?;
         Ok(store)
     }
+}
+
+fn unsupported_section(snapshot: &RecoverySnapshot) -> bool {
+    !snapshot.turn_correlations.is_empty()
+        || !snapshot.reservations.is_empty()
+        || !snapshot.native_write_evidence.is_empty()
+        || !snapshot.reconciliations.is_empty()
+        || !snapshot.prewrite_conclusions.is_empty()
+        || !snapshot.active_observations.is_empty()
 }
 
 fn unique_suffix() -> u64 {
@@ -418,12 +436,27 @@ fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn stamp(time: OffsetDateTime) -> i64 {
-    time.unix_timestamp()
+fn stamp(time: OffsetDateTime) -> Value {
+    json!({
+        "secs": time.unix_timestamp(),
+        "nanos": time.nanosecond(),
+    })
 }
 
-fn unstamp(seconds: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(seconds).expect("timestamp")
+fn unstamp(value: &Value) -> OffsetDateTime {
+    let secs = value.get("secs").and_then(Value::as_i64).expect("secs");
+    let nanos =
+        u32::try_from(value.get("nanos").and_then(Value::as_u64).expect("nanos")).expect("nanos");
+    OffsetDateTime::from_unix_timestamp(secs).expect("secs")
+        + time::Duration::nanoseconds(i64::from(nanos))
+}
+
+fn time_field(value: &Value, key: &str) -> OffsetDateTime {
+    unstamp(value.get(key).expect(key))
+}
+
+fn u64_json(value: u64) -> Value {
+    Value::String(value.to_string())
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -435,7 +468,11 @@ fn int(value: &Value, key: &str) -> i64 {
 }
 
 fn u64_field(value: &Value, key: &str) -> u64 {
-    u64::try_from(int(value, key)).expect(key)
+    match value.get(key) {
+        Some(Value::String(text)) => text.parse().expect(key),
+        Some(Value::Number(number)) => number.as_u64().expect(key),
+        _ => panic!("{key}"),
+    }
 }
 
 fn u8_field(value: &Value, key: &str) -> u8 {
@@ -504,9 +541,10 @@ fn token<const MAX: usize>(value: &BoundedToken<MAX>) -> String {
     value.as_str().to_owned()
 }
 
-fn encode_snapshot(snapshot: &RecoverySnapshot) -> String {
+fn encode_durable(snapshot: &RecoverySnapshot, creates: &[ThreadCreateReservation]) -> String {
     json!({
-        "attempt_seq": snapshot.attempt_seq,
+        "attempt_seq": u64_json(snapshot.attempt_seq),
+        "creates": creates.iter().map(encode_create).collect::<Vec<_>>(),
         "arms": snapshot.arms.iter().map(encode_arm).collect::<Vec<_>>(),
         "claims": snapshot.claims.iter().map(encode_claim).collect::<Vec<_>>(),
         "attachments": snapshot.attachments.iter().map(encode_attachment).collect::<Vec<_>>(),
@@ -524,10 +562,18 @@ fn encode_snapshot(snapshot: &RecoverySnapshot) -> String {
     .to_string()
 }
 
+fn encode_create(create: &ThreadCreateReservation) -> Value {
+    json!({
+        "birth_id": hex(&create.birth_id.0),
+        "attempt": hex(&create.create_attempt_id.0),
+        "reserved_at": stamp(create.reserved_at),
+    })
+}
+
 fn encode_arm(arm: &PersistedArm) -> Value {
     json!({
         "arm_id": arm.arm_id.as_str(),
-        "generation": arm.generation,
+        "generation": u64_json(arm.generation),
         "seat_id": arm.seat_id.as_str(),
         "coverage_until": stamp(arm.coverage_until),
     })
@@ -538,7 +584,7 @@ fn encode_claim(claim: &PersistedClaimRecord) -> Value {
         "attempt_id": claim.attempt_id.as_str(),
         "request_id": claim.request_id.as_str(),
         "arm_id": claim.arm_id.as_str(),
-        "generation": claim.generation,
+        "generation": u64_json(claim.generation),
         "signal_id": claim.signal_id.as_str(),
         "event_refs": claim.event_refs.as_slice().iter().map(super::controller::EventRef::as_str).collect::<Vec<_>>(),
         "claim_digest": hex(&claim.claim_digest.0),
@@ -553,7 +599,7 @@ fn encode_coverage(coverage: &ClaimCoverageEvidence) -> Value {
     json!({
         "request_id": coverage.request_id.as_str(),
         "arm_id": coverage.arm_id.as_str(),
-        "generation": coverage.generation,
+        "generation": u64_json(coverage.generation),
         "signal_id": coverage.signal_id.as_str(),
         "provider": coverage.provider.as_str(),
         "scope": token(&coverage.drain_filter_scope),
@@ -579,7 +625,7 @@ fn encode_attachment(attachment: &PersistedControllerAttachment) -> Value {
         "birth_id": hex(&attachment.birth_id.0),
         "seat_id": attachment.seat_id.as_str(),
         "arm_id": attachment.arm_id.as_str(),
-        "generation": attachment.generation,
+        "generation": u64_json(attachment.generation),
         "lease_until": stamp(attachment.lease_until),
         "verifier_ref": hex(attachment.verifier_ref.bytes()),
         "revoked": attachment.revoked,
@@ -591,7 +637,7 @@ fn encode_birth(birth: &PersistedControllerBirth) -> Value {
         "birth_id": hex(&birth.birth_id.0),
         "seat_id": birth.seat_id.as_str(),
         "arm_id": birth.arm_id.as_str(),
-        "generation": birth.generation,
+        "generation": u64_json(birth.generation),
         "lease_until": stamp(birth.lease_until),
         "verifier_ref": hex(birth.verifier_ref.bytes()),
         "created_at": stamp(birth.created_at),
@@ -630,7 +676,7 @@ fn encode_grant(grant: &PersistedHelperGrant) -> Value {
         "grant_ref": hex(grant.grant_ref.bytes()),
         "seat_id": grant.seat_id.as_str(),
         "arm_id": grant.arm_id.as_str(),
-        "generation": grant.generation,
+        "generation": u64_json(grant.generation),
         "birth_id": hex(&grant.birth_id.0),
         "attempt_id": grant.attempt_id.as_str(),
         "signal_id": grant.signal_id.as_str(),
@@ -656,7 +702,7 @@ fn encode_origin(origin: &PersistedHelperBindingIdentity) -> Value {
         "grant_ref": hex(origin.grant_ref.bytes()),
         "seat_id": origin.seat_id.as_str(),
         "arm_id": origin.arm_id.as_str(),
-        "generation": origin.generation,
+        "generation": u64_json(origin.generation),
         "birth_id": hex(&origin.birth_id.0),
         "attempt_id": origin.attempt_id.as_str(),
         "signal_id": origin.signal_id.as_str(),
@@ -721,7 +767,7 @@ fn encode_handled(row: &PersistedHandledCoverage) -> Value {
 fn encode_join(row: &PersistedRearmJoin) -> Value {
     json!({
         "arm_id": row.arm_id.as_str(),
-        "generation": row.generation,
+        "generation": u64_json(row.generation),
         "attempt_id": row.attempt_id.as_str(),
         "signal_id": row.signal_id.as_str(),
     })
@@ -775,9 +821,14 @@ fn encode_payload(payload: &BoundedClaimPayload) -> String {
     .to_string()
 }
 
-fn decode_snapshot(document: &str) -> RecoverySnapshot {
+fn decode_durable(document: &str) -> (RecoverySnapshot, Vec<ThreadCreateReservation>) {
     let value: Value = serde_json::from_str(document).expect("snapshot json");
-    RecoverySnapshot {
+    let creates = value
+        .get("creates")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().map(decode_create).collect())
+        .unwrap_or_default();
+    let snapshot = RecoverySnapshot {
         arms: array(&value, "arms").iter().map(decode_arm).collect(),
         claims: array(&value, "claims").iter().map(decode_claim).collect(),
         attachments: array(&value, "attachments")
@@ -819,6 +870,15 @@ fn decode_snapshot(document: &str) -> RecoverySnapshot {
             .collect(),
         rearmed_joins: array(&value, "joins").iter().map(decode_join).collect(),
         attempt_seq: u64_field(&value, "attempt_seq"),
+    };
+    (snapshot, creates)
+}
+
+fn decode_create(value: &Value) -> ThreadCreateReservation {
+    ThreadCreateReservation {
+        birth_id: ControllerBirthId(bytes32_field(value, "birth_id")),
+        create_attempt_id: RequestNonce(bytes32_field(value, "attempt")),
+        reserved_at: time_field(value, "reserved_at"),
     }
 }
 
@@ -832,7 +892,7 @@ fn decode_arm(value: &Value) -> PersistedArm {
         generation: u64_field(value, "generation"),
         seat_id: seat_id(value, "seat_id"),
         capability: ManagedCapability::HandleClaimedSignal,
-        coverage_until: unstamp(int(value, "coverage_until")),
+        coverage_until: time_field(value, "coverage_until"),
     }
 }
 
@@ -846,7 +906,7 @@ fn decode_claim(value: &Value) -> PersistedClaimRecord {
         event_refs: event_refs(value.get("event_refs").expect("event refs")),
         claim_digest: ClaimDigest(bytes32_field(value, "claim_digest")),
         payload_ref: ClaimPayloadRef(bytes32_field(value, "payload_ref")),
-        claimed_at: unstamp(int(value, "claimed_at")),
+        claimed_at: time_field(value, "claimed_at"),
         coverage: value.get("coverage").and_then(|item| {
             if item.is_null() {
                 None
@@ -896,7 +956,7 @@ fn decode_attachment(value: &Value) -> PersistedControllerAttachment {
         arm_id: arm_id(value, "arm_id"),
         generation: u64_field(value, "generation"),
         capability: ManagedCapability::HandleClaimedSignal,
-        lease_until: unstamp(int(value, "lease_until")),
+        lease_until: time_field(value, "lease_until"),
         verifier_ref: VerifierRef::from_bytes(bytes32_field(value, "verifier_ref")),
         revoked: flag(value, "revoked"),
     }
@@ -909,9 +969,9 @@ fn decode_birth(value: &Value) -> PersistedControllerBirth {
         arm_id: arm_id(value, "arm_id"),
         generation: u64_field(value, "generation"),
         capability: ManagedCapability::HandleClaimedSignal,
-        lease_until: unstamp(int(value, "lease_until")),
+        lease_until: time_field(value, "lease_until"),
         verifier_ref: VerifierRef::from_bytes(bytes32_field(value, "verifier_ref")),
-        created_at: unstamp(int(value, "created_at")),
+        created_at: time_field(value, "created_at"),
         revoked: flag(value, "revoked"),
     }
 }
@@ -959,7 +1019,7 @@ fn decode_origin(value: &Value) -> PersistedHelperBindingIdentity {
         signal_id: signal_id(value, "signal_id"),
         claim_digest: ClaimDigest(bytes32_field(value, "claim_digest")),
         operations: ops_from(value.get("operations").expect("ops")),
-        lease_until: unstamp(int(value, "lease_until")),
+        lease_until: time_field(value, "lease_until"),
     }
 }
 
@@ -969,7 +1029,7 @@ fn decode_recorded(value: &Value) -> RecordedRetrieveResult {
         claim_payload_ref: ClaimPayloadRef(bytes32_field(value, "payload_ref")),
         newest_event_ref: event_ref(text(value, "newest")),
         event_count: u8_field(value, "event_count"),
-        retrieved_at: unstamp(int(value, "retrieved_at")),
+        retrieved_at: time_field(value, "retrieved_at"),
     }
 }
 
@@ -1003,7 +1063,7 @@ fn decode_ack(value: &Value) -> PersistedAckReplay {
             attempt_id: attempt_id(value, "attempt_id"),
             signal_id: signal_id(value, "signal_id"),
             cursor: event_ref(text(value, "result_cursor")),
-            accepted_at: unstamp(int(value, "accepted_at")),
+            accepted_at: time_field(value, "accepted_at"),
         },
     }
 }
@@ -1038,7 +1098,7 @@ fn decode_grant(value: &Value) -> PersistedHelperGrant {
         signal_id: signal_id(value, "signal_id"),
         claim_digest: ClaimDigest(bytes32_field(value, "claim_digest")),
         operations: ops_from(value.get("operations").expect("ops")),
-        lease_until: unstamp(int(value, "lease_until")),
+        lease_until: time_field(value, "lease_until"),
         executable_identity: HelperExecutableIdentity {
             image_digest: bytes32_field(value, "image_digest"),
             file_identity: BoundedToken::new(text(value, "file_identity")).expect("file"),
@@ -1094,7 +1154,7 @@ fn decode_payload(document: &str) -> BoundedClaimPayload {
                 .get("actor")
                 .and_then(Value::as_str)
                 .map(|actor| ActorName::new(actor).expect("actor")),
-            observed_at: unstamp(int(event, "observed_at")),
+            observed_at: time_field(event, "observed_at"),
             body: BoundedBody::new(text(event, "body")).expect("body"),
         })
         .collect::<Vec<_>>();
@@ -1144,8 +1204,16 @@ mod tests {
             other => panic!("ownership rows {}", other.len()),
         }
         drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
 
-        let torn = path.with_extension("torn");
+    #[test]
+    fn connection_close_rolls_back_an_uncommitted_transaction() {
+        let torn = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-close-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
         let conn = Connection::open(&torn).expect("torn open");
         conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE authority_snapshot (id INTEGER PRIMARY KEY, document TEXT NOT NULL); INSERT INTO authority_snapshot (id, document) VALUES (1, '{}');")
             .expect("begin");
@@ -1160,7 +1228,161 @@ mod tests {
             .expect("master");
         assert_eq!(present, 0);
         drop(reopened);
-        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&torn);
+    }
+
+    #[test]
+    fn reopened_sql_preserves_payload_replay_ack_and_grant_rotation() {
+        let path = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-helper-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut store = SqliteBaseline::open_path(&path);
+        let (binding, _, _) = conformance::install_helper(&mut store);
+        let exchange = conformance::retrieve_for(&binding, 21);
+        let authorized = match store.record_retrieve_exchange(&exchange).expect("retrieve") {
+            IdempotentResult::Recorded(authorized) => authorized,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let payload = store
+            .materialize_claimed_batch(&binding, authorized.permit)
+            .expect("materialize");
+        assert_eq!(payload.events.as_slice().len(), 2);
+        let request =
+            conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 22);
+        store
+            .acknowledge_retrieved_batch(&binding, &request)
+            .expect("ack");
+        drop(store);
+        let mut reopened = SqliteBaseline::open_path(&path);
+        let replay = match reopened
+            .record_retrieve_exchange(&exchange)
+            .expect("replay")
+        {
+            IdempotentResult::ExactReplay(authorized) => authorized,
+            IdempotentResult::Recorded(_) => panic!("reopen must replay"),
+        };
+        let replayed = reopened
+            .materialize_claimed_batch(&binding, replay.permit)
+            .expect("replay materialize");
+        assert_eq!(replayed.events.as_slice().len(), 2);
+        match reopened
+            .acknowledge_retrieved_batch(&binding, &request)
+            .expect("ack replay")
+        {
+            IdempotentResult::ExactReplay(_) => {}
+            IdempotentResult::Recorded(_) => panic!("ack must replay"),
+        }
+        let before = reopened.recover_authority_state().expect("before");
+        let prior = before.helper_grants[0].clone();
+        let mut replacement = prior.clone();
+        replacement.grant_verifier = [0x44; 32];
+        replacement.grant_ref = VerifierRef::fixture(15);
+        reopened.persist_helper_grant(&replacement).expect("rotate");
+        reopened
+            .revoke_helper_grant(HelperRevocationScope {
+                grant_ref: replacement.grant_ref.clone(),
+                birth_id: binding.birth_id.clone(),
+                attempt_id: binding.attempt_id.clone(),
+            })
+            .expect("revoke");
+        drop(reopened);
+        let mut revoked = SqliteBaseline::open_path(&path);
+        let snapshot = revoked.recover_authority_state().expect("rotated");
+        assert!(snapshot.retired_helper_grants.iter().any(|grant| {
+            grant.grant_ref == prior.grant_ref && grant.grant_verifier == prior.grant_verifier
+        }));
+        assert!(snapshot.helper_grants.iter().any(|grant| grant.revoked));
+        assert_eq!(snapshot.ack_replays.len(), 1);
+        drop(revoked);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn codec_preserves_fractional_time_and_u64_boundary() {
+        let parts = conformance::birth_parts();
+        let mut birth = parts.birth;
+        birth.lease_until = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(1)
+            + time::Duration::nanoseconds(123_456_789);
+        birth.created_at = birth.lease_until;
+        let mut snapshot = RecoverySnapshot {
+            attempt_seq: u64::MAX,
+            ..RecoverySnapshot::default()
+        };
+        snapshot.controller_births.push(birth.clone());
+        let (decoded, _) = decode_durable(&encode_durable(&snapshot, &[]));
+        assert_eq!(decoded.attempt_seq, u64::MAX);
+        assert_eq!(decoded.controller_births[0].lease_until, birth.lease_until);
+        assert_eq!(decoded.controller_births[0].created_at, birth.created_at);
+    }
+
+    #[test]
+    fn commit_fault_keeps_the_previous_sql_pair() {
+        let path = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-fault-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut store = SqliteBaseline::open_path(&path);
+        let parts = conformance::birth_parts();
+        store
+            .reserve_controller_birth(&parts.birth, &parts.reservation)
+            .expect("reserve");
+        let before = store.recover_authority_state().expect("before");
+        store.fault_after_partial_write = true;
+        let error = store
+            .persist_arm(&PersistedArm {
+                arm_id: parts.birth.arm_id.clone(),
+                generation: parts.birth.generation,
+                seat_id: parts.birth.seat_id.clone(),
+                capability: parts.birth.capability,
+                coverage_until: parts.birth.lease_until,
+            })
+            .expect_err("fault");
+        assert!(matches!(error, PersistError::StorageUnavailable));
+        let live = store.recover_authority_state().expect("live");
+        assert_eq!(live.ownership.len(), before.ownership.len());
+        assert!(live.arms.is_empty());
+        drop(store);
+        let mut reopened = SqliteBaseline::open_path(&path);
+        let snapshot = reopened.recover_authority_state().expect("sql");
+        assert_eq!(snapshot.ownership.len(), before.ownership.len());
+        assert!(snapshot.arms.is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unsupported_native_sections_fail_before_a_commit() {
+        let path = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-refuse-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut store = SqliteBaseline::open_path(&path);
+        let parts = conformance::birth_parts();
+        let error = store
+            .seal_native_coordinate(
+                &NativeCoordinateScope::Thread {
+                    birth_id: parts.birth.birth_id.clone(),
+                    create_attempt_id: parts.reservation.create_attempt_id.clone(),
+                },
+                &SecretNativeCoordinate::thread("native-thread").expect("coordinate"),
+            )
+            .expect_err("seal");
+        assert!(matches!(error, PersistError::StorageUnavailable));
+        drop(store);
+        let reopened = SqliteBaseline::open_path(&path);
+        let count: i64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM authority_snapshot", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 0);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
     }
 }

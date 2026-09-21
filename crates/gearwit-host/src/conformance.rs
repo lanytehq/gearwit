@@ -1330,7 +1330,7 @@ fn copy_binding(binding: &ValidatedHelperBinding) -> ValidatedHelperBinding {
     }
 }
 
-fn retrieve_for(binding: &ValidatedHelperBinding, nonce: u8) -> RetrieveExchange {
+pub(crate) fn retrieve_for(binding: &ValidatedHelperBinding, nonce: u8) -> RetrieveExchange {
     let binding = copy_binding(binding);
     let request_id = RequestNonce::fixture(nonce);
     let canonical_body_digest =
@@ -1342,7 +1342,7 @@ fn retrieve_for(binding: &ValidatedHelperBinding, nonce: u8) -> RetrieveExchange
     }
 }
 
-fn ack_for(
+pub(crate) fn ack_for(
     binding: &ValidatedHelperBinding,
     retrieval_id: &RetrievalId,
     cursor: &str,

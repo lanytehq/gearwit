@@ -2265,6 +2265,40 @@ impl FakePersist {
         self.payloads.clone()
     }
 
+    /// Working create reservations. Recovery quarantines ownership and does
+    /// not carry this map, so a durable reload must restore it separately.
+    #[cfg(test)]
+    pub(crate) fn export_creates(&self) -> Vec<ThreadCreateReservation> {
+        self.creates.values().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn export_ownership(&self) -> Vec<PersistedThreadOwnership> {
+        self.ownership
+            .iter()
+            .map(|(birth_id, state)| PersistedThreadOwnership {
+                birth_id: birth_id.clone(),
+                state: state.clone(),
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_creates(&mut self, creates: Vec<ThreadCreateReservation>) {
+        self.creates = creates
+            .into_iter()
+            .map(|create| (create.birth_id.clone(), create))
+            .collect();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_ownership(&mut self, rows: Vec<PersistedThreadOwnership>) {
+        self.ownership = rows
+            .into_iter()
+            .map(|row| (row.birth_id.clone(), row.state))
+            .collect();
+    }
+
     #[must_use]
     pub fn prewrite_conclusion(&self, attempt_id: &str) -> Option<&PreWriteConclusion> {
         self.prewrite
