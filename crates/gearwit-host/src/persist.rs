@@ -1525,7 +1525,7 @@ fn canonical_binding_identity_digest(origin: &PersistedHelperBindingIdentity) ->
     *hasher.finalize().as_bytes()
 }
 
-fn canonical_binding_digest(binding: &ValidatedHelperBinding) -> [u8; 32] {
+pub(crate) fn canonical_binding_digest(binding: &ValidatedHelperBinding) -> [u8; 32] {
     canonical_binding_identity_digest(&snapshot_binding_identity(binding))
 }
 
@@ -1696,7 +1696,7 @@ impl FakePersist {
 
     #[cfg(test)]
     #[allow(clippy::too_many_lines)]
-    fn restore_from_snapshot(
+    pub(crate) fn restore_from_snapshot(
         snapshot: RecoverySnapshot,
         payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
     ) -> Result<Self, PersistError> {
@@ -2255,6 +2255,14 @@ impl FakePersist {
     #[cfg(test)]
     pub(crate) fn drop_payload(&mut self, payload_ref: &ClaimPayloadRef) -> bool {
         self.payloads.remove(payload_ref).is_some()
+    }
+
+    /// Payload partition paired with [`Self::restore_from_snapshot`].
+    /// Recovery snapshots stay body-free; admission tests supply this map
+    /// separately. Not a persistence-port method.
+    #[cfg(test)]
+    pub(crate) fn claim_payloads(&self) -> BTreeMap<ClaimPayloadRef, BoundedClaimPayload> {
+        self.payloads.clone()
     }
 
     #[must_use]

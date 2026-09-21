@@ -7,6 +7,8 @@ mod admit;
 mod authority;
 #[allow(dead_code)] // Kept private until a host integration point is approved.
 mod codex_transport;
+#[cfg(test)]
+mod conformance;
 #[allow(dead_code)] // Private until the native adapter is wired into gearwitd.
 mod controller;
 #[allow(dead_code)] // Private until the native adapter is wired into gearwitd.
