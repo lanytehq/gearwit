@@ -553,9 +553,9 @@ const CATALOG: &[ConformanceCase] = &[
     gap!(
         "auth.link-loss",
         Revocation,
-        Unauthorized,
+        InvalidTransition,
         NATIVE,
-        "fresh helper use and the controller path refuse use after link loss; an authenticated exact helper replay remains valid"
+        "fresh helper use after controller link loss returns InvalidTransition; an authenticated exact helper replay remains valid, and revocation still precedes this path"
     ),
     gap!(
         "claim.request-id-stable",
@@ -939,7 +939,7 @@ const MATRIX: &[MatrixRow] = &[
             pred!("stale generation" => "auth.stale-generation"),
             pred!("expired lease" => "auth.expired-lease"),
             pred!("mismatched controller" => "auth.mismatched-controller"),
-            pred!("link loss on fresh use or the controller path" => "auth.link-loss"),
+            pred!("fresh helper controller-loss returns InvalidTransition" => "auth.link-loss"),
             pred!("exact helper replay survives lease expiry" => "auth.exact-helper-replay-survives-lease"),
         ],
     },
@@ -2130,6 +2130,10 @@ mod tests {
                 .expect("fixed-time")
                 .required,
             RequiredOutcome::FixedTimeComparison
+        );
+        assert_eq!(
+            case("auth.link-loss").expect("link-loss").required,
+            RequiredOutcome::InvalidTransition
         );
         let body_free = matrix()
             .iter()
