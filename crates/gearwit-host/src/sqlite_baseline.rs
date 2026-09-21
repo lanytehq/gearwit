@@ -47,6 +47,7 @@ pub(crate) struct SqliteBaseline {
 struct BaselineFault {
     after_partial_write: bool,
     reload_after_commit: bool,
+    pause_before_commit: bool,
 }
 
 impl Drop for SqliteBaseline {
@@ -96,6 +97,7 @@ impl SqliteBaseline {
             fault: BaselineFault {
                 after_partial_write: false,
                 reload_after_commit: false,
+                pause_before_commit: false,
             },
             poisoned: false,
         };
@@ -175,6 +177,12 @@ impl SqliteBaseline {
                 params![hex(&payload_ref.0), encode_payload(&payload)],
             )
             .map_err(|_| PersistError::StorageUnavailable)?;
+        }
+        if self.fault.pause_before_commit {
+            let (journal, synchronous) = connection_pragmas(&tx);
+            write_writer_config(&self.path, &journal, synchronous);
+            write_marker(&self.path, "PRE_COMMIT");
+            std::thread::sleep(std::time::Duration::from_secs(60));
         }
         tx.commit().map_err(|_| PersistError::StorageUnavailable)?;
         Ok(())
@@ -1317,17 +1325,6 @@ fn filesystem_type(path: &Path) -> String {
         .to_owned()
 }
 
-fn sqlite_durability(path: &Path) -> (String, i64) {
-    let conn = Connection::open(path).expect("durability open");
-    let journal: String = conn
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .expect("journal");
-    let synchronous: i64 = conn
-        .query_row("PRAGMA synchronous", [], |row| row.get(0))
-        .expect("synchronous");
-    (journal, synchronous)
-}
-
 fn crash_writer(role: &str) {
     let path = std::env::var("GEARWIT_CRASH_PATH").expect("path");
     let path = PathBuf::from(path);
@@ -1342,24 +1339,22 @@ fn crash_writer(role: &str) {
     store
         .acknowledge_retrieved_batch(&binding, &request)
         .expect("ack");
+    save_expected(&path, &mut store);
     if role == "pre" {
-        drop(store);
-        let conn = Connection::open(&path).expect("dirty open");
-        conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             UPDATE authority_snapshot SET document = 'DIRTY' WHERE id = 1;",
-        )
-        .expect("dirty begin");
-        write_marker(&path, "PRE_COMMIT");
-        println!("PRE_COMMIT");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        std::thread::sleep(std::time::Duration::from_secs(60));
-        let _ = conn;
+        store.fault.pause_before_commit = true;
+        let extra = PersistedArm {
+            arm_id: ArmId::new("arm-extra").expect("arm"),
+            generation: 2,
+            seat_id: binding.seat_id.clone(),
+            capability: ManagedCapability::HandleClaimedSignal,
+            coverage_until: binding.lease_until,
+        };
+        let _ = store.persist_arm(&extra);
         return;
     }
+    let (journal, synchronous) = connection_pragmas(&store.conn);
+    write_writer_config(&path, &journal, synchronous);
     write_marker(&path, "POST_COMMIT");
-    println!("POST_COMMIT");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
     std::thread::sleep(std::time::Duration::from_secs(60));
     let _ = store;
 }
@@ -1400,15 +1395,195 @@ fn kill_writer_at(path: &Path, role: &str, marker: &str) {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(
-        reached,
-        "writer exited before {marker}: {}",
-        std::fs::read_to_string(&stderr_path).unwrap_or_default()
-    );
+    if !reached {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "writer exited before {marker}: {}",
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+    }
     child.kill().expect("sigkill");
     let status = child.wait().expect("wait");
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
     assert_eq!(signal, Some(9), "writer status {status:?}");
+}
+
+fn host_version(flag: &str) -> String {
+    let output = std::process::Command::new("sw_vers")
+        .arg(flag)
+        .output()
+        .expect("sw_vers");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn process_crash_supported() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+fn connection_pragmas(conn: &Connection) -> (String, i64) {
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal");
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .expect("synchronous");
+    (journal, synchronous)
+}
+
+fn write_writer_config(path: &Path, journal: &str, synchronous: i64) {
+    let config = path.with_extension("sqlite-config");
+    let mut file = std::fs::File::create(&config).expect("config");
+    let body = format!("{journal}\n{synchronous}\n");
+    std::io::Write::write_all(&mut file, body.as_bytes()).expect("config write");
+    file.sync_all().expect("config sync");
+}
+
+fn read_writer_config(path: &Path) -> (String, i64) {
+    let text = std::fs::read_to_string(path.with_extension("sqlite-config")).expect("config");
+    let mut lines = text.lines();
+    let journal = lines.next().expect("journal").to_owned();
+    let synchronous = lines.next().expect("synchronous").parse().expect("sync");
+    (journal, synchronous)
+}
+
+fn save_expected(path: &Path, store: &mut SqliteBaseline) {
+    let snapshot = store.recover_authority_state().expect("expected snapshot");
+    let payloads = store.live.claim_payloads();
+    let creates = store.live.export_creates();
+    let mut payload_docs = serde_json::Map::new();
+    for (payload_ref, payload) in &payloads {
+        payload_docs.insert(
+            hex(&payload_ref.0),
+            serde_json::Value::String(encode_payload(payload)),
+        );
+    }
+    let body = serde_json::json!({
+        "durable": encode_durable(&snapshot, &creates),
+        "payloads": payload_docs,
+    })
+    .to_string();
+    let mut file = std::fs::File::create(path.with_extension("expected")).expect("expected");
+    std::io::Write::write_all(&mut file, body.as_bytes()).expect("expected write");
+    file.sync_all().expect("expected sync");
+}
+
+fn load_expected(
+    path: &Path,
+) -> (
+    RecoverySnapshot,
+    Vec<ThreadCreateReservation>,
+    BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
+) {
+    let text = std::fs::read_to_string(path.with_extension("expected")).expect("expected");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("expected json");
+    let (snapshot, creates) = decode_durable(
+        value
+            .get("durable")
+            .and_then(|item| item.as_str())
+            .expect("durable"),
+    );
+    let mut payloads = BTreeMap::new();
+    for (payload_ref, document) in value
+        .get("payloads")
+        .and_then(|item| item.as_object())
+        .expect("payloads")
+    {
+        payloads.insert(
+            ClaimPayloadRef(unhex32(payload_ref)),
+            decode_payload(document.as_str().expect("payload")),
+        );
+    }
+    (snapshot, creates, payloads)
+}
+
+pub(crate) fn run_process_crash(id: &str) -> Result<(), String> {
+    if !process_crash_supported() {
+        return Err(format!("unqualified: {id}"));
+    }
+    let (role, marker) = match id {
+        "snapshot.reopened-media.post-commit" => ("post", "POST_COMMIT"),
+        "snapshot.reopened-media.pre-commit" => ("pre", "PRE_COMMIT"),
+        other => return Err(format!("not a process-crash case: {other}")),
+    };
+    let path = std::env::temp_dir().join(format!(
+        "gearwit-process-crash-{role}-{}-{}.sqlite",
+        std::process::id(),
+        unique_suffix()
+    ));
+    if filesystem_type(path.parent().unwrap_or(Path::new("/tmp"))) != "apfs" {
+        return Err(format!("unqualified filesystem: {id}"));
+    }
+    let product = host_version("-productVersion");
+    let build = host_version("-buildVersion");
+    if product.is_empty() || build.is_empty() {
+        return Err(format!("unqualified host version: {id}"));
+    }
+    kill_writer_at(&path, role, marker);
+    let (journal, synchronous) = read_writer_config(&path);
+    if journal != "delete" || synchronous != 2 {
+        return Err(format!("writer durability {journal} {synchronous}"));
+    }
+    let (expected, creates, payloads) = load_expected(&path);
+    let mut fresh = SqliteBaseline::open_path(&path);
+    let actual = fresh
+        .recover_authority_state()
+        .map_err(|error| format!("{error:?}"))?;
+    if actual != expected {
+        return Err("reopened authority differs from the expected pair".into());
+    }
+    if fresh.live.claim_payloads() != payloads {
+        return Err("reopened payloads differ from the expected pair".into());
+    }
+    if fresh.live.export_creates() != creates {
+        return Err("reopened reservations differ from the expected pair".into());
+    }
+    if actual
+        .arms
+        .iter()
+        .any(|arm| arm.arm_id.as_str() == "arm-extra")
+    {
+        return Err("partial arm survived process death".into());
+    }
+    let binding = binding_from_grant(&actual.helper_grants[0]);
+    let exchange = conformance::retrieve_for(&binding, 41);
+    let authorized = match fresh
+        .record_retrieve_exchange(&exchange)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        IdempotentResult::ExactReplay(authorized) => authorized,
+        IdempotentResult::Recorded(_) => {
+            return Err("retrieve was not the committed replay".into());
+        }
+    };
+    if authorized.recorded != actual.retrieve_replays[0].result {
+        return Err("retrieve result differs from the expected replay".into());
+    }
+    let payload = fresh
+        .materialize_claimed_batch(&binding, authorized.permit)
+        .map_err(|error| format!("{error:?}"))?;
+    if &payload
+        != payloads
+            .get(&authorized.recorded.claim_payload_ref)
+            .expect("payload")
+    {
+        return Err("materialized payload differs from the expected bytes".into());
+    }
+    let request = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 42);
+    match fresh
+        .acknowledge_retrieved_batch(&binding, &request)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        IdempotentResult::ExactReplay(result) if result == actual.ack_replays[0].result => {}
+        _ => return Err("ack was not the committed replay".into()),
+    }
+    drop(fresh);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("marker"));
+    let _ = std::fs::remove_file(path.with_extension("expected"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-config"));
+    let _ = std::fs::remove_file(path.with_extension("stderr"));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1804,63 +1979,17 @@ mod tests {
             crash_writer(&role);
             return;
         }
-        assert_eq!(std::env::consts::OS, "macos");
-        assert_eq!(std::env::consts::ARCH, "aarch64");
-        let root = std::env::temp_dir().join(format!(
-            "gearwit-process-crash-{}-{}",
-            std::process::id(),
-            unique_suffix()
-        ));
-        std::fs::create_dir_all(&root).expect("dir");
-        let filesystem = filesystem_type(&root);
-        assert_eq!(filesystem, "apfs");
-
-        let post = root.join("post.sqlite");
-        kill_writer_at(&post, "post", "POST_COMMIT");
-        let (journal, synchronous) = sqlite_durability(&post);
-        assert_eq!(journal, "delete");
-        assert_eq!(synchronous, 2);
-        let mut fresh = SqliteBaseline::open_path(&post);
-        let snapshot = fresh.recover_authority_state().expect("post reopen");
-        assert_eq!(snapshot.claims.len(), 1);
-        assert_eq!(snapshot.retrieve_replays.len(), 1);
-        assert_eq!(snapshot.ack_replays.len(), 1);
-        let binding = binding_from_grant(&snapshot.helper_grants[0]);
-        let exchange = conformance::retrieve_for(&binding, 41);
-        match fresh.record_retrieve_exchange(&exchange).expect("replay") {
-            IdempotentResult::ExactReplay(authorized) => {
-                let payload = fresh
-                    .materialize_claimed_batch(&binding, authorized.permit)
-                    .expect("materialize");
-                assert_eq!(payload.events.as_slice().len(), 2);
-            }
-            IdempotentResult::Recorded(_) => panic!("committed retrieve must replay after SIGKILL"),
-        }
-        drop(fresh);
-
-        let prior = root.join("prior.sqlite");
-        kill_writer_at(&prior, "pre", "PRE_COMMIT");
-        let mut reopened = SqliteBaseline::open_path(&prior);
-        let snapshot = reopened.recover_authority_state().expect("pre reopen");
-        assert_eq!(snapshot.claims.len(), 1);
-        assert!(
-            snapshot
-                .arms
-                .iter()
-                .all(|arm| arm.arm_id.as_str() != "arm-dirty")
-        );
-        let binding = binding_from_grant(&snapshot.helper_grants[0]);
-        let exchange = conformance::retrieve_for(&binding, 41);
-        match reopened
-            .record_retrieve_exchange(&exchange)
-            .expect("prior replay")
-        {
-            IdempotentResult::ExactReplay(_) => {}
-            IdempotentResult::Recorded(_) => {
-                panic!("open transaction must not replace the committed retrieve")
+        for id in [
+            "snapshot.reopened-media.post-commit",
+            "snapshot.reopened-media.pre-commit",
+        ] {
+            match run_process_crash(id) {
+                Ok(()) => assert!(process_crash_supported(), "{id} passed while unqualified"),
+                Err(error) if error.contains("unqualified") => {
+                    assert!(!process_crash_supported(), "{id}: {error}");
+                }
+                Err(error) => panic!("{id}: {error}"),
             }
         }
-        drop(reopened);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
