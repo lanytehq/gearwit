@@ -331,6 +331,11 @@ impl VerifierRef {
     pub(crate) const fn fixture(byte: u8) -> Self {
         Self([byte; 32])
     }
+
+    #[cfg(test)]
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl RequestNonce {

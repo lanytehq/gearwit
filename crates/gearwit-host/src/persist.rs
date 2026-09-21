@@ -1106,7 +1106,7 @@ pub enum PersistError {
     StorageUnavailable,
 }
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 

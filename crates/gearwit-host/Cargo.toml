@@ -28,3 +28,6 @@ sysprims-signal = { git = "https://github.com/3leaps/sysprims", tag = "v0.2.3" }
 time = { version = "0.3", default-features = false, features = ["parsing", "formatting", "macros"] }
 ulid = "1"
 zeroize = "1"
+
+[dev-dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled"] }

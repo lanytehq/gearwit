@@ -1173,7 +1173,14 @@ impl ConformanceFixture for FakeFixture {
     }
 
     fn prepare() -> Prepared<Self::Store> {
-        prepare_fake()
+        let mut store = FakePersist::default();
+        let (binding, admission, attachment) = install_helper(&mut store);
+        Prepared {
+            store,
+            binding,
+            admission,
+            attachment,
+        }
     }
 
     fn payloads(store: &Self::Store) -> BTreeMap<ClaimPayloadRef, BoundedClaimPayload> {
@@ -1188,12 +1195,12 @@ impl ConformanceFixture for FakeFixture {
     }
 }
 
-struct BirthParts {
-    birth: PersistedControllerBirth,
-    reservation: ThreadCreateReservation,
+pub(crate) struct BirthParts {
+    pub(crate) birth: PersistedControllerBirth,
+    pub(crate) reservation: ThreadCreateReservation,
 }
 
-fn birth_parts() -> BirthParts {
+pub(crate) fn birth_parts() -> BirthParts {
     let birth_id = ControllerBirthId::fixture(1);
     let lease_until = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
     BirthParts {
@@ -1226,8 +1233,13 @@ fn wire_event(event_ref: &str, body: &str) -> ProviderEvent {
     }
 }
 
-fn prepare_fake() -> Prepared<FakePersist> {
-    let mut store = FakePersist::default();
+pub(crate) fn install_helper(
+    store: &mut impl Persist,
+) -> (
+    ValidatedHelperBinding,
+    ClaimAdmission,
+    PersistedControllerAttachment,
+) {
     let parts = birth_parts();
     let lease_until = parts.birth.lease_until;
     store
@@ -1300,12 +1312,7 @@ fn prepare_fake() -> Prepared<FakePersist> {
         operations: HelperOperations::all(),
         lease_until,
     };
-    Prepared {
-        store,
-        binding,
-        admission,
-        attachment,
-    }
+    (binding, admission, attachment)
 }
 
 fn copy_binding(binding: &ValidatedHelperBinding) -> ValidatedHelperBinding {

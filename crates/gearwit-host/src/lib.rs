@@ -18,6 +18,8 @@ mod link;
 mod paths;
 #[allow(dead_code)] // Semantic fake precedes the production persistence backend.
 mod persist;
+#[cfg(test)]
+mod sqlite_baseline;
 
 pub use ack::{
     AckRearm, AckStore, HandledServe, apply_handled_request, rearm_from_handled, record_handled,
