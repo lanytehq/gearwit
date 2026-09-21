@@ -282,6 +282,18 @@ fn insert_unique<K: Ord, V>(
     }
 }
 
+#[cfg(test)]
+fn retrieve_result_matches_claim(
+    result: &RecordedRetrieveResult,
+    claim: &PersistedClaimRecord,
+) -> bool {
+    let newest = claim.event_refs.as_slice().last();
+    let count = u8::try_from(claim.event_refs.as_slice().len()).ok();
+    result.claim_payload_ref == claim.payload_ref
+        && newest == Some(&result.newest_event_ref)
+        && count == Some(result.event_count)
+}
+
 fn claim_is_drain_prefix(claim_refs: &[EventRef], drain: &[EventRef]) -> bool {
     claim_refs.len() <= drain.len() && drain[..claim_refs.len()] == *claim_refs
 }
@@ -1769,6 +1781,7 @@ impl FakePersist {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_lines)]
     fn validate_restored_helper_invariants(&self) -> Result<(), PersistError> {
         let mut grant_keys = BTreeSet::new();
         for grant in &self.grants {
@@ -1779,12 +1792,30 @@ impl FakePersist {
                 return Err(PersistError::Conflict);
             }
         }
+        for stored in self.retrievals.values() {
+            let claim = self.unique_claim_for_payload(&stored.result.claim_payload_ref)?;
+            if !retrieve_result_matches_claim(&stored.result, claim) {
+                return Err(PersistError::Conflict);
+            }
+        }
         for replay in self.retrieve_replays.values() {
             let stored = self
                 .retrievals
                 .get(&replay.result.retrieval_id)
                 .ok_or(PersistError::Conflict)?;
-            if stored.binding_digest != replay.binding_digest || stored.result != replay.result {
+            if stored.binding_digest != replay.binding_digest
+                || stored.result != replay.result
+                || stored.retrieval_id != replay.result.retrieval_id
+            {
+                return Err(PersistError::Conflict);
+            }
+            let claim = self.unique_claim_for_payload(&replay.result.claim_payload_ref)?;
+            if !retrieve_result_matches_claim(&replay.result, claim) {
+                return Err(PersistError::Conflict);
+            }
+            let expected =
+                canonical_retrieve_body_digest(&replay.binding_digest, &replay.request_id);
+            if expected != replay.canonical_body_digest {
                 return Err(PersistError::Conflict);
             }
         }
@@ -1793,7 +1824,37 @@ impl FakePersist {
                 .retrievals
                 .get(&replay.retrieval_id)
                 .ok_or(PersistError::Conflict)?;
-            if stored.result.retrieval_id != replay.retrieval_id {
+            if stored.binding_digest != replay.binding_digest
+                || stored.result.retrieval_id != replay.retrieval_id
+            {
+                return Err(PersistError::Conflict);
+            }
+            let expected = canonical_ack_body_digest(
+                &replay.binding_digest,
+                &replay.request_id,
+                &replay.retrieval_id,
+                &replay.cursor,
+            );
+            if expected != replay.canonical_body_digest {
+                return Err(PersistError::Conflict);
+            }
+            let claim = self.unique_claim_for_payload(&stored.result.claim_payload_ref)?;
+            if replay.result.attempt_id != claim.attempt_id
+                || replay.result.signal_id != claim.signal_id
+                || replay.result.cursor != replay.cursor
+            {
+                return Err(PersistError::Conflict);
+            }
+            let payload = self.payloads.get(&claim.payload_ref);
+            let proved = proved_ack_index(claim, claim.event_refs.as_slice(), payload)
+                .map_err(|_| PersistError::Conflict)?;
+            let position = claim
+                .event_refs
+                .as_slice()
+                .iter()
+                .position(|event_ref| event_ref == &replay.cursor)
+                .ok_or(PersistError::Conflict)?;
+            if position > proved {
                 return Err(PersistError::Conflict);
             }
         }
@@ -1801,12 +1862,23 @@ impl FakePersist {
             let claim = self
                 .claim_for_attempt(&coverage.attempt_id)
                 .ok_or(PersistError::Conflict)?;
-            if !claim
+            if coverage.signal_id != claim.signal_id {
+                return Err(PersistError::Conflict);
+            }
+            let payload = self.payloads.get(&claim.payload_ref);
+            let proved = proved_ack_index(claim, claim.event_refs.as_slice(), payload)
+                .map_err(|_| PersistError::Conflict)?;
+            let position = claim
                 .event_refs
                 .as_slice()
                 .iter()
-                .any(|event_ref| event_ref == &coverage.cursor)
-            {
+                .position(|event_ref| event_ref == &coverage.cursor)
+                .ok_or(PersistError::Conflict)?;
+            if position > proved {
+                return Err(PersistError::Conflict);
+            }
+            let newest = claim.event_refs.as_slice().last() == Some(&coverage.cursor);
+            if coverage.covered_through_newest != newest {
                 return Err(PersistError::Conflict);
             }
         }
@@ -1820,8 +1892,31 @@ impl FakePersist {
             {
                 return Err(PersistError::Conflict);
             }
+            let handled_through_newest = self.handled.get(attempt_id).is_some_and(|coverage| {
+                coverage.signal_id == *signal_id && coverage.covered_through_newest
+            });
+            if !handled_through_newest || !self.attempt_terminal(attempt_id) {
+                return Err(PersistError::Conflict);
+            }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn unique_claim_for_payload(
+        &self,
+        payload_ref: &ClaimPayloadRef,
+    ) -> Result<&PersistedClaimRecord, PersistError> {
+        let mut found = None;
+        for claim in self.claims.values() {
+            if claim.payload_ref == *payload_ref {
+                if found.is_some() {
+                    return Err(PersistError::Conflict);
+                }
+                found = Some(claim);
+            }
+        }
+        found.ok_or(PersistError::Conflict)
     }
 
     fn mint_retrieve_permit(
@@ -3099,9 +3194,6 @@ impl Persist for FakePersist {
             scope.attempt_id.clone(),
             scope.signal_id.clone(),
         );
-        if self.rearmed.contains(&key) {
-            return Ok(RearmJoinResult::AlreadyRearmed);
-        }
         let scope_matches_claim = self.claims.values().any(|claim| {
             claim.attempt_id == scope.attempt_id
                 && claim.arm_id == scope.arm_id
@@ -3111,14 +3203,16 @@ impl Persist for FakePersist {
         let handled_through_newest = self.handled.get(&scope.attempt_id).is_some_and(|coverage| {
             coverage.signal_id == scope.signal_id && coverage.covered_through_newest
         });
+        let recognized_terminal = self.attempt_terminal(&scope.attempt_id);
+        if self.rearmed.contains(&key) {
+            if scope_matches_claim && handled_through_newest && recognized_terminal {
+                return Ok(RearmJoinResult::AlreadyRearmed);
+            }
+            return Err(PersistError::Conflict);
+        }
         if !scope_matches_claim || !handled_through_newest {
             return Ok(RearmJoinResult::WaitingForHandled);
         }
-        let recognized_terminal = self.turn_facts.get(&scope.attempt_id).is_some_and(|facts| {
-            facts
-                .iter()
-                .any(|fact| matches!(fact, NativeTurnFact::Terminal { .. }))
-        });
         if !recognized_terminal {
             return Ok(RearmJoinResult::WaitingForRecognizedTerminal);
         }
@@ -5915,6 +6009,146 @@ mod tests {
             lost_restored.record_retrieve_exchange(&lost_exchange),
             &lost_recorded,
         );
+    }
+
+    #[test]
+    fn restore_rejects_forged_ack_handled_and_join() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 241);
+        let authorized = expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        let recorded = authorized.recorded.clone();
+        let ack = ack_for(&setup.binding, &recorded.retrieval_id, "event-a", 242);
+        setup
+            .store
+            .acknowledge_retrieved_batch(&setup.binding, &ack)
+            .expect("ack");
+        let payloads = setup.store.payloads.clone();
+        let snapshot = setup.store.recover_authority_state().expect("snapshot");
+
+        let mut forged_result = snapshot.clone();
+        forged_result.ack_replays[0].result.cursor = EventRef::new("event-b").expect("ref");
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(forged_result, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut forged_binding = snapshot.clone();
+        forged_binding.ack_replays[0].binding_digest = [0x11; 32];
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(forged_binding, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut forged_digest = snapshot.clone();
+        forged_digest.ack_replays[0].canonical_body_digest =
+            CanonicalBodyDigest::from_bytes([0x22; 32]);
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(forged_digest, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut forged_cursor = snapshot.clone();
+        forged_cursor.ack_replays[0].cursor = EventRef::new("event-b").expect("ref");
+        forged_cursor.ack_replays[0].canonical_body_digest = canonical_ack_body_digest(
+            &forged_cursor.ack_replays[0].binding_digest,
+            &forged_cursor.ack_replays[0].request_id,
+            &forged_cursor.ack_replays[0].retrieval_id,
+            &forged_cursor.ack_replays[0].cursor,
+        );
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(forged_cursor, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+
+        let mut handled_signal = snapshot.clone();
+        handled_signal.handled_coverage[0].signal_id = SignalId::new("signal-b").expect("signal");
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(handled_signal, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+        let mut handled_complete = snapshot.clone();
+        handled_complete.handled_coverage[0].covered_through_newest = true;
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(handled_complete, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+
+        let mut join_only = snapshot.clone();
+        join_only.rearmed_joins.push(PersistedRearmJoin {
+            arm_id: setup.binding.arm_id.clone(),
+            generation: setup.binding.generation,
+            attempt_id: setup.attempt_id.clone(),
+            signal_id: setup.binding.signal_id.clone(),
+        });
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(join_only, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+
+        let mut paired = snapshot.clone();
+        paired.retrieve_replays[0].result.event_count = 1;
+        paired.retrieve_replays[0].result.newest_event_ref = EventRef::new("event-a").expect("ref");
+        paired.retrieval_bindings[0].result = paired.retrieve_replays[0].result.clone();
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(paired, payloads.clone()),
+            Err(PersistError::Conflict)
+        ));
+
+        let mut rotated = setup
+            .store
+            .helper_grant(&setup.birth.birth_id, &setup.attempt_id)
+            .expect("grant")
+            .clone();
+        rotated.grant_verifier = [0x34; 32];
+        rotated.grant_ref = VerifierRef::fixture(10);
+        setup.store.persist_helper_grant(&rotated).expect("rotate");
+        let rotated_payloads = setup.store.payloads.clone();
+        let rotated_snapshot = setup.store.recover_authority_state().expect("snapshot");
+        let mut restored = FakePersist::restore_from_snapshot(rotated_snapshot, rotated_payloads)
+            .expect("historical retrieve survives rotation");
+        restored.set_now(setup.store.now);
+        assert_eq!(
+            restored.record_retrieve_exchange(&exchange),
+            Err(PersistError::Unauthorized)
+        );
+        assert_eq!(restored.retrieve_replays.len(), 1);
+    }
+
+    #[test]
+    fn restore_terminal_only_does_not_close_rearm() {
+        let mut setup = helper_store();
+        let exchange = retrieve_for(&setup.binding, 251);
+        expect_recorded_retrieve(setup.store.record_retrieve_exchange(&exchange));
+        setup.store.turn_facts.insert(
+            setup.attempt_id.clone(),
+            vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(7),
+                class: crate::controller::TerminalClass::Succeeded,
+            }],
+        );
+        let payloads = setup.store.payloads.clone();
+        let snapshot = setup.store.recover_authority_state().expect("snapshot");
+        let mut restored = FakePersist::restore_from_snapshot(snapshot.clone(), payloads.clone())
+            .expect("restore");
+        restored.set_now(setup.store.now);
+        let join = RearmJoinScope {
+            arm_id: setup.binding.arm_id.clone(),
+            generation: setup.binding.generation,
+            attempt_id: setup.attempt_id.clone(),
+            signal_id: setup.binding.signal_id.clone(),
+        };
+        assert_eq!(
+            restored.try_rearm_join(join),
+            Ok(RearmJoinResult::WaitingForHandled)
+        );
+        let mut terminal_join = snapshot;
+        terminal_join.rearmed_joins.push(PersistedRearmJoin {
+            arm_id: setup.binding.arm_id.clone(),
+            generation: setup.binding.generation,
+            attempt_id: setup.attempt_id.clone(),
+            signal_id: setup.binding.signal_id.clone(),
+        });
+        assert!(matches!(
+            FakePersist::restore_from_snapshot(terminal_join, payloads),
+            Err(PersistError::Conflict)
+        ));
     }
 
     #[test]
