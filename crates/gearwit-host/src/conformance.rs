@@ -91,6 +91,8 @@ const SQLITE: &str = "bundled sqlite baseline";
 const CUSTODY: &str = "installation identity and encrypted private partition";
 const RETENTION: &str = "migration compaction and retention";
 const NATIVE: &str = "native reservation and write evidence";
+const IDENTITY: &str = "bounded claim request identity and private nonce validation";
+const VERIFIER: &str = "fixed-time grant verifier comparison";
 
 macro_rules! port {
     ($id:literal, $family:ident, $required:ident, $summary:literal) => {
@@ -483,11 +485,501 @@ const CATALOG: &[ConformanceCase] = &[
         VerifierRedacted,
         "recovered grant debug output redacts the verifier"
     ),
+    port!(
+        "replay.retrieve.exact",
+        ReplayIdentity,
+        ExactReplay,
+        "alias of op.record-retrieve-exchange"
+    ),
+    port!(
+        "replay.ack.exact",
+        ReplayIdentity,
+        ExactReplay,
+        "alias of op.acknowledge-retrieved-batch"
+    ),
+    port!(
+        "snapshot.helper-sections-omit-bodies",
+        RecoverySnapshot,
+        SectionsWithoutBodies,
+        "alias of op.recover-authority-state"
+    ),
+    port!(
+        "snapshot.grant-rotation-retires-prior-ref",
+        Revocation,
+        RetiredGrantRecorded,
+        "alias of op.persist-helper-grant"
+    ),
+    port!(
+        "snapshot.rearm-join-absent-before-handled",
+        RecoverySnapshot,
+        JoinAbsent,
+        "alias of op.try-rearm-join"
+    ),
+    port!(
+        "grant.reissue-denied-after-revocation",
+        Revocation,
+        Conflict,
+        "a revoked helper grant cannot be re-issued under a fresh ref and verifier"
+    ),
+    snap!(
+        "grant.revocation-survives-admission",
+        Revocation,
+        StickyRevocation,
+        "revocation remains set after snapshot admission and still denies re-issue"
+    ),
+    gap!(
+        "auth.stale-generation",
+        Revocation,
+        Unauthorized,
+        NATIVE,
+        "a stale generation is refused"
+    ),
+    gap!(
+        "auth.expired-lease",
+        Revocation,
+        Unauthorized,
+        NATIVE,
+        "an expired lease is refused"
+    ),
+    gap!(
+        "auth.mismatched-controller",
+        Revocation,
+        Unauthorized,
+        NATIVE,
+        "a mismatched controller is refused"
+    ),
+    gap!(
+        "auth.link-loss",
+        Revocation,
+        Unauthorized,
+        NATIVE,
+        "link loss does not authorize a later use"
+    ),
+    gap!(
+        "claim.request-id-stable",
+        ClaimAdmission,
+        ExactReplay,
+        IDENTITY,
+        "a bounded claim request id stays accepted and stable"
+    ),
+    gap!(
+        "claim.private-nonce-strict",
+        ClaimAdmission,
+        Conflict,
+        IDENTITY,
+        "a private nonce that is not 256 bits is refused"
+    ),
+    gap!(
+        "native.probe-epoch-mismatch",
+        NativeWrite,
+        Unauthorized,
+        NATIVE,
+        "a reservation or command probe whose epoch mismatches fails before any write"
+    ),
+    gap!(
+        "native.changed-observation-conflicts",
+        NativeWrite,
+        Conflict,
+        NATIVE,
+        "a changed prehash, fingerprint, or binding conflicts and records no conclusion"
+    ),
+    gap!(
+        "native.changed-epoch-conflicts",
+        NativeWrite,
+        Conflict,
+        NATIVE,
+        "a changed mutation epoch conflicts"
+    ),
+    gap!(
+        "ownership.duplicate",
+        RecoverySnapshot,
+        Conflict,
+        NATIVE,
+        "a duplicate ownership row fails recovery"
+    ),
+    gap!(
+        "ownership.orphan",
+        RecoverySnapshot,
+        Conflict,
+        NATIVE,
+        "an orphan ownership row fails recovery"
+    ),
+    gap!(
+        "ownership.conflicting-recovery",
+        RecoverySnapshot,
+        Conflict,
+        NATIVE,
+        "conflicting ownership rows fail recovery"
+    ),
+    gap!(
+        "restart.reserved-first-create",
+        Durability,
+        ExactReplay,
+        REOPEN,
+        "restart from a reserved first create restores that reservation and no later fact"
+    ),
+    gap!(
+        "restart.held-before-native-write",
+        Durability,
+        BothRecordsOrNeither,
+        REOPEN,
+        "restart from a pre-write hold restores the hold and no native acceptance"
+    ),
+    gap!(
+        "restart.idle-state-unproven",
+        Durability,
+        NoPartialRecord,
+        REOPEN,
+        "restart from idle-state-unproven preserves the claim and records no native acceptance"
+    ),
+    gap!(
+        "grant.verifier-fixed-time",
+        Revocation,
+        Conflict,
+        VERIFIER,
+        "verifier presentation comparison does not take a data-dependent branch"
+    ),
+    gap!(
+        "durability.interior-corruption",
+        Durability,
+        TornTailRefused,
+        REOPEN,
+        "interior corruption is refused on recovery"
+    ),
+    gap!(
+        "durability.migration-crash",
+        Retention,
+        FailClosed,
+        RETENTION,
+        "a crash during migration fails closed"
+    ),
+    gap!(
+        "durability.snapshot-crash",
+        Durability,
+        FailClosed,
+        REOPEN,
+        "a crash during snapshot write fails closed"
+    ),
+    gap!(
+        "durability.compaction-crash",
+        Retention,
+        FailClosed,
+        RETENTION,
+        "a crash during compaction fails closed"
+    ),
+    gap!(
+        "materialize.no-unscoped-oracle",
+        Materialization,
+        Unauthorized,
+        NATIVE,
+        "no unscoped content oracle can materialize a claim payload"
+    ),
+    gap!(
+        "native.active-turn-preserves-claim",
+        NativeWrite,
+        BothRecordsOrNeither,
+        NATIVE,
+        "an exact active turn preserves the claim and records a pre-write hold with no native acceptance"
+    ),
+    gap!(
+        "native.no-store-key",
+        Custody,
+        FailClosed,
+        CUSTODY,
+        "store key material and a MAC oracle never enter the controller"
+    ),
+    gap!(
+        "join.unclassified-completion",
+        ReplayIdentity,
+        Conflict,
+        NATIVE,
+        "an unclassified completion cannot satisfy the handled and terminal join"
+    ),
+    gap!(
+        "join.malformed-completion",
+        ReplayIdentity,
+        Conflict,
+        NATIVE,
+        "a malformed completion cannot satisfy the handled and terminal join"
+    ),
+    gap!(
+        "join.in-progress-completion",
+        ReplayIdentity,
+        JoinAbsent,
+        NATIVE,
+        "an in-progress completion cannot satisfy the handled and terminal join"
+    ),
 ];
 
 pub(crate) fn case(id: &str) -> Option<&'static ConformanceCase> {
     CATALOG.iter().find(|case| case.id == id)
 }
+
+/// One predicate inside a brief conformance-matrix row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MatrixPredicate {
+    pub label: &'static str,
+    pub case_id: &'static str,
+}
+
+/// One brief matrix row. A row is not covered by a single positive operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MatrixRow {
+    pub id: &'static str,
+    pub predicates: &'static [MatrixPredicate],
+}
+
+macro_rules! pred {
+    ($label:literal => $id:literal) => {
+        MatrixPredicate {
+            label: $label,
+            case_id: $id,
+        }
+    };
+}
+
+/// Row-by-row crosswalk of the brief conformance matrix.
+pub(crate) fn matrix() -> &'static [MatrixRow] {
+    MATRIX
+}
+
+const MATRIX: &[MatrixRow] = &[
+    MatrixRow {
+        id: "matrix.claim-atomicity",
+        predicates: &[
+            pred!("first admission records one claim" => "op.admit-claim"),
+            pred!("identical admission replays" => "op.admit-claim"),
+            pred!("forged digest conflicts and leaves the stored claim" => "op.admit-claim"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.failure-windows",
+        predicates: &[
+            pred!("failure before append" => "crash.failure-windows"),
+            pred!("failure during commit" => "crash.failure-windows"),
+            pred!("failure after claim" => "crash.failure-windows"),
+            pred!("failure before native send" => "crash.failure-windows"),
+            pred!("failure after possible native acceptance" => "crash.failure-windows"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.restart-phases",
+        predicates: &[
+            pred!("restart from claimed" => "restart.phase-matrix"),
+            pred!("restart from prepared" => "restart.phase-matrix"),
+            pred!("restart from in-flight" => "restart.phase-matrix"),
+            pred!("restart from ambiguous" => "restart.phase-matrix"),
+            pred!("restart from terminal" => "restart.phase-matrix"),
+            pred!("restart from handled" => "restart.phase-matrix"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.restart-reserved-held-idle",
+        predicates: &[
+            pred!("reserved first create" => "restart.reserved-first-create"),
+            pred!("ambiguous create quarantine" => "op.thread-ownership-state"),
+            pred!("held before native write" => "restart.held-before-native-write"),
+            pred!("idle state unproven" => "restart.idle-state-unproven"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.reconciliation",
+        predicates: &[
+            pred!("proven not accepted" => "op.record-reconciliation-fact"),
+            pred!("accepted" => "op.record-reconciliation-fact"),
+            pred!("terminal" => "op.record-reconciliation-fact"),
+            pred!("unknown" => "op.record-reconciliation-fact"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.stale-lease-controller-link",
+        predicates: &[
+            pred!("stale generation" => "auth.stale-generation"),
+            pred!("expired lease" => "auth.expired-lease"),
+            pred!("mismatched controller" => "auth.mismatched-controller"),
+            pred!("link loss" => "auth.link-loss"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.recyclable-identity",
+        predicates: &[pred!("recycled process port or socket" => "native.recyclable-identity")],
+    },
+    MatrixRow {
+        id: "matrix.active-turn-hold",
+        predicates: &[
+            pred!("claim preserved and hold without acceptance" => "native.active-turn-preserves-claim"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.active-observation",
+        predicates: &[
+            pred!("proof and held commit together" => "native.active-hold-atomicity"),
+            pred!("changed prehash or fingerprint conflicts" => "native.changed-observation-conflicts"),
+            pred!("no store key in the controller" => "native.no-store-key"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.rejected-proof",
+        predicates: &[
+            pred!("rejected proof records neither held nor unproven" => "native.active-hold-atomicity"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.idle-unproven",
+        predicates: &[pred!("idle unproven preserves the claim" => "restart.idle-state-unproven")],
+    },
+    MatrixRow {
+        id: "matrix.idle-permits",
+        predicates: &[
+            pred!("missing stale replayed mismatched or restart-carried permits" => "native.idle-permit-negatives"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.epoch-crash-windows",
+        predicates: &[
+            pred!("reservation crash window" => "native.reservation-write-ambiguity"),
+            pred!("write crash window" => "native.reservation-write-ambiguity"),
+            pred!("response crash window" => "native.reservation-write-ambiguity"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.epoch-replay",
+        predicates: &[
+            pred!("exact epoch replay" => "native.epoch-invalidation"),
+            pred!("changed epoch conflicts" => "native.changed-epoch-conflicts"),
+            pred!("restart retains the zero-write conclusion" => "native.epoch-invalidation"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.claim-id-and-nonce",
+        predicates: &[
+            pred!("bounded claim request id remains stable" => "claim.request-id-stable"),
+            pred!("private nonce validation stays strict" => "claim.private-nonce-strict"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.probe-epoch-and-ownership",
+        predicates: &[
+            pred!("probe epoch mismatch" => "native.probe-epoch-mismatch"),
+            pred!("duplicate ownership" => "ownership.duplicate"),
+            pred!("orphan ownership" => "ownership.orphan"),
+            pred!("conflicting ownership" => "ownership.conflicting-recovery"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.monotonic-lifecycle",
+        predicates: &[
+            pred!("duplicate regressive or conflicting transition" => "native.monotonic-lifecycle"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.audit-atomicity",
+        predicates: &[
+            pred!("mutation and audit commit together" => "audit.mutation-sequence"),
+            pred!("duplicate record with changed content" => "audit.conflicting-sequence"),
+            pred!("gapped or rolled-back sequence" => "audit.rollback-continuity"),
+            pred!("conflicting sequence" => "audit.conflicting-sequence"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.torn-interior-migration",
+        predicates: &[
+            pred!("torn tail" => "audit.torn-tail"),
+            pred!("interior corruption" => "durability.interior-corruption"),
+            pred!("migration crash" => "durability.migration-crash"),
+            pred!("snapshot crash" => "durability.snapshot-crash"),
+            pred!("compaction crash" => "durability.compaction-crash"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.handled-rearm",
+        predicates: &[
+            pred!("handled cursor closes fresh use" => "replay.fresh-refused-after-handled"),
+            pred!("re-arm waits without handled coverage" => "snapshot.rearm-join-absent-before-handled"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.unrecognized-join",
+        predicates: &[
+            pred!("missing terminal" => "replay.restore.forged-join"),
+            pred!("terminal without full handled coverage" => "replay.restore.terminal-leaves-partial-rearm"),
+            pred!("unclassified completion" => "join.unclassified-completion"),
+            pred!("malformed completion" => "join.malformed-completion"),
+            pred!("in-progress completion" => "join.in-progress-completion"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.revocation-reissue",
+        predicates: &[
+            pred!("live revocation refuses fresh retrieve" => "op.revoke-helper-grant"),
+            pred!("revocation survives snapshot admission" => "grant.revocation-survives-admission"),
+            pred!("re-issue after revocation is denied" => "grant.reissue-denied-after-revocation"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.materialization",
+        predicates: &[
+            pred!("materialization requires the sealed binding" => "op.materialize-claimed-batch"),
+            pred!("no unscoped content oracle" => "materialize.no-unscoped-oracle"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.verifier-fixed-time-zeroize",
+        predicates: &[
+            pred!("recovered verifier is redacted" => "grant.verifier-redacted"),
+            pred!("comparison is fixed-time" => "grant.verifier-fixed-time"),
+            pred!("opened coordinate plaintext is erased" => "op.seal-native-coordinate"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.root-permission",
+        predicates: &[pred!("unwritable root fails closed" => "custody.root-permission")],
+    },
+    MatrixRow {
+        id: "matrix.redacted-export",
+        predicates: &[pred!("export contains no forbidden sentinel" => "custody.redacted-export")],
+    },
+    MatrixRow {
+        id: "matrix.snapshot-body-free",
+        predicates: &[
+            pred!("recovery omits provider bodies" => "snapshot.helper-sections-omit-bodies"),
+            pred!("replay resolves through the private claim reference" => "replay.restore.two-claim-substitution"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.private-key-refusal",
+        predicates: &[
+            pred!("missing key refuses recovery" => "custody.key-refusal"),
+            pred!("remnants expose no private sentinel" => "custody.redacted-export"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.installation-identity",
+        predicates: &[
+            pred!("wrong installation or second host is refused" => "custody.installation-identity"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.retention",
+        predicates: &[
+            pred!("capacity and compaction budget" => "retention.migration-compaction"),
+            pred!("migration crash" => "durability.migration-crash"),
+            pred!("compaction crash" => "durability.compaction-crash"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.disabled-remote",
+        predicates: &[
+            pred!("disabled remote makes no network attempt" => "durability.disabled-remote"),
+        ],
+    },
+    MatrixRow {
+        id: "matrix.sqlite-baseline",
+        predicates: &[
+            pred!("bundled baseline passes this catalog" => "durability.sqlite-baseline"),
+        ],
+    },
+];
 
 /// Test-only boundary a later provider implements. Not a persistence-port method.
 pub(crate) trait ConformanceFixture {
@@ -750,7 +1242,7 @@ fn run_port<F: ConformanceFixture>(id: &str) -> Result<(), String> {
             } = F::prepare();
             arm_recovered(&mut store, &binding)
         }
-        "op.recover-authority-state" => {
+        "op.recover-authority-state" | "snapshot.helper-sections-omit-bodies" => {
             let Prepared {
                 mut store, binding, ..
             } = F::prepare();
@@ -767,12 +1259,14 @@ fn run_port<F: ConformanceFixture>(id: &str) -> Result<(), String> {
         }
         "op.reserve-controller-birth" => reserve_birth_replays::<F>(),
         "op.thread-ownership-state" => unresolved_create_quarantined::<F>(),
-        "op.persist-helper-grant" | "grant.retired-identity-rejected" => {
+        "op.persist-helper-grant"
+        | "snapshot.grant-rotation-retires-prior-ref"
+        | "grant.retired-identity-rejected" => {
             let Prepared { mut store, .. } = F::prepare();
-            if id == "op.persist-helper-grant" {
-                grant_rotation_retires_prior_ref(&mut store)
-            } else {
+            if id == "grant.retired-identity-rejected" {
                 retired_identity_rejected(&mut store)
+            } else {
+                grant_rotation_retires_prior_ref(&mut store)
             }
         }
         "op.revoke-helper-grant" => {
@@ -781,7 +1275,13 @@ fn run_port<F: ConformanceFixture>(id: &str) -> Result<(), String> {
             } = F::prepare();
             revocation_sticky(&mut store, &binding)
         }
-        "op.record-retrieve-exchange" => {
+        "grant.reissue-denied-after-revocation" => {
+            let Prepared {
+                mut store, binding, ..
+            } = F::prepare();
+            reissue_denied_after_revocation(&mut store, &binding)
+        }
+        "op.record-retrieve-exchange" | "replay.retrieve.exact" => {
             let Prepared {
                 mut store, binding, ..
             } = F::prepare();
@@ -799,7 +1299,7 @@ fn run_port<F: ConformanceFixture>(id: &str) -> Result<(), String> {
             } = F::prepare();
             materialize_requires_binding(&mut store, &binding)
         }
-        "op.acknowledge-retrieved-batch" => {
+        "op.acknowledge-retrieved-batch" | "replay.ack.exact" => {
             let Prepared {
                 mut store, binding, ..
             } = F::prepare();
@@ -817,7 +1317,7 @@ fn run_port<F: ConformanceFixture>(id: &str) -> Result<(), String> {
             } = F::prepare();
             fresh_refused_after_handled(&mut store, &binding)
         }
-        "op.try-rearm-join" => {
+        "op.try-rearm-join" | "snapshot.rearm-join-absent-before-handled" => {
             let Prepared {
                 mut store, binding, ..
             } = F::prepare();
@@ -1003,7 +1503,10 @@ fn fresh_refused_after_handled(
 
 fn arm_recovered(store: &mut impl Persist, binding: &ValidatedHelperBinding) -> Result<(), String> {
     let snapshot = store.recover_authority_state().map_err(err)?;
-    if snapshot.arms.len() == 1 && snapshot.arms[0].arm_id == binding.arm_id {
+    if snapshot.arms.len() == 1
+        && snapshot.arms[0].arm_id == binding.arm_id
+        && snapshot.arms[0].generation == binding.generation
+    {
         Ok(())
     } else {
         Err(format!("arm missing from recovery: {snapshot:?}"))
@@ -1041,6 +1544,7 @@ fn grant_rotation_retires_prior_ref(store: &mut impl Persist) -> Result<(), Stri
     let before = store.recover_authority_state().map_err(err)?;
     let mut replacement = before.helper_grants[0].clone();
     let prior_ref = replacement.grant_ref.clone();
+    let prior_verifier = replacement.grant_verifier;
     replacement.grant_verifier = [0x34; 32];
     replacement.grant_ref = VerifierRef::fixture(10);
     store.persist_helper_grant(&replacement).map_err(err)?;
@@ -1048,7 +1552,7 @@ fn grant_rotation_retires_prior_ref(store: &mut impl Persist) -> Result<(), Stri
     let retired = snapshot
         .retired_helper_grants
         .iter()
-        .any(|grant| grant.grant_ref == prior_ref);
+        .any(|grant| grant.grant_ref == prior_ref && grant.grant_verifier == prior_verifier);
     let live = snapshot
         .helper_grants
         .iter()
@@ -1201,7 +1705,60 @@ fn pair_claims<F: ConformanceFixture>(
     Ok((both, both_payloads, claim_b))
 }
 
+fn reissue_denied_after_revocation(
+    store: &mut impl Persist,
+    binding: &ValidatedHelperBinding,
+) -> Result<(), String> {
+    let scope = HelperRevocationScope {
+        grant_ref: binding.grant_ref.clone(),
+        birth_id: binding.birth_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+    };
+    store.revoke_helper_grant(scope).map_err(err)?;
+    let snapshot = store.recover_authority_state().map_err(err)?;
+    let mut reissue = snapshot.helper_grants[0].clone();
+    reissue.revoked = false;
+    reissue.grant_verifier = [0x44; 32];
+    reissue.grant_ref = VerifierRef::fixture(15);
+    match store.persist_helper_grant(&reissue) {
+        Err(PersistError::Conflict) => Ok(()),
+        other => Err(format!("expected re-issue conflict, got {other:?}")),
+    }
+}
+
+fn revocation_survives_admission<F: ConformanceFixture>() -> Result<(), String> {
+    let Prepared {
+        mut store, binding, ..
+    } = F::prepare();
+    let scope = HelperRevocationScope {
+        grant_ref: binding.grant_ref.clone(),
+        birth_id: binding.birth_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+    };
+    store.revoke_helper_grant(scope).map_err(err)?;
+    let payloads = F::payloads(&store);
+    let snapshot = store.recover_authority_state().map_err(err)?;
+    let mut restored = F::admit_snapshot(snapshot, payloads).map_err(err)?;
+    let recovered = restored.recover_authority_state().map_err(err)?;
+    if !recovered.helper_grants.iter().any(|grant| grant.revoked) {
+        return Err("revocation lost on admission".into());
+    }
+    let mut reissue = recovered.helper_grants[0].clone();
+    reissue.revoked = false;
+    reissue.grant_verifier = [0x44; 32];
+    reissue.grant_ref = VerifierRef::fixture(15);
+    match restored.persist_helper_grant(&reissue) {
+        Err(PersistError::Conflict) => Ok(()),
+        other => Err(format!(
+            "expected reconstructed re-issue conflict, got {other:?}"
+        )),
+    }
+}
+
 fn run_snapshot<F: ConformanceFixture>(id: &str) -> Result<(), String> {
+    if id == "grant.revocation-survives-admission" {
+        return revocation_survives_admission::<F>();
+    }
     let Prepared {
         mut store, binding, ..
     } = F::prepare();
@@ -1368,6 +1925,43 @@ mod tests {
         ];
         for id in operations {
             assert!(case(id).is_some(), "missing operation {id}");
+        }
+    }
+
+    #[test]
+    fn matrix_crosswalk_names_real_cases() {
+        let mut rows = std::collections::BTreeSet::new();
+        for row in matrix() {
+            assert!(rows.insert(row.id), "duplicate {}", row.id);
+            assert!(!row.predicates.is_empty(), "{}", row.id);
+            for predicate in row.predicates {
+                assert!(
+                    case(predicate.case_id).is_some(),
+                    "{} -> {}",
+                    predicate.label,
+                    predicate.case_id
+                );
+            }
+        }
+        for id in [
+            "matrix.stale-lease-controller-link",
+            "matrix.claim-id-and-nonce",
+            "matrix.probe-epoch-and-ownership",
+            "matrix.restart-reserved-held-idle",
+            "matrix.revocation-reissue",
+            "matrix.verifier-fixed-time-zeroize",
+            "matrix.torn-interior-migration",
+        ] {
+            assert!(rows.contains(id), "missing {id}");
+        }
+        for id in [
+            "replay.retrieve.exact",
+            "replay.ack.exact",
+            "snapshot.helper-sections-omit-bodies",
+            "snapshot.grant-rotation-retires-prior-ref",
+            "snapshot.rearm-join-absent-before-handled",
+        ] {
+            assert!(case(id).is_some(), "missing alias {id}");
         }
     }
 
