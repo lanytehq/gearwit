@@ -1410,15 +1410,42 @@ fn kill_writer_at(path: &Path, role: &str, marker: &str) {
 }
 
 fn host_version(flag: &str) -> String {
-    let output = std::process::Command::new("sw_vers")
-        .arg(flag)
-        .output()
-        .expect("sw_vers");
+    let Ok(output) = std::process::Command::new("sw_vers").arg(flag).output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-fn process_crash_supported() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrashQualification {
+    Ready,
+    Unqualified { reason: &'static str },
+}
+
+fn crash_qualification(
+    os: &str,
+    arch: &str,
+    filesystem: &str,
+    product: &str,
+    build: &str,
+) -> CrashQualification {
+    if os != "macos" || arch != "aarch64" {
+        return CrashQualification::Unqualified { reason: "os-arch" };
+    }
+    if filesystem != "apfs" {
+        return CrashQualification::Unqualified {
+            reason: "filesystem",
+        };
+    }
+    if product.is_empty() || build.is_empty() {
+        return CrashQualification::Unqualified {
+            reason: "host-version",
+        };
+    }
+    CrashQualification::Ready
 }
 
 fn connection_pragmas(conn: &Connection) -> (String, i64) {
@@ -1498,26 +1525,26 @@ fn load_expected(
 }
 
 pub(crate) fn run_process_crash(id: &str) -> Result<(), String> {
-    if !process_crash_supported() {
-        return Err(format!("unqualified: {id}"));
-    }
     let (role, marker) = match id {
         "snapshot.reopened-media.post-commit" => ("post", "POST_COMMIT"),
         "snapshot.reopened-media.pre-commit" => ("pre", "PRE_COMMIT"),
         other => return Err(format!("not a process-crash case: {other}")),
     };
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(format!("unqualified os-arch: {id}"));
+    }
     let path = std::env::temp_dir().join(format!(
         "gearwit-process-crash-{role}-{}-{}.sqlite",
         std::process::id(),
         unique_suffix()
     ));
-    if filesystem_type(path.parent().unwrap_or(Path::new("/tmp"))) != "apfs" {
-        return Err(format!("unqualified filesystem: {id}"));
-    }
+    let filesystem = filesystem_type(path.parent().unwrap_or(Path::new("/tmp")));
     let product = host_version("-productVersion");
     let build = host_version("-buildVersion");
-    if product.is_empty() || build.is_empty() {
-        return Err(format!("unqualified host version: {id}"));
+    if crash_qualification("macos", "aarch64", &filesystem, &product, &build)
+        != CrashQualification::Ready
+    {
+        return Err(format!("unqualified configuration: {id}"));
     }
     kill_writer_at(&path, role, marker);
     let (journal, synchronous) = read_writer_config(&path);
@@ -1984,12 +2011,34 @@ mod tests {
             "snapshot.reopened-media.pre-commit",
         ] {
             match run_process_crash(id) {
-                Ok(()) => assert!(process_crash_supported(), "{id} passed while unqualified"),
-                Err(error) if error.contains("unqualified") => {
-                    assert!(!process_crash_supported(), "{id}: {error}");
-                }
+                Ok(()) => {}
+                Err(error) if error.starts_with("unqualified ") => {}
                 Err(error) => panic!("{id}: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn macos_arm64_missing_configuration_stays_inconclusive() {
+        assert_eq!(
+            crash_qualification("macos", "aarch64", "tmpfs", "26.7", "25G229"),
+            CrashQualification::Unqualified {
+                reason: "filesystem"
+            }
+        );
+        assert_eq!(
+            crash_qualification("macos", "aarch64", "apfs", "", "25G229"),
+            CrashQualification::Unqualified {
+                reason: "host-version"
+            }
+        );
+        assert_eq!(
+            crash_qualification("linux", "x86_64", "ext4", "", ""),
+            CrashQualification::Unqualified { reason: "os-arch" }
+        );
+        assert_eq!(
+            crash_qualification("macos", "aarch64", "apfs", "26.7", "25G229"),
+            CrashQualification::Ready
+        );
     }
 }
