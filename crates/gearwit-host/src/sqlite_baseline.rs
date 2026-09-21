@@ -40,7 +40,13 @@ pub(crate) struct SqliteBaseline {
     live: FakePersist,
     path: PathBuf,
     ephemeral: bool,
-    fault_after_partial_write: bool,
+    fault: BaselineFault,
+    poisoned: bool,
+}
+
+struct BaselineFault {
+    after_partial_write: bool,
+    reload_after_commit: bool,
 }
 
 impl Drop for SqliteBaseline {
@@ -83,13 +89,21 @@ impl SqliteBaseline {
             live: FakePersist::default(),
             path: path.to_path_buf(),
             ephemeral: false,
-            fault_after_partial_write: false,
+            fault: BaselineFault {
+                after_partial_write: false,
+                reload_after_commit: false,
+            },
+            poisoned: false,
         };
         store.reload().expect("empty baseline");
         store
     }
 
     fn reload(&mut self) -> Result<(), PersistError> {
+        if self.fault.reload_after_commit {
+            self.fault.reload_after_commit = false;
+            return Err(PersistError::StorageUnavailable);
+        }
         let document: Option<String> = self
             .conn
             .query_row(
@@ -98,7 +112,7 @@ impl SqliteBaseline {
                 |row| row.get(0),
             )
             .optional()
-            .expect("snapshot read");
+            .map_err(|_| PersistError::StorageUnavailable)?;
         let Some(document) = document else {
             self.live = FakePersist::default();
             return Ok(());
@@ -107,14 +121,14 @@ impl SqliteBaseline {
         let mut statement = self
             .conn
             .prepare("SELECT payload_ref, document FROM claim_payload")
-            .expect("payload select");
+            .map_err(|_| PersistError::StorageUnavailable)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .expect("payload rows");
+            .map_err(|_| PersistError::StorageUnavailable)?;
         for row in rows {
-            let (payload_ref, document) = row.expect("payload row");
+            let (payload_ref, document) = row.map_err(|_| PersistError::StorageUnavailable)?;
             let payload_ref = ClaimPayloadRef(unhex32(&payload_ref));
             payloads.insert(payload_ref, decode_payload(&document));
         }
@@ -148,7 +162,7 @@ impl SqliteBaseline {
             params![document],
         )
         .map_err(|_| PersistError::StorageUnavailable)?;
-        if self.fault_after_partial_write {
+        if self.fault.after_partial_write {
             return Err(PersistError::StorageUnavailable);
         }
         for (payload_ref, payload) in payloads {
@@ -167,12 +181,16 @@ impl SqliteBaseline {
         saved: FakePersist,
         result: Result<T, PersistError>,
     ) -> Result<T, PersistError> {
+        if self.poisoned {
+            self.live = saved;
+            return Err(PersistError::StorageUnavailable);
+        }
         match result {
             Ok(value) => match self.commit() {
                 Ok(()) => match self.reload() {
                     Ok(()) => Ok(value),
                     Err(error) => {
-                        self.live = saved;
+                        self.poisoned = true;
                         Err(error)
                     }
                 },
@@ -218,17 +236,18 @@ impl Persist for SqliteBaseline {
 
     fn resolve_thread_create(
         &mut self,
-        commit: ThreadCreateCommit,
+        _commit: ThreadCreateCommit,
     ) -> Result<IdempotentWrite, PersistError> {
-        let saved = self.live.clone();
-        let result = self.live.resolve_thread_create(commit);
-        self.finish(saved, result)
+        Err(PersistError::StorageUnavailable)
     }
 
     fn thread_ownership_state(
         &self,
         birth_id: &ControllerBirthId,
     ) -> Result<ThreadOwnershipState, PersistError> {
+        if self.poisoned {
+            return Err(PersistError::StorageUnavailable);
+        }
         self.live.thread_ownership_state(birth_id)
     }
 
@@ -337,6 +356,9 @@ impl Persist for SqliteBaseline {
         binding: &ValidatedHelperBinding,
         permit: ClaimMaterializationPermit,
     ) -> Result<BoundedClaimPayload, PersistError> {
+        if self.poisoned {
+            return Err(PersistError::StorageUnavailable);
+        }
         self.live.materialize_claimed_batch(binding, permit)
     }
 
@@ -357,6 +379,9 @@ impl Persist for SqliteBaseline {
     }
 
     fn recover_authority_state(&mut self) -> Result<RecoverySnapshot, PersistError> {
+        if self.poisoned {
+            return Err(PersistError::StorageUnavailable);
+        }
         self.live.recover_authority_state()
     }
 }
@@ -1161,6 +1186,96 @@ fn decode_payload(document: &str) -> BoundedClaimPayload {
     BoundedClaimPayload::try_from(records).expect("payload")
 }
 
+fn admit_fractional(
+    store: &mut SqliteBaseline,
+    observed: OffsetDateTime,
+    lease: OffsetDateTime,
+) -> (ValidatedHelperBinding, ClaimAdmission) {
+    let mut parts = conformance::birth_parts();
+    parts.birth.lease_until = lease;
+    store
+        .reserve_controller_birth(&parts.birth, &parts.reservation)
+        .expect("reserve");
+    store
+        .persist_arm(&PersistedArm {
+            arm_id: parts.birth.arm_id.clone(),
+            generation: parts.birth.generation,
+            seat_id: parts.birth.seat_id.clone(),
+            capability: parts.birth.capability,
+            coverage_until: lease + time::Duration::seconds(600),
+        })
+        .expect("arm");
+    let signal_id = SignalId::new("signal-a").expect("signal");
+    let events = [gearwit_protocol::ProviderEvent {
+        provider: "test".to_owned(),
+        event_ref: "event-a".to_owned(),
+        actor: None,
+        observed_at: observed
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339"),
+        body: "fractional-body".to_owned(),
+    }];
+    let admission = crate::persist::claim_admission_fixture(
+        "claim-a",
+        parts.birth.arm_id.clone(),
+        parts.birth.generation,
+        signal_id.clone(),
+        &events,
+        observed,
+    );
+    let attempt_id = AttemptId::new("attempt-a").expect("attempt");
+    store
+        .admit_claim(
+            &admission,
+            &PersistedControllerAttachment {
+                attempt_id: attempt_id.clone(),
+                birth_id: parts.birth.birth_id.clone(),
+                seat_id: parts.birth.seat_id.clone(),
+                arm_id: parts.birth.arm_id.clone(),
+                generation: parts.birth.generation,
+                capability: parts.birth.capability,
+                lease_until: lease,
+                verifier_ref: VerifierRef::fixture(8),
+                revoked: false,
+            },
+        )
+        .expect("admit");
+    store
+        .persist_helper_grant(&PersistedHelperGrant {
+            grant_verifier: [0x33; 32],
+            grant_ref: VerifierRef::fixture(9),
+            seat_id: parts.birth.seat_id.clone(),
+            arm_id: parts.birth.arm_id.clone(),
+            generation: parts.birth.generation,
+            birth_id: parts.birth.birth_id.clone(),
+            attempt_id: attempt_id.clone(),
+            signal_id: signal_id.clone(),
+            claim_digest: admission.claim_digest.clone(),
+            operations: HelperOperations::all(),
+            lease_until: lease,
+            executable_identity: HelperExecutableIdentity {
+                image_digest: [0x11; 32],
+                file_identity: BoundedToken::new("gearwit-helper").expect("file"),
+                build_identity: BoundedToken::new("build-1").expect("build"),
+            },
+            revoked: false,
+        })
+        .expect("grant");
+    let binding = ValidatedHelperBinding {
+        grant_ref: VerifierRef::fixture(9),
+        seat_id: parts.birth.seat_id,
+        arm_id: parts.birth.arm_id,
+        generation: parts.birth.generation,
+        birth_id: parts.birth.birth_id,
+        attempt_id,
+        signal_id,
+        claim_digest: admission.claim_digest.clone(),
+        operations: HelperOperations::all(),
+        lease_until: lease,
+    };
+    (binding, admission)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,12 +1441,62 @@ mod tests {
             unique_suffix()
         ));
         let mut store = SqliteBaseline::open_path(&path);
+        let (binding, _, _) = conformance::install_helper(&mut store);
+        let exchange = conformance::retrieve_for(&binding, 21);
+        let authorized = match store.record_retrieve_exchange(&exchange).expect("retrieve") {
+            IdempotentResult::Recorded(authorized) => authorized,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let request =
+            conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 22);
+        store
+            .acknowledge_retrieved_batch(&binding, &request)
+            .expect("ack");
+        let before = store.recover_authority_state().expect("before");
+        let payloads = store.live.claim_payloads();
+        store.fault.after_partial_write = true;
+        let error = store
+            .persist_arm(&PersistedArm {
+                arm_id: ArmId::new("arm-extra").expect("arm"),
+                generation: 2,
+                seat_id: binding.seat_id.clone(),
+                capability: ManagedCapability::HandleClaimedSignal,
+                coverage_until: binding.lease_until,
+            })
+            .expect_err("fault");
+        assert!(matches!(error, PersistError::StorageUnavailable));
+        let live = store.recover_authority_state().expect("live");
+        assert_eq!(live.ack_replays, before.ack_replays);
+        assert_eq!(live.claims, before.claims);
+        assert_eq!(store.live.claim_payloads(), payloads);
+        assert!(
+            live.arms
+                .iter()
+                .all(|arm| arm.arm_id != ArmId::new("arm-extra").expect("arm"))
+        );
+        drop(store);
+        let mut reopened = SqliteBaseline::open_path(&path);
+        let snapshot = reopened.recover_authority_state().expect("sql");
+        assert_eq!(snapshot.ack_replays, before.ack_replays);
+        assert_eq!(snapshot.claims, before.claims);
+        assert_eq!(reopened.live.claim_payloads(), payloads);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn post_commit_reload_failure_poisons_the_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-poison-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut store = SqliteBaseline::open_path(&path);
         let parts = conformance::birth_parts();
         store
             .reserve_controller_birth(&parts.birth, &parts.reservation)
             .expect("reserve");
-        let before = store.recover_authority_state().expect("before");
-        store.fault_after_partial_write = true;
+        store.fault.reload_after_commit = true;
         let error = store
             .persist_arm(&PersistedArm {
                 arm_id: parts.birth.arm_id.clone(),
@@ -1340,16 +1505,129 @@ mod tests {
                 capability: parts.birth.capability,
                 coverage_until: parts.birth.lease_until,
             })
-            .expect_err("fault");
+            .expect_err("reload");
         assert!(matches!(error, PersistError::StorageUnavailable));
-        let live = store.recover_authority_state().expect("live");
-        assert_eq!(live.ownership.len(), before.ownership.len());
-        assert!(live.arms.is_empty());
+        assert!(matches!(
+            store.recover_authority_state(),
+            Err(PersistError::StorageUnavailable)
+        ));
+        assert!(matches!(
+            store.persist_arm(&PersistedArm {
+                arm_id: ArmId::new("arm-overwrite").expect("arm"),
+                generation: 9,
+                seat_id: parts.birth.seat_id.clone(),
+                capability: parts.birth.capability,
+                coverage_until: parts.birth.lease_until,
+            }),
+            Err(PersistError::StorageUnavailable)
+        ));
         drop(store);
         let mut reopened = SqliteBaseline::open_path(&path);
-        let snapshot = reopened.recover_authority_state().expect("sql");
-        assert_eq!(snapshot.ownership.len(), before.ownership.len());
-        assert!(snapshot.arms.is_empty());
+        let snapshot = reopened.recover_authority_state().expect("committed");
+        assert!(
+            snapshot
+                .arms
+                .iter()
+                .any(|arm| arm.arm_id == parts.birth.arm_id)
+        );
+        assert!(
+            snapshot
+                .arms
+                .iter()
+                .all(|arm| arm.arm_id.as_str() != "arm-overwrite")
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fractional_event_and_lease_survive_in_digest_bearing_state() {
+        let path = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-fraction-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let observed = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(1)
+            + time::Duration::nanoseconds(123_456_789);
+        let lease = OffsetDateTime::UNIX_EPOCH
+            + time::Duration::seconds(90)
+            + time::Duration::nanoseconds(987_654_321);
+        let mut store = SqliteBaseline::open_path(&path);
+        let (binding, admission) = admit_fractional(&mut store, observed, lease);
+        let exchange = conformance::retrieve_for(&binding, 31);
+        let authorized = match store.record_retrieve_exchange(&exchange).expect("retrieve") {
+            IdempotentResult::Recorded(authorized) => authorized,
+            IdempotentResult::ExactReplay(_) => panic!("first retrieve must record"),
+        };
+        let request =
+            conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 32);
+        store
+            .acknowledge_retrieved_batch(&binding, &request)
+            .expect("ack");
+        drop(store);
+        let mut reopened = SqliteBaseline::open_path(&path);
+        let snapshot = reopened.recover_authority_state().expect("reload");
+        assert_eq!(snapshot.claims[0].claim_digest, admission.claim_digest);
+        assert_eq!(snapshot.helper_grants[0].lease_until, lease);
+        let payload = reopened
+            .live
+            .claim_payloads()
+            .remove(&snapshot.claims[0].payload_ref)
+            .expect("payload");
+        assert_eq!(payload.events.as_slice()[0].observed_at, observed);
+        assert_eq!(
+            payload.events.as_slice()[0].body.as_str(),
+            "fractional-body"
+        );
+        match reopened
+            .record_retrieve_exchange(&exchange)
+            .expect("replay")
+        {
+            IdempotentResult::ExactReplay(replay) => {
+                assert_eq!(replay.recorded, authorized.recorded);
+            }
+            IdempotentResult::Recorded(_) => panic!("retrieve must replay"),
+        }
+        match reopened
+            .acknowledge_retrieved_batch(&binding, &request)
+            .expect("ack replay")
+        {
+            IdempotentResult::ExactReplay(_) => {}
+            IdempotentResult::Recorded(_) => panic!("ack must replay"),
+        }
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn thread_create_resolution_is_refused_before_a_commit() {
+        let path = std::env::temp_dir().join(format!(
+            "gearwit-sqlite-create-{}-{}.sqlite",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut store = SqliteBaseline::open_path(&path);
+        let parts = conformance::birth_parts();
+        store
+            .reserve_controller_birth(&parts.birth, &parts.reservation)
+            .expect("reserve");
+        let error = store
+            .resolve_thread_create(ThreadCreateCommit {
+                birth_id: parts.birth.birth_id.clone(),
+                create_attempt_id: parts.reservation.create_attempt_id.clone(),
+                resolution: crate::persist::ThreadCreateResolution::ProvenNotAccepted,
+                evidence_ref: VerifierRef::fixture(4),
+            })
+            .expect_err("resolve");
+        assert!(matches!(error, PersistError::StorageUnavailable));
+        drop(store);
+        let mut reopened = SqliteBaseline::open_path(&path);
+        let snapshot = reopened.recover_authority_state().expect("unchanged");
+        assert!(matches!(
+            snapshot.ownership[0].state,
+            ThreadOwnershipState::Reserved { .. } | ThreadOwnershipState::Unknown { .. }
+        ));
         drop(reopened);
         let _ = std::fs::remove_file(&path);
     }
