@@ -2244,9 +2244,10 @@ fn terminal_class(class: TerminalClass) -> ControllerTerminalClass {
 fn map_persist_error(error: PersistError) -> Error {
     match error {
         PersistError::StorageUnavailable => Error::Closed,
-        PersistError::Conflict | PersistError::InvalidTransition | PersistError::Unauthorized => {
-            Error::Correlation
-        }
+        PersistError::Conflict
+        | PersistError::InvalidTransition
+        | PersistError::Unauthorized
+        | PersistError::PayloadUnavailable => Error::Correlation,
     }
 }
 
@@ -2474,7 +2475,7 @@ impl<P: Persist> Controller for CodexController<P> {
             .is_some_and(|state| {
                 state.native_write_evidence.iter().any(|evidence| {
                     evidence.correlation == *correlation
-                        && evidence.evidence_ref == scope.evidence_ref
+                        && evidence.evidence_ref == scope.native_write_evidence_ref
                         && evidence.evidence == NativeWriteEvidence::Unknown
                 })
             });
@@ -3037,29 +3038,23 @@ mod tests {
             verifier_ref: verifier_ref.clone(),
             revoked: false,
         };
+        let admission = crate::persist::claim_admission_fixture(
+            "claim-a",
+            attachment.arm_id.clone(),
+            1,
+            correlation.signal_id.clone(),
+            &[gearwit_protocol::ProviderEvent {
+                provider: "test".to_owned(),
+                event_ref: "event-a".to_owned(),
+                actor: None,
+                observed_at: "1970-01-01T00:00:00Z".to_owned(),
+                body: "test".to_owned(),
+            }],
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
         controller
             .persist
-            .admit_claim(
-                &crate::persist::ClaimAdmission {
-                    record: crate::persist::PersistedClaimRecord {
-                        attempt_id: correlation.attempt_id.clone(),
-                        request_id: controller::ClaimRequestId::new("claim-a").expect("claim"),
-                        arm_id: attachment.arm_id.clone(),
-                        generation: 1,
-                        signal_id: correlation.signal_id.clone(),
-                        event_refs: vec!["event-a".to_owned()],
-                        claimed_at: time::OffsetDateTime::UNIX_EPOCH,
-                    },
-                    events: vec![gearwit_protocol::ProviderEvent {
-                        provider: "test".to_owned(),
-                        event_ref: "event-a".to_owned(),
-                        actor: None,
-                        observed_at: "1970-01-01T00:00:00Z".to_owned(),
-                        body: "test".to_owned(),
-                    }],
-                },
-                &attachment,
-            )
+            .admit_claim(&admission, &attachment)
             .expect("claim admission");
         controller
             .persist

@@ -3,33 +3,35 @@
 #![allow(clippy::missing_errors_doc)]
 
 use crate::controller::{
-    ActiveObservationProof, ArmId, AttemptId, ClaimRequestId, ControllerAttachment,
+    ActiveObservationProof, ArmId, AttemptId, BoundedVec, ClaimRequestId, ControllerAttachment,
     ControllerBirthBinding, ControllerBirthId, ControllerCommand, ControllerIdleGuard,
-    ControllerProbeError, ControllerReconcileError, ControllerWriteError, IdleProbeObservation,
-    IdleProbeResult, IdleProbeScope, ManagedCapability, NativeTurnFact, NativeWriteDisposition,
-    ObservationScope, PersistedTurnCorrelation, ProbeBinding, ReconciliationDisposition,
-    ReconciliationScope, RequestNonce, SeatId, SignalAction, SignalId, ValidatedIdlePermit,
-    VerifierRef,
+    ControllerProbeError, ControllerReconcileError, ControllerWriteError, EventRef,
+    IdleProbeObservation, IdleProbeResult, IdleProbeScope, ManagedCapability, NativeTurnFact,
+    NativeWriteDisposition, ObservationScope, PersistedTurnCorrelation, ProbeBinding,
+    ReconciliationDisposition, ReconciliationScope, RequestNonce, SeatId, SignalAction, SignalId,
+    ValidatedIdlePermit, VerifierRef,
 };
 use crate::persist::{
-    ActiveHoldCommit, ClaimAdmission, ClaimOutcome, IdempotentWrite, NativeTurnFactCommit,
-    NativeWriteEvidence, NativeWriteEvidenceCommit, Persist, PersistError, PersistedArm,
-    PersistedClaimRecord, PersistedControllerAttachment, PersistedControllerBirth,
-    PreWriteConclusion, PreWriteConclusionCommit, PreparedDispatchCommit, RecoverySnapshot,
-    ReserveBirthOutcome, ThreadCreateCommit, ThreadCreateReservation, ThreadCreateResolution,
-    ThreadOwnershipState, ValidatedAttachmentScope,
+    ActiveHoldCommit, AdmissionOutcome, BoundedClaimPayload, ClaimAdmission, IdempotentWrite,
+    NativeTurnFactCommit, NativeWriteEvidence, NativeWriteEvidenceCommit,
+    NonActivePreWriteConclusion, Persist, PersistError, PersistedArm, PersistedClaimRecord,
+    PersistedControllerAttachment, PersistedControllerBirth, PreWriteConclusionCommit,
+    PreparedDispatchCommit, RecoverySnapshot, ReserveBirthOutcome, ThreadCreateCommit,
+    ThreadCreateReservation, ThreadCreateResolution, ThreadOwnershipState,
+    ValidatedAttachmentScope, canonical_claim_digest,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime};
 
+/// Frozen wire-bound boundary values. The event-count bound is enforced
+/// here before per-event conversion (count failures are conflicts even when
+/// the repeated events would otherwise fail conversion); the remaining
+/// enforcement lives in the bounded wrappers. Tests name the boundary, not
+/// the implementation.
 const MAX_CLAIM_EVENTS: usize = 64;
+#[cfg(test)]
 const MAX_EVENT_BODY_BYTES: usize = 4_096;
-const MAX_AGGREGATE_BODY_BYTES: usize = 131_072;
-const MAX_EVENT_REF_BYTES: usize = 256;
-const MAX_PROVIDER_BYTES: usize = 64;
-const MAX_ACTOR_BYTES: usize = 256;
-const MAX_TIMESTAMP_BYTES: usize = 64;
 const IDLE_PERMIT_WINDOW: Duration = Duration::seconds(5);
 
 /// Input for generation-fenced claim admission.
@@ -51,49 +53,34 @@ pub struct ManagedArmRegistration {
     pub coverage_until: OffsetDateTime,
 }
 
-fn validate_claim_events(events: &[gearwit_protocol::ProviderEvent]) -> Result<(), AuthorityError> {
+fn validated_claim_payload(
+    events: &[gearwit_protocol::ProviderEvent],
+) -> Result<(BoundedVec<EventRef, 1, 64>, BoundedClaimPayload), AuthorityError> {
     if events.is_empty() || events.len() > MAX_CLAIM_EVENTS {
         return Err(AuthorityError::Conflict);
     }
-
-    let mut aggregate_body_bytes = 0_usize;
-    let mut event_refs = BTreeSet::new();
+    let mut records = Vec::with_capacity(events.len());
+    let mut seen_refs = BTreeSet::new();
     let mut previous_observed_at = None;
     for event in events {
-        if !is_bounded_token(&event.event_ref, MAX_EVENT_REF_BYTES)
-            || !event_refs.insert(event.event_ref.as_str())
-            || !is_bounded_token(&event.provider, MAX_PROVIDER_BYTES)
-            || event
-                .actor
-                .as_ref()
-                .is_some_and(|actor| !is_bounded_token(actor, MAX_ACTOR_BYTES))
-            || event.observed_at.len() > MAX_TIMESTAMP_BYTES
-            || event.body.len() > MAX_EVENT_BODY_BYTES
-        {
+        let record = crate::persist::ProviderEventRecord::try_from(event)
+            .map_err(|_| AuthorityError::InvalidIdentifier)?;
+        if !seen_refs.insert(record.event_ref.as_str().to_owned()) {
             return Err(AuthorityError::InvalidIdentifier);
         }
-        let observed_at = OffsetDateTime::parse(&event.observed_at, &Rfc3339)
-            .map_err(|_| AuthorityError::InvalidIdentifier)?;
-        if previous_observed_at.is_some_and(|previous| observed_at < previous) {
+        if previous_observed_at.is_some_and(|previous| record.observed_at < previous) {
             return Err(AuthorityError::Conflict);
         }
-        previous_observed_at = Some(observed_at);
-        aggregate_body_bytes = aggregate_body_bytes
-            .checked_add(event.body.len())
-            .ok_or(AuthorityError::Conflict)?;
+        previous_observed_at = Some(record.observed_at);
+        records.push(record);
     }
-    if aggregate_body_bytes > MAX_AGGREGATE_BODY_BYTES {
-        return Err(AuthorityError::Conflict);
-    }
-    Ok(())
-}
-
-fn is_bounded_token(value: &str, max_bytes: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= max_bytes
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+    let event_refs: Vec<EventRef> = records
+        .iter()
+        .map(|record| record.event_ref.clone())
+        .collect();
+    let event_refs = BoundedVec::try_from(event_refs).map_err(|_| AuthorityError::Conflict)?;
+    let payload = BoundedClaimPayload::try_from(records).map_err(|_| AuthorityError::Conflict)?;
+    Ok((event_refs, payload))
 }
 
 /// Non-Clone reservation proving controller birth and create were persisted.
@@ -144,7 +131,7 @@ impl AdmissionReceipt {
 
 #[derive(Debug)]
 pub struct AdmissionResult {
-    pub outcome: ClaimOutcome,
+    pub outcome: AdmissionOutcome,
     pub attempt_id: String,
     receipt: Option<AdmissionReceipt>,
 }
@@ -239,7 +226,7 @@ impl From<PersistError> for AuthorityError {
         match error {
             PersistError::Conflict | PersistError::InvalidTransition => Self::Conflict,
             PersistError::Unauthorized => Self::Unauthorized,
-            PersistError::StorageUnavailable => Self::Storage,
+            PersistError::PayloadUnavailable | PersistError::StorageUnavailable => Self::Storage,
         }
     }
 }
@@ -412,7 +399,7 @@ impl<P: Persist> DaemonAuthority<P> {
         &mut self,
         request: &ClaimRequest,
     ) -> Result<AdmissionResult, AuthorityError> {
-        validate_claim_events(&request.events)?;
+        let (event_refs, payload) = validated_claim_payload(&request.events)?;
         let arm_id =
             ArmId::new(request.arm_id.clone()).map_err(|_| AuthorityError::InvalidIdentifier)?;
         let arm = self.arms.get(&arm_id).ok_or(AuthorityError::UnknownArm)?;
@@ -452,27 +439,30 @@ impl<P: Persist> DaemonAuthority<P> {
             verifier_ref,
             revoked: false,
         };
-        let claim = PersistedClaimRecord {
-            attempt_id: attempt_id.clone(),
+        let claim_digest = canonical_claim_digest(
+            &request_id,
+            &arm.arm_id,
+            arm.generation,
+            &signal_id,
+            &event_refs,
+            &payload,
+            None,
+            None,
+        );
+        let admission = ClaimAdmission {
             request_id,
             arm_id: arm.arm_id.clone(),
             generation: arm.generation,
             signal_id,
-            event_refs: request
-                .events
-                .iter()
-                .map(|event| event.event_ref.clone())
-                .collect(),
+            event_refs: event_refs.clone(),
+            claim_digest: claim_digest.clone(),
+            payload,
             claimed_at: self.now,
+            coverage: None,
+            drain_witness: None,
         };
-        let record = self.persist.admit_claim(
-            &ClaimAdmission {
-                record: claim.clone(),
-                events: request.events.clone(),
-            },
-            &attachment,
-        )?;
-        if record.outcome == ClaimOutcome::ExactReplay {
+        let record = self.persist.admit_claim(&admission, &attachment)?;
+        if record.outcome == AdmissionOutcome::ExactReplay {
             return Ok(AdmissionResult {
                 outcome: record.outcome,
                 attempt_id: record.attempt_id.as_str().to_owned(),
@@ -480,10 +470,23 @@ impl<P: Persist> DaemonAuthority<P> {
             });
         }
         self.attempt_seq = attempt_seq;
+        let claim = PersistedClaimRecord {
+            attempt_id: attempt_id.clone(),
+            request_id: admission.request_id,
+            arm_id: admission.arm_id,
+            generation: admission.generation,
+            signal_id: admission.signal_id,
+            event_refs,
+            claim_digest,
+            payload_ref: record.payload_ref.clone(),
+            claimed_at: admission.claimed_at,
+            coverage: admission.coverage.clone(),
+            drain_witness: admission.drain_witness.clone(),
+        };
         self.claims.insert(attempt_id.clone(), claim);
         self.attachments.insert(attempt_id.clone(), attachment);
         Ok(AdmissionResult {
-            outcome: ClaimOutcome::Admitted,
+            outcome: AdmissionOutcome::Admitted,
             attempt_id: attempt_id.as_str().to_owned(),
             receipt: Some(AdmissionReceipt { attempt_id }),
         })
@@ -573,7 +576,7 @@ impl<P: Persist> DaemonAuthority<P> {
                     .record_prewrite_conclusion(PreWriteConclusionCommit {
                         attempt_id: prepared.correlation.attempt_id,
                         signal_id: prepared.correlation.signal_id,
-                        conclusion: PreWriteConclusion::IdleStateUnproven,
+                        conclusion: NonActivePreWriteConclusion::IdleStateUnproven,
                         recorded_at: observed_at,
                     })?;
                 Ok(ProbeAuthorization::IdleStateUnproven)
@@ -657,7 +660,7 @@ impl<P: Persist> DaemonAuthority<P> {
                 .record_prewrite_conclusion(PreWriteConclusionCommit {
                     attempt_id: prepared.correlation.attempt_id,
                     signal_id: prepared.correlation.signal_id,
-                    conclusion: PreWriteConclusion::IdleEpochInvalidated {
+                    conclusion: NonActivePreWriteConclusion::IdleEpochInvalidated {
                         probe_id: probe_id.clone(),
                         expected_epoch: expected_epoch.clone(),
                         observed_epoch: observed_epoch.clone(),
@@ -733,7 +736,7 @@ impl<P: Persist> DaemonAuthority<P> {
         let reconciliation_scope =
             matches!(disposition, NativeWriteDisposition::Unknown).then(|| ReconciliationScope {
                 correlation,
-                evidence_ref,
+                native_write_evidence_ref: evidence_ref,
             });
         Ok(NativeWriteConclusion {
             disposition,
@@ -763,7 +766,7 @@ impl<P: Persist> DaemonAuthority<P> {
             write,
             reconciliation: degraded.then(|| ReconciliationScope {
                 correlation: scope.correlation.clone(),
-                evidence_ref: scope.evidence_ref.clone(),
+                native_write_evidence_ref: scope.evidence_ref.clone(),
             }),
         })
     }
@@ -774,9 +777,15 @@ impl<P: Persist> DaemonAuthority<P> {
         disposition: Result<ReconciliationDisposition, ControllerReconcileError>,
     ) -> Result<(IdempotentWrite, ReconciliationPhase), AuthorityError> {
         let disposition = disposition.map_err(|_| AuthorityError::Unauthorized)?;
+        // Each observation carries a freshly authorized owned scope to the
+        // consuming port; the coordinator-retained scope never crosses it.
+        let owned = ReconciliationScope {
+            correlation: scope.correlation.clone(),
+            native_write_evidence_ref: scope.native_write_evidence_ref.clone(),
+        };
         let result = self
             .persist
-            .record_reconciliation_fact(scope, &disposition)?;
+            .record_reconciliation_fact(owned, &disposition)?;
         let phase = match &disposition {
             ReconciliationDisposition::Unknown => ReconciliationPhase::Reconciling,
             ReconciliationDisposition::ProvenNotAccepted => ReconciliationPhase::Closed,
@@ -792,7 +801,7 @@ impl<P: Persist> DaemonAuthority<P> {
                 })?;
                 ReconciliationPhase::Observing(Box::new(ObservationScope {
                     correlation,
-                    evidence_ref: scope.evidence_ref.clone(),
+                    evidence_ref: scope.native_write_evidence_ref.clone(),
                 }))
             }
             ReconciliationDisposition::Terminal { turn_ref, class } => {
@@ -1038,7 +1047,7 @@ fn recovery_followup_scopes(
                     None | Some(ReconciliationDisposition::Unknown) => {
                         reconciling.push(ReconciliationScope {
                             correlation: record.correlation.clone(),
-                            evidence_ref: record.evidence_ref.clone(),
+                            native_write_evidence_ref: record.evidence_ref.clone(),
                         });
                     }
                     Some(ReconciliationDisposition::Accepted { turn_ref }) => {
@@ -1499,7 +1508,7 @@ mod tests {
                         probe_id,
                         expected_epoch,
                         observed_epoch,
-                    } => PreWriteConclusion::IdleEpochInvalidated {
+                    } => NonActivePreWriteConclusion::IdleEpochInvalidated {
                         probe_id,
                         expected_epoch,
                         observed_epoch,
@@ -1645,7 +1654,7 @@ mod tests {
         authority.admit_claim(&request).expect("admit");
         authority.set_now(now() + Duration::seconds(1));
         let replay = authority.admit_claim(&request).expect("exact replay");
-        assert_eq!(replay.outcome, ClaimOutcome::ExactReplay);
+        assert_eq!(replay.outcome, AdmissionOutcome::ExactReplay);
 
         let different = ClaimRequest {
             request_id: "claim-b".to_owned(),

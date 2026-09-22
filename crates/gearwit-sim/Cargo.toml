@@ -1,0 +1,23 @@
+[package]
+name = "gearwit-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Development-only deterministic simulation and replay for Gearwit"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gearwit-sim"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1"
+clap = { version = "4.5.45", features = ["derive"] }
+gearwit-host = { workspace = true, features = ["simulator"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

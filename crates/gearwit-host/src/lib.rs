@@ -7,6 +7,8 @@ mod admit;
 mod authority;
 #[allow(dead_code)] // Kept private until a host integration point is approved.
 mod codex_transport;
+#[cfg(any(test, feature = "simulator"))]
+mod conformance;
 #[allow(dead_code)] // Private until the native adapter is wired into gearwitd.
 mod controller;
 #[allow(dead_code)] // Private until the native adapter is wired into gearwitd.
@@ -16,6 +18,10 @@ mod link;
 mod paths;
 #[allow(dead_code)] // Semantic fake precedes the production persistence backend.
 mod persist;
+#[cfg(feature = "simulator")]
+pub mod simulator;
+#[cfg(any(test, feature = "simulator"))]
+mod sqlite_baseline;
 
 pub use ack::{
     AckRearm, AckStore, HandledServe, apply_handled_request, rearm_from_handled, record_handled,
