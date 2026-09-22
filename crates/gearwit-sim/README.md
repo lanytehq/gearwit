@@ -17,16 +17,16 @@ Run a fixed scenario and save its replay bundle:
 
 ```sh
 cargo run -p gearwit-sim -- scenario --id SIM-CHAIN-01 --store sqlite \
-  --seed 17 --artifact target/gearwit-sim/chain.json
+  --seed 17 --root target/gearwit-sim/chain
 ```
 
 Run a bounded seeded campaign, replay one result, or compare two results:
 
 ```sh
 cargo run -p gearwit-sim -- campaign --seed 23 --runs 16 \
-  --artifact-dir target/gearwit-sim/campaign
+  --root target/gearwit-sim/campaign
 cargo run -p gearwit-sim -- replay \
-  --artifact target/gearwit-sim/chain.json
+  --bundle target/gearwit-sim/chain/sim-chain-01-17-sqlite.json
 cargo run -p gearwit-sim -- compare --left result-a.json --right result-b.json
 ```
 
@@ -41,9 +41,16 @@ The stable readiness catalog is:
 
 | IDs | Coverage |
 | --- | --- |
-| `SIM-CHAIN-01`–`SIM-CHAIN-08` | Full helper chain, exact and conflicting retries, revocation, partial rearm, restart after acknowledgment, stale authority, changed-content reuse, and omitted rearm |
+| `SIM-CHAIN-01` | Full helper chain through rearm and admission of the next event |
+| `SIM-CHAIN-02` | Exact retrieve and acknowledgment retry before and after restart |
+| `SIM-CHAIN-03` | Changed-content operation identity reuse conflicts across restart |
+| `SIM-CHAIN-04` | Revocation survives restart and refuses a fresh retrieve |
+| `SIM-CHAIN-05` | Stale authority cannot regain access after restart |
+| `SIM-CHAIN-06` | An event arrives while rearm waits for terminal state |
+| `SIM-CHAIN-07` | A child is killed after acknowledgment; a fresh process reopens its own SQLite media |
+| `SIM-CHAIN-08` | Omitted rearm produces the recorded inactive outcome |
 | `SIM-QUEUE-01` | Independent offered arrivals, bounded queue growth, completion, and visible rejection |
-| `SIM-REPLAY-01` | Same controlled input and scheduling decisions reproduce the semantic fingerprint |
+| `SIM-REPLAY-01` | A named early-rearm failure reproduces the same semantic fingerprint |
 | `SIM-PROC-01` | Pre-commit and post-commit killed child with fresh-process SQLite reopen |
 | `SIM-ORACLE-01`–`SIM-ORACLE-04` | Detection of duplicate admission, lost committed acknowledgment, revoked-grant resurrection, and false durable-publication success |
 

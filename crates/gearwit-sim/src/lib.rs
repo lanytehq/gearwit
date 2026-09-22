@@ -104,8 +104,10 @@ pub struct Stimulus {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Action {
     Arm,
+    Offer { event: String },
     Admit { event: String },
     Retrieve { request: String },
+    StaleRetrieve { request: String },
     Acknowledge { request: String },
     Terminal,
     Rearm,
@@ -175,6 +177,7 @@ struct Oracle {
     terminal: bool,
     rearmed: bool,
     revoked: bool,
+    offered: usize,
     logical_effects: u64,
     revision: u64,
     request_results: BTreeMap<String, String>,
@@ -209,7 +212,11 @@ impl Oracle {
                 self.armed = true;
                 self.commit("armed")
             }
-            Action::Admit { event } if self.armed && !self.revoked => {
+            Action::Offer { .. } if self.armed => {
+                self.offered += 1;
+                self.commit("offered")
+            }
+            Action::Admit { event } if self.armed && !self.revoked && self.offered > 0 => {
                 if self.claimed {
                     "conflict".to_owned()
                 } else {
@@ -248,6 +255,10 @@ impl Oracle {
             }
             Action::Rearm if self.acknowledged && self.terminal => {
                 self.rearmed = true;
+                self.claimed = false;
+                self.retrieved = false;
+                self.acknowledged = false;
+                self.terminal = false;
                 self.commit("rearmed")
             }
             Action::Rearm if !self.acknowledged => "waiting_for_handled".to_owned(),
@@ -268,6 +279,175 @@ impl Oracle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FaultMode {
+    None,
+    DuplicateAdmission,
+    LoseAcknowledgment,
+    ResurrectRevokedGrant,
+    FalsePublication,
+}
+
+impl FaultMode {
+    fn for_case(case_id: &str) -> Self {
+        match case_id {
+            "SIM-ORACLE-01" => Self::DuplicateAdmission,
+            "SIM-ORACLE-02" => Self::LoseAcknowledgment,
+            "SIM-ORACLE-03" => Self::ResurrectRevokedGrant,
+            "SIM-ORACLE-04" => Self::FalsePublication,
+            _ => Self::None,
+        }
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Default)]
+struct AdapterState {
+    armed: bool,
+    offered: usize,
+    claimed: bool,
+    retrieved: bool,
+    acknowledged: bool,
+    terminal: bool,
+    revoked: bool,
+    logical_effects: u64,
+    revision: u64,
+    requests: BTreeMap<String, String>,
+    operations: BTreeMap<String, Action>,
+}
+
+struct TestAdapter {
+    live: AdapterState,
+    durable: AdapterState,
+    fault: FaultMode,
+}
+
+impl TestAdapter {
+    fn new(fault: FaultMode) -> Self {
+        Self {
+            live: AdapterState::default(),
+            durable: AdapterState::default(),
+            fault,
+        }
+    }
+
+    fn apply(&mut self, stimulus: &Stimulus) -> Observation {
+        if matches!(stimulus.action, Action::Restart) {
+            self.live = self.durable.clone();
+            match self.fault {
+                FaultMode::LoseAcknowledgment => self.live.acknowledged = false,
+                FaultMode::ResurrectRevokedGrant => self.live.revoked = false,
+                _ => {}
+            }
+            return self.observation(stimulus, "reopened");
+        }
+        let outcome = if let Some(original) = self.live.operations.get(&stimulus.operation_id) {
+            if original == &stimulus.action {
+                "exact_replay".to_owned()
+            } else {
+                "conflict".to_owned()
+            }
+        } else {
+            self.live
+                .operations
+                .insert(stimulus.operation_id.clone(), stimulus.action.clone());
+            self.apply_fresh(&stimulus.action)
+        };
+        self.observation(stimulus, &outcome)
+    }
+
+    fn apply_fresh(&mut self, action: &Action) -> String {
+        let (outcome, committed) = match action {
+            Action::Arm => {
+                self.live.armed = true;
+                ("armed", true)
+            }
+            Action::Offer { .. } if self.live.armed => {
+                self.live.offered += 1;
+                ("offered", true)
+            }
+            Action::Admit { event }
+                if self.live.armed && !self.live.revoked && self.live.offered > 0 =>
+            {
+                if self.live.claimed {
+                    ("conflict", false)
+                } else {
+                    self.live.claimed = true;
+                    self.live.logical_effects += 1;
+                    self.live
+                        .requests
+                        .insert(event.clone(), "admitted".to_owned());
+                    if self.fault == FaultMode::DuplicateAdmission {
+                        self.live.logical_effects += 1;
+                    }
+                    ("admitted", true)
+                }
+            }
+            Action::Retrieve { request } if self.live.claimed && !self.live.revoked => {
+                if let Some(result) = self.live.requests.get(request) {
+                    return result.clone();
+                }
+                if self.live.acknowledged {
+                    ("invalid_transition", false)
+                } else {
+                    self.live.retrieved = true;
+                    self.live
+                        .requests
+                        .insert(request.clone(), "retrieved".to_owned());
+                    ("retrieved", true)
+                }
+            }
+            Action::Acknowledge { request } if self.live.retrieved && !self.live.revoked => {
+                if let Some(result) = self.live.requests.get(request) {
+                    return result.clone();
+                }
+                if self.fault == FaultMode::FalsePublication {
+                    return "acknowledged".to_owned();
+                }
+                self.live.acknowledged = true;
+                self.live
+                    .requests
+                    .insert(request.clone(), "acknowledged".to_owned());
+                ("acknowledged", true)
+            }
+            Action::Terminal if self.live.claimed => {
+                self.live.terminal = true;
+                ("terminal", true)
+            }
+            Action::Rearm if self.live.acknowledged && self.live.terminal => {
+                self.live.claimed = false;
+                self.live.retrieved = false;
+                self.live.acknowledged = false;
+                self.live.terminal = false;
+                ("rearmed", true)
+            }
+            Action::Rearm if !self.live.acknowledged => ("waiting_for_handled", false),
+            Action::Rearm => ("waiting_for_terminal", false),
+            Action::Revoke => {
+                self.live.revoked = true;
+                ("revoked", true)
+            }
+            Action::OmitRearm => ("inactive", false),
+            _ => ("unauthorized", false),
+        };
+        if committed {
+            self.live.revision += 1;
+            self.durable = self.live.clone();
+        }
+        outcome.to_owned()
+    }
+
+    fn observation(&self, stimulus: &Stimulus, outcome: &str) -> Observation {
+        Observation {
+            version: ARTIFACT_VERSION.to_owned(),
+            operation_id: stimulus.operation_id.clone(),
+            outcome: outcome.to_owned(),
+            logical_effects: self.live.logical_effects,
+            authority_revision: self.live.revision,
+        }
+    }
+}
+
 /// Build the stable scenario envelope for one named readiness case.
 ///
 /// # Errors
@@ -283,95 +463,226 @@ pub fn scenario(
         return Err(format!("unknown scenario id: {case_id}"));
     }
     let seeds = derive_seeds(seed);
-    let mut stimuli = base_chain(seeds.actor);
     let mut limits = RunLimits::default();
-    match case_id {
+    let event = format!("event-{:016x}", seeds.actor);
+    let retrieve = format!("retrieve-{:016x}", seeds.actor);
+    let acknowledge = format!("ack-{:016x}", seeds.actor);
+    let mut stimuli = match case_id {
+        "SIM-CHAIN-01" => complete_chain(&event, &retrieve, &acknowledge),
+        "SIM-REPLAY-01" => {
+            let mut chain = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+            chain.push(stimulus(5, 6, "controlled-early-rearm", Action::Rearm));
+            chain
+        }
         "SIM-CHAIN-02" => {
-            let mut retrieve_replay = stimuli[2].clone();
-            retrieve_replay.due_tick = 7;
-            retrieve_replay.sequence = 8;
-            stimuli.push(retrieve_replay);
-            let mut ack_replay = stimuli[3].clone();
-            ack_replay.due_tick = 8;
-            ack_replay.sequence = 9;
-            stimuli.push(ack_replay);
+            let mut chain = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+            chain.push(stimulus(5, 6, "restart-1", Action::Restart));
+            chain.push(stimulus(
+                6,
+                7,
+                "retrieve-1",
+                Action::Retrieve {
+                    request: retrieve.clone(),
+                },
+            ));
+            chain.push(stimulus(
+                7,
+                8,
+                "ack-1",
+                Action::Acknowledge {
+                    request: acknowledge.clone(),
+                },
+            ));
+            chain
         }
         "SIM-CHAIN-03" => {
-            stimuli.truncate(3);
-            stimuli.push(stimulus(3, 4, "revoke-1", Action::Revoke));
-            stimuli.push(stimulus(4, 5, "restart-1", Action::Restart));
-            stimuli.push(stimulus(
-                5,
-                6,
-                "retrieve-after-revoke",
-                Action::Retrieve {
-                    request: "retrieve-2".to_owned(),
-                },
-            ));
-        }
-        "SIM-CHAIN-04" => {
-            stimuli.truncate(3);
-            stimuli.push(stimulus(3, 4, "rearm-early", Action::Rearm));
-            stimuli.push(stimulus(
+            let mut chain = vec![
+                stimulus(0, 1, "arm-1", Action::Arm),
+                stimulus(
+                    1,
+                    2,
+                    "offer-1",
+                    Action::Offer {
+                        event: event.clone(),
+                    },
+                ),
+                stimulus(
+                    2,
+                    3,
+                    "claim-1",
+                    Action::Admit {
+                        event: event.clone(),
+                    },
+                ),
+                stimulus(3, 4, "restart-1", Action::Restart),
+            ];
+            chain.push(stimulus(
                 4,
                 5,
-                "admit-during-rearm",
-                Action::Admit {
-                    event: "event-b".to_owned(),
-                },
-            ));
-        }
-        "SIM-CHAIN-05" => {
-            stimuli.truncate(5);
-            stimuli.push(stimulus(5, 6, "restart-after-ack", Action::Restart));
-            stimuli.push(stimulus(6, 7, "terminal-1", Action::Terminal));
-            stimuli.push(stimulus(7, 8, "rearm-1", Action::Rearm));
-        }
-        "SIM-CHAIN-06" => {
-            stimuli.truncate(2);
-            stimuli.push(stimulus(2, 3, "revoke-lease", Action::Revoke));
-            stimuli.push(stimulus(
-                3,
-                4,
-                "stale-retrieve",
-                Action::Retrieve {
-                    request: "retrieve-stale".to_owned(),
-                },
-            ));
-        }
-        "SIM-CHAIN-07" => {
-            stimuli.truncate(2);
-            stimuli.push(stimulus(
-                2,
-                3,
                 "claim-1",
                 Action::Admit {
                     event: "changed-event".to_owned(),
                 },
             ));
+            chain
+        }
+        "SIM-CHAIN-04" => vec![
+            stimulus(0, 1, "arm-1", Action::Arm),
+            stimulus(
+                1,
+                2,
+                "offer-1",
+                Action::Offer {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(
+                2,
+                3,
+                "claim-1",
+                Action::Admit {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(3, 4, "revoke-1", Action::Revoke),
+            stimulus(4, 5, "restart-1", Action::Restart),
+            stimulus(
+                5,
+                6,
+                "retrieve-after-revoke",
+                Action::Retrieve {
+                    request: retrieve.clone(),
+                },
+            ),
+        ],
+        "SIM-CHAIN-05" => vec![
+            stimulus(0, 1, "arm-1", Action::Arm),
+            stimulus(
+                1,
+                2,
+                "offer-1",
+                Action::Offer {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(
+                2,
+                3,
+                "claim-1",
+                Action::Admit {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(3, 4, "restart-1", Action::Restart),
+            stimulus(
+                4,
+                5,
+                "stale-retrieve",
+                Action::StaleRetrieve {
+                    request: retrieve.clone(),
+                },
+            ),
+        ],
+        "SIM-CHAIN-06" => {
+            let mut chain = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+            chain.push(stimulus(5, 6, "rearm-wait", Action::Rearm));
+            chain.push(stimulus(
+                6,
+                7,
+                "offer-during-rearm",
+                Action::Offer {
+                    event: "event-during-rearm".to_owned(),
+                },
+            ));
+            chain.push(stimulus(7, 8, "terminal-1", Action::Terminal));
+            chain.push(stimulus(8, 9, "rearm-1", Action::Rearm));
+            chain
+        }
+        "SIM-CHAIN-07" | "SIM-PROC-01" => {
+            let mut chain = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+            chain.push(stimulus(5, 6, "restart-after-ack", Action::Restart));
+            chain.push(stimulus(6, 7, "terminal-1", Action::Terminal));
+            chain.push(stimulus(7, 8, "rearm-1", Action::Rearm));
+            chain
         }
         "SIM-CHAIN-08" => {
-            stimuli.truncate(6);
-            stimuli.push(stimulus(6, 7, "omit-rearm", Action::OmitRearm));
+            let mut chain = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+            chain.push(stimulus(5, 6, "terminal-1", Action::Terminal));
+            chain.push(stimulus(6, 7, "omit-rearm", Action::OmitRearm));
+            chain
         }
         "SIM-QUEUE-01" => {
             limits.queue_capacity = 8;
             let mut arrivals = SplitMix64(seeds.scheduler);
-            stimuli = (0..24)
+            (0..24)
                 .map(|index| {
                     stimulus(
                         arrivals.next() % 6,
                         index,
                         &format!("queue-{index}"),
-                        Action::Arm,
+                        Action::Offer {
+                            event: format!("event-{index}"),
+                        },
                     )
                 })
-                .collect();
+                .collect()
         }
-        "SIM-REPLAY-01" | "SIM-PROC-01" | "SIM-ORACLE-01" | "SIM-ORACLE-02" | "SIM-ORACLE-03"
-        | "SIM-ORACLE-04" | "SIM-CHAIN-01" => {}
+        "SIM-ORACLE-01" => vec![
+            stimulus(0, 1, "arm-1", Action::Arm),
+            stimulus(
+                1,
+                2,
+                "offer-1",
+                Action::Offer {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(
+                2,
+                3,
+                "claim-1",
+                Action::Admit {
+                    event: event.clone(),
+                },
+            ),
+        ],
+        "SIM-ORACLE-02" => {
+            let mut chain = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+            chain.push(stimulus(5, 6, "restart-1", Action::Restart));
+            chain.push(stimulus(6, 7, "terminal-1", Action::Terminal));
+            chain.push(stimulus(7, 8, "rearm-1", Action::Rearm));
+            chain
+        }
+        "SIM-ORACLE-03" => vec![
+            stimulus(0, 1, "arm-1", Action::Arm),
+            stimulus(
+                1,
+                2,
+                "offer-1",
+                Action::Offer {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(
+                2,
+                3,
+                "claim-1",
+                Action::Admit {
+                    event: event.clone(),
+                },
+            ),
+            stimulus(3, 4, "revoke-1", Action::Revoke),
+            stimulus(4, 5, "restart-1", Action::Restart),
+            stimulus(
+                5,
+                6,
+                "retrieve-after-revoke",
+                Action::Retrieve { request: retrieve },
+            ),
+        ],
+        "SIM-ORACLE-04" => first_acknowledged_chain(&event, &retrieve, &acknowledge),
         _ => unreachable!("catalog checked"),
-    }
+    };
     if case_id != "SIM-QUEUE-01" {
         let mut prior = None;
         for stimulus in &mut stimuli {
@@ -401,33 +712,65 @@ fn stimulus(due_tick: u64, sequence: u64, operation_id: &str, action: Action) ->
     }
 }
 
-fn base_chain(seed: u64) -> Vec<Stimulus> {
-    let event = format!("event-{seed:016x}");
-    let retrieve = format!("retrieve-{seed:016x}");
-    let acknowledge = format!("ack-{seed:016x}");
+fn first_acknowledged_chain(event: &str, retrieve: &str, acknowledge: &str) -> Vec<Stimulus> {
     vec![
         stimulus(0, 1, "arm-1", Action::Arm),
-        stimulus(1, 2, "claim-1", Action::Admit { event }),
-        stimulus(2, 3, "retrieve-1", Action::Retrieve { request: retrieve }),
+        stimulus(
+            1,
+            2,
+            "offer-1",
+            Action::Offer {
+                event: event.to_owned(),
+            },
+        ),
+        stimulus(
+            2,
+            3,
+            "claim-1",
+            Action::Admit {
+                event: event.to_owned(),
+            },
+        ),
         stimulus(
             3,
             4,
-            "ack-1",
-            Action::Acknowledge {
-                request: acknowledge,
+            "retrieve-1",
+            Action::Retrieve {
+                request: retrieve.to_owned(),
             },
         ),
-        stimulus(4, 5, "terminal-1", Action::Terminal),
-        stimulus(5, 6, "rearm-1", Action::Rearm),
         stimulus(
-            6,
-            7,
-            "next-event",
-            Action::Admit {
-                event: "event-b".to_owned(),
+            4,
+            5,
+            "ack-1",
+            Action::Acknowledge {
+                request: acknowledge.to_owned(),
             },
         ),
     ]
+}
+
+fn complete_chain(event: &str, retrieve: &str, acknowledge: &str) -> Vec<Stimulus> {
+    let mut chain = first_acknowledged_chain(event, retrieve, acknowledge);
+    chain.push(stimulus(5, 6, "terminal-1", Action::Terminal));
+    chain.push(stimulus(6, 7, "rearm-1", Action::Rearm));
+    chain.push(stimulus(
+        7,
+        8,
+        "offer-2",
+        Action::Offer {
+            event: "event-next".to_owned(),
+        },
+    ));
+    chain.push(stimulus(
+        8,
+        9,
+        "claim-2",
+        Action::Admit {
+            event: "event-next".to_owned(),
+        },
+    ));
+    chain
 }
 
 /// Run a deterministic scenario and return a replayable artifact.
@@ -457,10 +800,10 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
     let (observations, queue_accounting) = if envelope.case_id == "SIM-QUEUE-01" {
         run_slow_queue(&runnable, &envelope.limits)
     } else {
-        let mut oracle = Oracle::default();
+        let mut adapter = TestAdapter::new(FaultMode::for_case(&envelope.case_id));
         let observations = runnable
             .iter()
-            .map(|stimulus| oracle.apply(stimulus))
+            .map(|stimulus| adapter.apply(stimulus))
             .collect::<Vec<_>>();
         let completed = observations.len();
         (
@@ -478,9 +821,28 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
         )
     };
     let mut host_checks = host_checks(&envelope.case_id, envelope.store);
-    let findings = validate_observations(&envelope.case_id, &observations);
-    if let Some(check) = faulty_adapter_probe(&envelope.case_id) {
-        host_checks.push(check);
+    let mut findings = if envelope.case_id == "SIM-QUEUE-01" {
+        Vec::new()
+    } else {
+        oracle_findings(&runnable, &observations)
+    };
+    let case_findings = validate_observations(&envelope.case_id, &observations);
+    findings.extend(case_findings.iter().cloned());
+    let fault = FaultMode::for_case(&envelope.case_id);
+    if fault != FaultMode::None {
+        host_checks.push(HostCheck {
+            store: envelope.store,
+            check: format!("oracle-detects-{}", fault.name()),
+            passed: !findings.is_empty(),
+            detail: if findings.is_empty() {
+                "deliberate adapter violation escaped the independent oracle".to_owned()
+            } else {
+                format!(
+                    "independent oracle reported {} mismatch(es)",
+                    findings.len()
+                )
+            },
+        });
     }
     if envelope.case_id == "SIM-PROC-01" {
         host_checks.push(HostCheck {
@@ -492,7 +854,10 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
     }
     let status = if resource_limited {
         CaseStatus::Incomplete
-    } else if findings.is_empty() && host_checks.iter().all(|check| check.passed) {
+    } else if case_findings.is_empty()
+        && (fault != FaultMode::None || findings.is_empty())
+        && host_checks.iter().all(|check| check.passed)
+    {
         CaseStatus::Passed
     } else if envelope.case_id == "SIM-PROC-01" {
         CaseStatus::Incomplete
@@ -507,6 +872,43 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
         findings,
         status,
     )
+}
+
+impl FaultMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::DuplicateAdmission => "duplicate-admission",
+            Self::LoseAcknowledgment => "lost-committed-ack",
+            Self::ResurrectRevokedGrant => "revoked-grant-resurrection",
+            Self::FalsePublication => "false-durable-publication",
+        }
+    }
+}
+
+fn oracle_findings(stimuli: &[Stimulus], observations: &[Observation]) -> Vec<String> {
+    let mut oracle = Oracle::default();
+    let expected = stimuli
+        .iter()
+        .map(|stimulus| oracle.apply(stimulus))
+        .collect::<Vec<_>>();
+    expected
+        .iter()
+        .zip(observations)
+        .filter(|(expected, actual)| expected != actual)
+        .map(|(expected, actual)| {
+            format!(
+                "{} expected outcome={} effects={} revision={}, observed outcome={} effects={} revision={}",
+                actual.operation_id,
+                expected.outcome,
+                expected.logical_effects,
+                expected.authority_revision,
+                actual.outcome,
+                actual.logical_effects,
+                actual.authority_revision
+            )
+        })
+        .collect()
 }
 
 fn run_slow_queue(stimuli: &[Stimulus], limits: &RunLimits) -> (Vec<Observation>, QueueAccounting) {
@@ -564,23 +966,26 @@ fn queue_completion(stimulus: Stimulus, prior: usize) -> Observation {
 
 fn host_checks(case_id: &str, store: SimulatorStore) -> Vec<HostCheck> {
     let ids: &[&str] = match case_id {
-        "SIM-CHAIN-01" | "SIM-REPLAY-01" => return vec![run_complete_chain(store)],
+        "SIM-CHAIN-01" => return vec![run_complete_chain(store)],
         "SIM-CHAIN-02" => &[
             "replay.retrieve.exact",
             "replay.ack.exact",
-            "replay.retrieve.changed-digest",
+            "op.recover-authority-state",
         ],
-        "SIM-CHAIN-03" => &[
+        "SIM-CHAIN-03" => &["op.admit-claim", "op.recover-authority-state"],
+        "SIM-CHAIN-04" => &[
             "op.revoke-helper-grant",
             "grant.revocation-survives-admission",
         ],
-        "SIM-CHAIN-04" => &[
-            "snapshot.rearm-join-absent-before-handled",
-            "replay.restore.terminal-leaves-partial-rearm",
+        "SIM-CHAIN-05" => &[
+            "grant.retired-identity-rejected",
+            "op.recover-authority-state",
         ],
-        "SIM-CHAIN-05" => &["replay.ack.exact", "snapshot.helper-sections-omit-bodies"],
-        "SIM-CHAIN-06" => &["op.revoke-helper-grant", "replay.retrieve.exact"],
-        "SIM-CHAIN-07" => &["op.admit-claim", "replay.retrieve.changed-digest"],
+        "SIM-CHAIN-06" => &[
+            "snapshot.rearm-join-absent-before-handled",
+            "op.try-rearm-join",
+        ],
+        "SIM-CHAIN-07" => &["replay.ack.exact", "op.recover-authority-state"],
         "SIM-CHAIN-08" => &["snapshot.rearm-join-absent-before-handled"],
         _ => &[],
     };
@@ -611,9 +1016,38 @@ fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<Str
     if case_id == "SIM-CHAIN-03"
         && observations
             .last()
+            .is_some_and(|observation| observation.outcome != "conflict")
+    {
+        findings
+            .push("changed-content operation identity did not conflict after restart".to_owned());
+    }
+    if case_id == "SIM-CHAIN-04"
+        && observations
+            .last()
             .is_some_and(|observation| observation.outcome != "unauthorized")
     {
         findings.push("revoked authority returned after restart".to_owned());
+    }
+    if case_id == "SIM-CHAIN-05"
+        && observations
+            .last()
+            .is_some_and(|observation| observation.outcome != "unauthorized")
+    {
+        findings.push("stale authority regained access after restart".to_owned());
+    }
+    if case_id == "SIM-CHAIN-06"
+        && !observations
+            .iter()
+            .any(|observation| observation.outcome == "waiting_for_terminal")
+    {
+        findings.push("early rearm did not wait for terminal state".to_owned());
+    }
+    if case_id == "SIM-CHAIN-07"
+        && observations
+            .last()
+            .is_some_and(|observation| observation.outcome != "rearmed")
+    {
+        findings.push("post-ack restart did not preserve state through rearm".to_owned());
     }
     if case_id == "SIM-CHAIN-08"
         && observations
@@ -622,64 +1056,19 @@ fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<Str
     {
         findings.push("omitted rearm was not reported inactive".to_owned());
     }
-    if case_id == "SIM-CHAIN-07"
-        && observations
-            .last()
-            .is_some_and(|observation| observation.outcome != "conflict")
-    {
-        findings.push("changed-content identity reuse did not conflict".to_owned());
+    if case_id == "SIM-CHAIN-01" && effects != 2 {
+        findings.push(format!(
+            "complete chain admitted {effects} logical effects, expected 2"
+        ));
     }
-    if effects > 1 {
-        findings.push(format!("logical effect count exceeded one: {effects}"));
+    if case_id == "SIM-REPLAY-01"
+        && !observations
+            .iter()
+            .any(|observation| observation.outcome == "waiting_for_terminal")
+    {
+        findings.push("controlled replay failure was not observed".to_owned());
     }
     findings
-}
-
-fn faulty_adapter_probe(case_id: &str) -> Option<HostCheck> {
-    let (name, detected) = match case_id {
-        "SIM-ORACLE-01" => {
-            let reported_effects = [1_u64, 2];
-            (
-                "duplicate-admission",
-                reported_effects.windows(2).any(|pair| pair[1] > pair[0]),
-            )
-        }
-        "SIM-ORACLE-02" => {
-            let acknowledged_before_restart = true;
-            let acknowledged_after_restart = false;
-            (
-                "lost-committed-ack",
-                acknowledged_before_restart && !acknowledged_after_restart,
-            )
-        }
-        "SIM-ORACLE-03" => {
-            let grant_revoked = true;
-            let fresh_retrieve_reported = true;
-            (
-                "revoked-grant-resurrection",
-                grant_revoked && fresh_retrieve_reported,
-            )
-        }
-        "SIM-ORACLE-04" => {
-            let revision_before = 7_u64;
-            let revision_after_reported_success = 7_u64;
-            (
-                "false-durable-publication",
-                revision_before == revision_after_reported_success,
-            )
-        }
-        _ => return None,
-    };
-    Some(HostCheck {
-        store: SimulatorStore::Fake,
-        check: format!("oracle-detects-{name}"),
-        passed: detected,
-        detail: if detected {
-            "deliberate violation detected".to_owned()
-        } else {
-            "deliberate violation escaped the oracle".to_owned()
-        },
-    })
 }
 
 fn finish_artifact(
@@ -863,45 +1252,39 @@ fn derive_seeds(seed: u64) -> SeedSet {
 ///
 /// # Panics
 ///
-/// Panics if the compile-time `SIM-PROC-01` catalog entry is removed.
+/// Panics if `case_id` is not a process-backed catalog entry.
 #[must_use]
-pub fn run_process_case(executable: &Path, seed: u64) -> RunArtifact {
-    let envelope = scenario("SIM-PROC-01", seed, SimulatorStore::Sqlite).expect("known case");
-    let mut checks = Vec::new();
+pub fn run_process_case(executable: &Path, seed: u64, case_id: &str, root: &Path) -> RunArtifact {
+    assert!(matches!(case_id, "SIM-CHAIN-07" | "SIM-PROC-01"));
+    let envelope = scenario(case_id, seed, SimulatorStore::Sqlite).expect("known case");
+    let base = run(envelope);
+    let mut checks = base.host_checks;
+    checks.retain(|check| check.check != "real-process-runner");
     for phase in ["pre_commit", "post_commit"] {
-        checks.push(run_crash_phase(executable, phase));
+        checks.push(run_crash_phase(executable, phase, root));
     }
-    let status = if checks.iter().all(|check| check.passed) {
+    let status = if base.oracle_findings.is_empty() && checks.iter().all(|check| check.passed) {
         CaseStatus::Passed
     } else {
         CaseStatus::Failed
     };
     finish_artifact(
-        envelope,
-        Vec::new(),
+        base.scenario,
+        base.observations,
         checks,
-        QueueAccounting {
-            offered: 0,
-            admitted: 0,
-            rejected: 0,
-            completed: 0,
-            delivered: 0,
-            duplicated: 0,
-            dropped: 0,
-            max_depth: 0,
-        },
-        Vec::new(),
+        base.queue,
+        base.oracle_findings,
         status,
     )
 }
 
-fn run_crash_phase(executable: &Path, phase: &str) -> HostCheck {
-    let root = std::env::temp_dir().join(format!("gearwit-sim-{}-{phase}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    if let Err(error) = fs::create_dir(&root) {
+fn run_crash_phase(executable: &Path, phase: &str, artifact_root: &Path) -> HostCheck {
+    let phase_root = artifact_root.join(format!("process-{}-{phase}", std::process::id()));
+    let _ = fs::remove_dir_all(&phase_root);
+    if let Err(error) = fs::create_dir_all(&phase_root) {
         return failed_process_check(phase, error.to_string());
     }
-    let path = root.join("authority.sqlite");
+    let path = phase_root.join("authority.sqlite");
     let marker = path.with_extension("marker");
     let mut child = match Command::new(executable)
         .arg("__crash-child")
@@ -943,7 +1326,7 @@ fn run_crash_phase(executable: &Path, phase: &str) -> HostCheck {
     }
     let _ = child.wait();
     let result = verify_crash_reopen(&path);
-    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&phase_root);
     match result {
         Ok(()) => HostCheck {
             store: SimulatorStore::Sqlite,
@@ -995,6 +1378,9 @@ mod tests {
             for store in [SimulatorStore::Fake, SimulatorStore::Sqlite] {
                 let artifact = run(scenario(id, 9, store).expect(id));
                 assert_eq!(artifact.status, CaseStatus::Passed, "{id}: {artifact:#?}");
+                if !id.starts_with("SIM-ORACLE-") {
+                    assert!(artifact.oracle_findings.is_empty(), "{id}: {artifact:#?}");
+                }
             }
         }
     }
@@ -1040,6 +1426,41 @@ mod tests {
         ] {
             let artifact = run(scenario(id, 29, SimulatorStore::Fake).expect("scenario"));
             assert_eq!(artifact.status, CaseStatus::Passed, "{id}: {artifact:#?}");
+            assert!(!artifact.oracle_findings.is_empty(), "{id}: {artifact:#?}");
+            assert!(
+                artifact
+                    .host_checks
+                    .iter()
+                    .any(|check| check.check.starts_with("oracle-detects-") && check.passed),
+                "{id}: {artifact:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_chain_ids_have_the_required_terminal_observation() {
+        for (id, operation_id, outcome) in [
+            ("SIM-CHAIN-01", "claim-2", "admitted"),
+            ("SIM-CHAIN-02", "ack-1", "exact_replay"),
+            ("SIM-CHAIN-03", "claim-1", "conflict"),
+            ("SIM-CHAIN-04", "retrieve-after-revoke", "unauthorized"),
+            ("SIM-CHAIN-05", "stale-retrieve", "unauthorized"),
+            ("SIM-CHAIN-06", "rearm-1", "rearmed"),
+            ("SIM-CHAIN-07", "rearm-1", "rearmed"),
+            ("SIM-CHAIN-08", "omit-rearm", "inactive"),
+            (
+                "SIM-REPLAY-01",
+                "controlled-early-rearm",
+                "waiting_for_terminal",
+            ),
+        ] {
+            let artifact = run(scenario(id, 37, SimulatorStore::Fake).expect(id));
+            assert!(
+                artifact.observations.iter().any(|observation| {
+                    observation.operation_id == operation_id && observation.outcome == outcome
+                }),
+                "{id}: {artifact:#?}"
+            );
         }
     }
 

@@ -32,7 +32,7 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         seed: u64,
         #[arg(long)]
-        artifact: Option<PathBuf>,
+        root: PathBuf,
     },
     /// Run a bounded seeded campaign and save every replay bundle.
     Campaign {
@@ -43,12 +43,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = StoreArg::Fake)]
         store: StoreArg,
         #[arg(long)]
-        artifact_dir: PathBuf,
+        root: PathBuf,
     },
     /// Replay a saved bundle and require the same semantic fingerprint.
     Replay {
         #[arg(long)]
-        artifact: PathBuf,
+        bundle: PathBuf,
     },
     /// Compare two saved result bundles.
     Compare {
@@ -98,19 +98,19 @@ fn execute(cli: Cli) -> Result<ExitCode, String> {
             id,
             store,
             seed,
-            artifact,
+            root,
         } => {
-            let result = if id == "SIM-PROC-01" {
+            let result = if matches!(id.as_str(), "SIM-CHAIN-07" | "SIM-PROC-01") {
                 run_process_case(
                     &std::env::current_exe().map_err(|error| error.to_string())?,
                     seed,
+                    &id,
+                    &root,
                 )
             } else {
                 run(scenario(&id, seed, store.into())?)
             };
-            if let Some(path) = artifact {
-                write_artifact(&path, &result)?;
-            }
+            write_artifact(&default_artifact_path(&root, &result), &result)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
@@ -121,11 +121,11 @@ fn execute(cli: Cli) -> Result<ExitCode, String> {
             seed,
             runs,
             store,
-            artifact_dir,
+            root,
         } => {
             let results = campaign(seed, runs, store.into());
             for result in &results {
-                write_artifact(&default_artifact_path(&artifact_dir, result), result)?;
+                write_artifact(&default_artifact_path(&root, result), result)?;
             }
             println!(
                 "{}",
@@ -141,8 +141,8 @@ fn execute(cli: Cli) -> Result<ExitCode, String> {
             };
             Ok(exit_for(status))
         }
-        Command::Replay { artifact } => {
-            let original = read_artifact(&artifact)?;
+        Command::Replay { bundle } => {
+            let original = read_artifact(&bundle)?;
             let replayed = replay(&original)?;
             println!(
                 "{}",
