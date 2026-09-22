@@ -330,6 +330,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gearwit-sim"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "gearwit-host",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

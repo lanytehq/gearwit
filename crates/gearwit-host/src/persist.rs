@@ -282,7 +282,7 @@ fn insert_unique<K: Ord, V>(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "simulator"))]
 fn retrieve_result_matches_claim(
     result: &RecordedRetrieveResult,
     claim: &PersistedClaimRecord,
@@ -388,7 +388,7 @@ fn proved_ack_index(
 
 /// Test-only admission constructor over validated wire events. Panics on
 /// invalid fixture input; production admissions validate through authority.
-#[cfg(test)]
+#[cfg(any(test, feature = "simulator"))]
 pub(crate) fn claim_admission_fixture(
     request_id: &str,
     arm_id: ArmId,
@@ -444,7 +444,7 @@ pub(crate) fn claim_admission_fixture(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "simulator"))]
 pub(crate) fn synthetic_drain_witness(
     payload: &BoundedClaimPayload,
     event_refs: &BoundedVec<EventRef, 1, 64>,
@@ -458,7 +458,7 @@ pub(crate) fn synthetic_drain_witness(
 }
 
 /// Test-only contiguous-prefix coverage through the newest admitted event.
-#[cfg(test)]
+#[cfg(any(test, feature = "simulator"))]
 pub(crate) fn synthetic_claim_coverage(
     request_id: &ClaimRequestId,
     arm_id: &ArmId,
@@ -1694,7 +1694,7 @@ impl FakePersist {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     #[allow(clippy::too_many_lines)]
     pub(crate) fn restore_from_snapshot(
         snapshot: RecoverySnapshot,
@@ -1818,7 +1818,7 @@ impl FakePersist {
         Ok(store)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     #[allow(clippy::too_many_lines)]
     fn validate_restored_helper_invariants(&self) -> Result<(), PersistError> {
         let mut grant_keys = BTreeSet::new();
@@ -1964,7 +1964,7 @@ impl FakePersist {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     fn claim_for_origin(
         &self,
         origin: &PersistedHelperBindingIdentity,
@@ -2260,19 +2260,19 @@ impl FakePersist {
     /// Payload partition paired with [`Self::restore_from_snapshot`].
     /// Recovery snapshots stay body-free; admission tests supply this map
     /// separately. Not a persistence-port method.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) fn claim_payloads(&self) -> BTreeMap<ClaimPayloadRef, BoundedClaimPayload> {
         self.payloads.clone()
     }
 
     /// Working create reservations. Recovery quarantines ownership and does
     /// not carry this map, so a durable reload must restore it separately.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) fn export_creates(&self) -> Vec<ThreadCreateReservation> {
         self.creates.values().cloned().collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) fn export_ownership(&self) -> Vec<PersistedThreadOwnership> {
         self.ownership
             .iter()
@@ -2283,7 +2283,7 @@ impl FakePersist {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) fn install_creates(&mut self, creates: Vec<ThreadCreateReservation>) {
         self.creates = creates
             .into_iter()

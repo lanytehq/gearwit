@@ -11,6 +11,9 @@ description = "Local gearwitd link admission and private ipcprims socket"
 [lints]
 workspace = true
 
+[features]
+simulator = ["dep:rusqlite"]
+
 [dependencies]
 blake3 = "1"
 gearwit-protocol.workspace = true
@@ -19,6 +22,7 @@ ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.4", default
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 # Keep rsfulmen pinned while sysprims shares the same logging ABI.
 rsfulmen = { version = "=0.1.5", default-features = false, features = ["logging"] }
+rusqlite = { version = "0.32.1", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 subtle = "2"

@@ -5,6 +5,8 @@
 //! transaction, then reloads that pair. It is not a production provider.
 //! Conformance gaps stay inconclusive; this module does not mark them passed.
 
+#![cfg_attr(feature = "simulator", allow(dead_code))]
+
 use crate::conformance::{self, ConformanceFixture, Prepared};
 use crate::controller::{
     ActorName, ArmId, AttemptId, BoundedBody, BoundedToken, BoundedVec, CanonicalBodyDigest,
@@ -1357,6 +1359,125 @@ fn crash_writer(role: &str) {
     write_marker(&path, "POST_COMMIT");
     std::thread::sleep(std::time::Duration::from_secs(60));
     let _ = store;
+}
+
+pub(crate) fn run_simulator_crash_child(path: &Path, phase: &str) -> Result<(), String> {
+    let mut store = SqliteBaseline::open_path(path);
+    let (binding, _, _) = conformance::install_helper(&mut store);
+    let exchange = conformance::retrieve_for(&binding, 41);
+    let authorized = match store
+        .record_retrieve_exchange(&exchange)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        IdempotentResult::Recorded(authorized) => authorized,
+        IdempotentResult::ExactReplay(_) => return Err("first retrieve replayed".to_owned()),
+    };
+    let request = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 42);
+    store
+        .acknowledge_retrieved_batch(&binding, &request)
+        .map_err(|error| format!("{error:?}"))?;
+    save_expected(path, &mut store);
+    match phase {
+        "pre_commit" => {
+            store.fault.pause_before_commit = true;
+            let extra = PersistedArm {
+                arm_id: ArmId::new("arm-extra").expect("arm"),
+                generation: 2,
+                seat_id: binding.seat_id.clone(),
+                capability: ManagedCapability::HandleClaimedSignal,
+                coverage_until: binding.lease_until,
+            };
+            let _ = store.persist_arm(&extra);
+        }
+        "post_commit" => {
+            let (journal, synchronous) = connection_pragmas(&store.conn);
+            write_writer_config(path, &journal, synchronous);
+            write_marker(path, "POST_COMMIT");
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        }
+        other => return Err(format!("unknown crash phase: {other}")),
+    }
+    Err("crash child returned before termination".to_owned())
+}
+
+pub(crate) fn verify_simulator_crash_reopen(path: &Path) -> Result<(), String> {
+    let (journal, synchronous) = read_writer_config(path);
+    if journal != "delete" || synchronous != 2 {
+        return Err(format!("writer durability {journal} {synchronous}"));
+    }
+    let (expected, creates, payloads) = load_expected(path);
+    let mut fresh = SqliteBaseline::open_path(path);
+    let actual = fresh
+        .recover_authority_state()
+        .map_err(|error| format!("{error:?}"))?;
+    if actual != expected {
+        return Err("reopened authority differs from expected state".to_owned());
+    }
+    if fresh.live.claim_payloads() != payloads {
+        return Err("reopened payloads differ from expected state".to_owned());
+    }
+    if fresh.live.export_creates() != creates {
+        return Err("reopened reservations differ from expected state".to_owned());
+    }
+    if actual
+        .arms
+        .iter()
+        .any(|arm| arm.arm_id.as_str() == "arm-extra")
+    {
+        return Err("partial arm survived process death".to_owned());
+    }
+    let binding = binding_from_grant(
+        actual
+            .helper_grants
+            .first()
+            .ok_or_else(|| "reopened grant missing".to_owned())?,
+    );
+    let exchange = conformance::retrieve_for(&binding, 41);
+    let authorized = match fresh
+        .record_retrieve_exchange(&exchange)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        IdempotentResult::ExactReplay(authorized) => authorized,
+        IdempotentResult::Recorded(_) => return Err("retrieve did not replay".to_owned()),
+    };
+    if authorized.recorded
+        != actual
+            .retrieve_replays
+            .first()
+            .ok_or_else(|| "reopened retrieve missing".to_owned())?
+            .result
+    {
+        return Err("retrieve result differs from expected replay".to_owned());
+    }
+    let payload = fresh
+        .materialize_claimed_batch(&binding, authorized.permit)
+        .map_err(|error| format!("{error:?}"))?;
+    if &payload
+        != payloads
+            .get(&authorized.recorded.claim_payload_ref)
+            .ok_or_else(|| "reopened payload reference missing".to_owned())?
+    {
+        return Err("materialized payload differs from expected bytes".to_owned());
+    }
+    let request = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-a", 42);
+    match fresh
+        .acknowledge_retrieved_batch(&binding, &request)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        IdempotentResult::ExactReplay(result)
+            if result
+                == actual
+                    .ack_replays
+                    .first()
+                    .ok_or_else(|| "reopened acknowledgment missing".to_owned())?
+                    .result =>
+        {
+            Ok(())
+        }
+        other => Err(format!(
+            "acknowledgment did not replay after process death: {other:?}"
+        )),
+    }
 }
 
 fn write_marker(path: &Path, marker: &str) {

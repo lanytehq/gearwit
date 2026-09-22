@@ -5,6 +5,7 @@ members = [
     "crates/gearwit-protocol",
     "crates/gearwit-host",
     "crates/gearwit-cli",
+    "crates/gearwit-sim",
 ]
 exclude = ["apps/console/src-tauri"]
 
@@ -19,6 +20,7 @@ license = "MIT OR Apache-2.0"
 gearwit-domain = { path = "crates/gearwit-domain" }
 gearwit-protocol = { path = "crates/gearwit-protocol" }
 gearwit-host = { path = "crates/gearwit-host" }
+gearwit-sim = { path = "crates/gearwit-sim" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -10,6 +10,8 @@
 //! Only the deterministic fake adapter is implemented. The persistence port
 //! gains no method. Waiter-link acknowledgment state is outside this catalog.
 
+#![cfg_attr(feature = "simulator", allow(dead_code))]
+
 use crate::controller::{
     ArmId, AttemptId, BoundedToken, CanonicalBodyDigest, ClaimPayloadRef, ClaimRequestId,
     ControllerBirthId, EventRef, ManagedCapability, NativeTurnFact, PrivateNativeRef, RequestNonce,

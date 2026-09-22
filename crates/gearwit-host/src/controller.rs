@@ -50,7 +50,7 @@ macro_rules! private_id {
         }
 
         impl $name {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "simulator"))]
             pub(crate) const fn fixture(byte: u8) -> Self {
                 Self([byte; 32])
             }
@@ -327,12 +327,12 @@ impl VerifierRef {
         &self.0
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) const fn fixture(byte: u8) -> Self {
         Self([byte; 32])
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
