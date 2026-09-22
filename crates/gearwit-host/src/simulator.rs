@@ -16,6 +16,330 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use time::OffsetDateTime;
 
+/// One operation accepted by the development-only store stream adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoreStreamAction {
+    Arm,
+    Offer { event: String },
+    Admit { event: String },
+    Retrieve { request: String },
+    StaleRetrieve { request: String },
+    Acknowledge { request: String },
+    Terminal,
+    Rearm,
+    Revoke,
+    Restart,
+    OmitRearm,
+}
+
+/// Store-derived receipt returned for one resolved simulator operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreStreamReceipt {
+    pub outcome: String,
+    pub logical_effects: u64,
+    pub authority_revision: u64,
+}
+
+/// Stateful development adapter over one admitted persistence store.
+pub struct StoreStreamAdapter(StoreStreamAdapterInner);
+
+enum StoreStreamAdapterInner {
+    Fake(StreamDriver<FakeFixture>),
+    Sqlite(StreamDriver<SqliteBaseline>),
+}
+
+impl StoreStreamAdapter {
+    #[must_use]
+    pub fn new(store: SimulatorStore) -> Self {
+        match store {
+            SimulatorStore::Fake => Self(StoreStreamAdapterInner::Fake(StreamDriver::new())),
+            SimulatorStore::Sqlite => Self(StoreStreamAdapterInner::Sqlite(StreamDriver::new())),
+        }
+    }
+
+    /// Execute one operation against the same store used by earlier calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot execute or recover the requested
+    /// operation.
+    pub fn apply(
+        &mut self,
+        operation_id: &str,
+        action: &StoreStreamAction,
+    ) -> Result<StoreStreamReceipt, String> {
+        match &mut self.0 {
+            StoreStreamAdapterInner::Fake(driver) => driver.apply(operation_id, action),
+            StoreStreamAdapterInner::Sqlite(driver) => driver.apply(operation_id, action),
+        }
+    }
+}
+
+struct StreamDriver<F: ConformanceFixture> {
+    store: Option<F::Store>,
+    binding: ValidatedHelperBinding,
+    admission: crate::persist::ClaimAdmission,
+    attachment: crate::persist::PersistedControllerAttachment,
+    admissions: std::collections::BTreeMap<
+        String,
+        (
+            String,
+            crate::persist::ClaimAdmission,
+            crate::persist::PersistedControllerAttachment,
+        ),
+    >,
+    offered: Vec<String>,
+    last_retrieve: Option<AuthorizedRetrieve>,
+    blueprint: crate::persist::RecoverySnapshot,
+    grant_installed: bool,
+    logical_effects: u64,
+    revision: u64,
+}
+
+impl<F: ConformanceFixture> StreamDriver<F> {
+    fn new() -> Self {
+        let Prepared {
+            mut store,
+            binding,
+            admission,
+            attachment,
+        } = F::prepare();
+        let blueprint = store
+            .recover_authority_state()
+            .expect("fixture blueprint must recover");
+        Self {
+            store: Some(F::empty()),
+            binding,
+            admission,
+            attachment,
+            admissions: std::collections::BTreeMap::new(),
+            offered: Vec::new(),
+            last_retrieve: None,
+            blueprint,
+            grant_installed: false,
+            logical_effects: 0,
+            revision: 0,
+        }
+    }
+
+    fn apply(
+        &mut self,
+        operation_id: &str,
+        action: &StoreStreamAction,
+    ) -> Result<StoreStreamReceipt, String> {
+        let outcome = match action {
+            StoreStreamAction::Restart => {
+                let store = self.store.take().ok_or("store unavailable")?;
+                self.store = Some(F::reopen(store).map_err(debug_error)?);
+                "reopened".to_owned()
+            }
+            _ => self.apply_live(operation_id, action)?,
+        };
+        let recovered = self
+            .store
+            .as_mut()
+            .ok_or("store unavailable")?
+            .recover_authority_state()
+            .map_err(debug_error)?;
+        self.logical_effects = u64::try_from(recovered.claims.len())
+            .map_err(|_| "claim count exceeded receipt range".to_owned())?;
+        Ok(StoreStreamReceipt {
+            outcome,
+            logical_effects: self.logical_effects,
+            authority_revision: self.revision,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_live(
+        &mut self,
+        operation_id: &str,
+        action: &StoreStreamAction,
+    ) -> Result<String, String> {
+        let store = self.store.as_mut().ok_or("store unavailable")?;
+        match action {
+            StoreStreamAction::Arm => {
+                let birth = self
+                    .blueprint
+                    .controller_births
+                    .first()
+                    .ok_or("fixture blueprint had no controller birth")?;
+                let reservation = conformance::birth_parts().reservation;
+                store
+                    .reserve_controller_birth(birth, &reservation)
+                    .map_err(debug_error)?;
+                let arm = self
+                    .blueprint
+                    .arms
+                    .first()
+                    .ok_or("fixture blueprint had no arm")?;
+                store.persist_arm(arm).map_err(debug_error)?;
+                self.revision += 1;
+                Ok("armed".to_owned())
+            }
+            StoreStreamAction::Offer { event } => {
+                self.offered.push(event.clone());
+                self.revision += 1;
+                Ok("offered".to_owned())
+            }
+            StoreStreamAction::Admit { event } => {
+                if !self.admissions.contains_key(operation_id)
+                    && !self.offered.iter().any(|offered| offered == event)
+                {
+                    return Ok("unauthorized".to_owned());
+                }
+                let (admission, attachment) = if let Some((original, admission, attachment)) =
+                    self.admissions.get(operation_id)
+                {
+                    let mut admission = admission.clone();
+                    if original != event {
+                        admission.claim_digest = ClaimDigest::fixture(derive_nonce(event));
+                    }
+                    (admission, attachment.clone())
+                } else if self.admissions.is_empty() {
+                    (self.admission.clone(), self.attachment.clone())
+                } else {
+                    let event_record = ProviderEvent {
+                        provider: "test".to_owned(),
+                        event_ref: bounded_id("event", event),
+                        actor: None,
+                        observed_at: "1970-01-01T00:00:00Z".to_owned(),
+                        body: format!("simulator event {event}"),
+                    };
+                    let admission = crate::persist::claim_admission_fixture(
+                        &bounded_id("claim", operation_id),
+                        self.binding.arm_id.clone(),
+                        self.binding.generation,
+                        SignalId::new(bounded_id("signal", operation_id)).map_err(str::to_owned)?,
+                        &[event_record],
+                        OffsetDateTime::UNIX_EPOCH,
+                    );
+                    let mut attachment = self.attachment.clone();
+                    attachment.attempt_id = AttemptId::new(bounded_id("attempt", operation_id))
+                        .map_err(str::to_owned)?;
+                    attachment.verifier_ref = VerifierRef::fixture(derive_nonce(operation_id));
+                    (admission, attachment)
+                };
+                let result = store.admit_claim(&admission, &attachment);
+                let outcome = match result {
+                    Ok(result) if result.outcome == AdmissionOutcome::Admitted => {
+                        if !self.grant_installed {
+                            let grant = self
+                                .blueprint
+                                .helper_grants
+                                .first()
+                                .ok_or("fixture blueprint had no helper grant")?;
+                            store.persist_helper_grant(grant).map_err(debug_error)?;
+                            self.grant_installed = true;
+                        }
+                        self.logical_effects += 1;
+                        self.revision += 1;
+                        "admitted"
+                    }
+                    Ok(result) if result.outcome == AdmissionOutcome::ExactReplay => "exact_replay",
+                    Err(PersistError::Conflict) => "conflict",
+                    Err(PersistError::Unauthorized) => "unauthorized",
+                    Err(PersistError::InvalidTransition) => "invalid_transition",
+                    Err(error) => return Err(debug_error(error)),
+                    Ok(result) => return Err(format!("unexpected admission outcome: {result:?}")),
+                };
+                self.admissions.entry(operation_id.to_owned()).or_insert((
+                    event.clone(),
+                    admission,
+                    attachment,
+                ));
+                Ok(outcome.to_owned())
+            }
+            StoreStreamAction::Retrieve { request } => {
+                let exchange = conformance::retrieve_for(&self.binding, derive_nonce(request));
+                match store.record_retrieve_exchange(&exchange) {
+                    Ok(IdempotentResult::Recorded(authorized)) => {
+                        self.last_retrieve = Some(authorized);
+                        self.revision += 1;
+                        Ok("retrieved".to_owned())
+                    }
+                    Ok(IdempotentResult::ExactReplay(authorized)) => {
+                        self.last_retrieve = Some(authorized);
+                        Ok("exact_replay".to_owned())
+                    }
+                    Err(PersistError::Unauthorized) => Ok("unauthorized".to_owned()),
+                    Err(PersistError::InvalidTransition) => Ok("invalid_transition".to_owned()),
+                    Err(error) => Err(debug_error(error)),
+                }
+            }
+            StoreStreamAction::StaleRetrieve { request } => {
+                store
+                    .revoke_helper_grant(revocation_scope(&self.binding))
+                    .map_err(debug_error)?;
+                let exchange = conformance::retrieve_for(&self.binding, derive_nonce(request));
+                match store.record_retrieve_exchange(&exchange) {
+                    Err(PersistError::Unauthorized) => Ok("unauthorized".to_owned()),
+                    other => Err(format!("stale retrieve was accepted: {other:?}")),
+                }
+            }
+            StoreStreamAction::Acknowledge { request } => {
+                let authorized = self
+                    .last_retrieve
+                    .as_ref()
+                    .ok_or("acknowledgment had no recorded retrieve")?;
+                let ack = conformance::ack_for(
+                    &self.binding,
+                    &authorized.recorded.retrieval_id,
+                    "event-b",
+                    derive_nonce(request),
+                );
+                match store.acknowledge_retrieved_batch(&self.binding, &ack) {
+                    Ok(IdempotentResult::Recorded(_)) => {
+                        self.revision += 1;
+                        Ok("acknowledged".to_owned())
+                    }
+                    Ok(IdempotentResult::ExactReplay(_)) => Ok("exact_replay".to_owned()),
+                    Err(PersistError::Unauthorized) => Ok("unauthorized".to_owned()),
+                    Err(PersistError::InvalidTransition) => Ok("invalid_transition".to_owned()),
+                    Err(error) => Err(debug_error(error)),
+                }
+            }
+            StoreStreamAction::Terminal => {
+                F::install_terminal(store, &self.binding, derive_nonce(operation_id))
+                    .map_err(debug_error)?;
+                self.revision += 1;
+                Ok("terminal".to_owned())
+            }
+            StoreStreamAction::Rearm => match store
+                .try_rearm_join(join_scope(&self.binding))
+                .map_err(debug_error)?
+            {
+                RearmJoinResult::Rearmed => {
+                    self.revision += 1;
+                    Ok("rearmed".to_owned())
+                }
+                RearmJoinResult::AlreadyRearmed => Ok("exact_replay".to_owned()),
+                RearmJoinResult::WaitingForHandled => Ok("waiting_for_handled".to_owned()),
+                RearmJoinResult::WaitingForRecognizedTerminal => {
+                    Ok("waiting_for_terminal".to_owned())
+                }
+            },
+            StoreStreamAction::Revoke => {
+                store
+                    .revoke_helper_grant(revocation_scope(&self.binding))
+                    .map_err(debug_error)?;
+                self.revision += 1;
+                Ok("revoked".to_owned())
+            }
+            StoreStreamAction::OmitRearm => Ok("inactive".to_owned()),
+            StoreStreamAction::Restart => unreachable!("handled by apply"),
+        }
+    }
+}
+
+fn derive_nonce(value: &str) -> u8 {
+    blake3::hash(value.as_bytes()).as_bytes()[0].max(1)
+}
+
+fn bounded_id(prefix: &str, value: &str) -> String {
+    format!("{prefix}-{:02x}", derive_nonce(value))
+}
+
 /// Admitted synthetic stores. Neither variant is a production provider.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

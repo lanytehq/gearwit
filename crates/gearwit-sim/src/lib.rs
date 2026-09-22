@@ -7,17 +7,16 @@
 #![forbid(unsafe_code)]
 
 use gearwit_host::simulator::{
-    HostCheck, SimulatorStore, run_chain_case, run_complete_chain, run_conformance,
-    verify_crash_reopen,
+    HostCheck, SimulatorStore, StoreStreamAction, StoreStreamAdapter, verify_crash_reopen,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const ARTIFACT_VERSION: &str = "gearwit.sim/v1";
+pub const ARTIFACT_VERSION: &str = "gearwit.sim/v2";
 pub const ORACLE_VERSION: &str = "gearwit.abstract-oracle/v1";
 pub const MAX_ARTIFACT_BYTES: usize = 1_048_576;
 
@@ -158,14 +157,29 @@ pub struct RunArtifact {
     pub oracle_findings: Vec<String>,
     pub status: CaseStatus,
     pub semantic_fingerprint: String,
+    pub provenance_fingerprint: String,
+    pub artifact_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Comparison {
     pub same_scenario: bool,
     pub same_semantics: bool,
+    pub same_provenance: bool,
     pub left_status: CaseStatus,
     pub right_status: CaseStatus,
+}
+
+pub const MAX_CAMPAIGN_RUNS: usize = 256;
+pub const MAX_CAMPAIGN_EVENTS: usize = 16_384;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CampaignManifest {
+    pub version: String,
+    pub seed: u64,
+    pub runs: usize,
+    pub store: SimulatorStore,
+    pub max_total_events: usize,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -291,160 +305,12 @@ enum FaultMode {
 
 impl FaultMode {
     fn for_case(case_id: &str) -> Self {
-        match case_id {
-            "SIM-ORACLE-01" => Self::DuplicateAdmission,
-            "SIM-ORACLE-02" => Self::LoseAcknowledgment,
-            "SIM-ORACLE-03" => Self::ResurrectRevokedGrant,
-            "SIM-ORACLE-04" => Self::FalsePublication,
+        match case_id.rsplit('-').next() {
+            Some("01") if case_id.contains("ORACLE") => Self::DuplicateAdmission,
+            Some("02") if case_id.contains("ORACLE") => Self::LoseAcknowledgment,
+            Some("03") if case_id.contains("ORACLE") => Self::ResurrectRevokedGrant,
+            Some("04") if case_id.contains("ORACLE") => Self::FalsePublication,
             _ => Self::None,
-        }
-    }
-}
-
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Default)]
-struct AdapterState {
-    armed: bool,
-    offered: usize,
-    claimed: bool,
-    retrieved: bool,
-    acknowledged: bool,
-    terminal: bool,
-    revoked: bool,
-    logical_effects: u64,
-    revision: u64,
-    requests: BTreeMap<String, String>,
-    operations: BTreeMap<String, Action>,
-}
-
-struct TestAdapter {
-    live: AdapterState,
-    durable: AdapterState,
-    fault: FaultMode,
-}
-
-impl TestAdapter {
-    fn new(fault: FaultMode) -> Self {
-        Self {
-            live: AdapterState::default(),
-            durable: AdapterState::default(),
-            fault,
-        }
-    }
-
-    fn apply(&mut self, stimulus: &Stimulus) -> Observation {
-        if matches!(stimulus.action, Action::Restart) {
-            self.live = self.durable.clone();
-            match self.fault {
-                FaultMode::LoseAcknowledgment => self.live.acknowledged = false,
-                FaultMode::ResurrectRevokedGrant => self.live.revoked = false,
-                _ => {}
-            }
-            return self.observation(stimulus, "reopened");
-        }
-        let outcome = if let Some(original) = self.live.operations.get(&stimulus.operation_id) {
-            if original == &stimulus.action {
-                "exact_replay".to_owned()
-            } else {
-                "conflict".to_owned()
-            }
-        } else {
-            self.live
-                .operations
-                .insert(stimulus.operation_id.clone(), stimulus.action.clone());
-            self.apply_fresh(&stimulus.action)
-        };
-        self.observation(stimulus, &outcome)
-    }
-
-    fn apply_fresh(&mut self, action: &Action) -> String {
-        let (outcome, committed) = match action {
-            Action::Arm => {
-                self.live.armed = true;
-                ("armed", true)
-            }
-            Action::Offer { .. } if self.live.armed => {
-                self.live.offered += 1;
-                ("offered", true)
-            }
-            Action::Admit { event }
-                if self.live.armed && !self.live.revoked && self.live.offered > 0 =>
-            {
-                if self.live.claimed {
-                    ("conflict", false)
-                } else {
-                    self.live.claimed = true;
-                    self.live.logical_effects += 1;
-                    self.live
-                        .requests
-                        .insert(event.clone(), "admitted".to_owned());
-                    if self.fault == FaultMode::DuplicateAdmission {
-                        self.live.logical_effects += 1;
-                    }
-                    ("admitted", true)
-                }
-            }
-            Action::Retrieve { request } if self.live.claimed && !self.live.revoked => {
-                if let Some(result) = self.live.requests.get(request) {
-                    return result.clone();
-                }
-                if self.live.acknowledged {
-                    ("invalid_transition", false)
-                } else {
-                    self.live.retrieved = true;
-                    self.live
-                        .requests
-                        .insert(request.clone(), "retrieved".to_owned());
-                    ("retrieved", true)
-                }
-            }
-            Action::Acknowledge { request } if self.live.retrieved && !self.live.revoked => {
-                if let Some(result) = self.live.requests.get(request) {
-                    return result.clone();
-                }
-                if self.fault == FaultMode::FalsePublication {
-                    return "acknowledged".to_owned();
-                }
-                self.live.acknowledged = true;
-                self.live
-                    .requests
-                    .insert(request.clone(), "acknowledged".to_owned());
-                ("acknowledged", true)
-            }
-            Action::Terminal if self.live.claimed => {
-                self.live.terminal = true;
-                ("terminal", true)
-            }
-            Action::Rearm if self.live.acknowledged && self.live.terminal => {
-                self.live.claimed = false;
-                self.live.retrieved = false;
-                self.live.acknowledged = false;
-                self.live.terminal = false;
-                ("rearmed", true)
-            }
-            Action::Rearm if !self.live.acknowledged => ("waiting_for_handled", false),
-            Action::Rearm => ("waiting_for_terminal", false),
-            Action::Revoke => {
-                self.live.revoked = true;
-                ("revoked", true)
-            }
-            Action::OmitRearm => ("inactive", false),
-            _ => ("unauthorized", false),
-        };
-        if committed {
-            self.live.revision += 1;
-            self.durable = self.live.clone();
-        }
-        outcome.to_owned()
-    }
-
-    fn observation(&self, stimulus: &Stimulus, outcome: &str) -> Observation {
-        Observation {
-            version: ARTIFACT_VERSION.to_owned(),
-            operation_id: stimulus.operation_id.clone(),
-            outcome: outcome.to_owned(),
-            logical_effects: self.live.logical_effects,
-            authority_revision: self.live.revision,
         }
     }
 }
@@ -755,73 +621,23 @@ fn complete_chain(event: &str, retrieve: &str, acknowledge: &str) -> Vec<Stimulu
     let mut chain = first_acknowledged_chain(event, retrieve, acknowledge);
     chain.push(stimulus(5, 6, "terminal-1", Action::Terminal));
     chain.push(stimulus(6, 7, "rearm-1", Action::Rearm));
-    chain.push(stimulus(
-        7,
-        8,
-        "offer-2",
-        Action::Offer {
-            event: "event-next".to_owned(),
-        },
-    ));
-    chain.push(stimulus(
-        8,
-        9,
-        "claim-2",
-        Action::Admit {
-            event: "event-next".to_owned(),
-        },
-    ));
     chain
 }
 
 /// Run a deterministic scenario and return a replayable artifact.
 #[must_use]
 pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
-    let mut queue = envelope.stimuli.clone();
-    queue.sort_by_key(|stimulus| (stimulus.due_tick, stimulus.sequence));
-    let offered = queue.len();
-    let admitted = offered.min(envelope.limits.queue_capacity);
-    let rejected = offered.saturating_sub(admitted);
-    if rejected > 0
-        && envelope.limits.overflow == OverflowPolicy::Reject
-        && envelope.case_id != "SIM-QUEUE-01"
-    {
-        queue.truncate(admitted);
-    }
-    let resource_limited = queue.len() > envelope.limits.max_events
-        || queue
-            .iter()
-            .any(|stimulus| stimulus.due_tick > envelope.limits.max_virtual_tick);
-    let runnable = queue
+    let (observations, queue, mut host_checks, resource_limited) = execute_stream(&envelope);
+    let runnable = envelope
+        .stimuli
         .iter()
-        .filter(|stimulus| stimulus.due_tick <= envelope.limits.max_virtual_tick)
-        .take(envelope.limits.max_events)
+        .filter(|stimulus| {
+            observations
+                .iter()
+                .any(|observation| observation.operation_id == stimulus.operation_id)
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let (observations, queue_accounting) = if envelope.case_id == "SIM-QUEUE-01" {
-        run_slow_queue(&runnable, &envelope.limits)
-    } else {
-        let mut adapter = TestAdapter::new(FaultMode::for_case(&envelope.case_id));
-        let observations = runnable
-            .iter()
-            .map(|stimulus| adapter.apply(stimulus))
-            .collect::<Vec<_>>();
-        let completed = observations.len();
-        (
-            observations,
-            QueueAccounting {
-                offered,
-                admitted,
-                rejected,
-                completed,
-                delivered: completed,
-                duplicated: 0,
-                dropped: 0,
-                max_depth: admitted,
-            },
-        )
-    };
-    let mut host_checks = host_checks(&envelope.case_id, envelope.store);
     let mut findings = if envelope.case_id == "SIM-QUEUE-01" {
         Vec::new()
     } else {
@@ -829,6 +645,13 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
     };
     let case_findings = validate_observations(&envelope.case_id, &observations);
     findings.extend(case_findings.iter().cloned());
+    if envelope.case_id != "SIM-QUEUE-01" && observations.len() != envelope.stimuli.len() {
+        findings.push(format!(
+            "mandatory stream completed {} of {} operations",
+            observations.len(),
+            envelope.stimuli.len()
+        ));
+    }
     let fault = FaultMode::for_case(&envelope.case_id);
     if fault != FaultMode::None {
         host_checks.push(HostCheck {
@@ -836,7 +659,7 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
             check: format!("oracle-detects-{}", fault.name()),
             passed: !findings.is_empty(),
             detail: if findings.is_empty() {
-                "deliberate adapter violation escaped the independent oracle".to_owned()
+                "deliberate adapter receipt violation escaped the independent oracle".to_owned()
             } else {
                 format!(
                     "independent oracle reported {} mismatch(es)",
@@ -853,26 +676,234 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
             detail: "use run_process_case so a separate child can be killed".to_owned(),
         });
     }
-    let status = if resource_limited {
-        CaseStatus::Incomplete
-    } else if case_findings.is_empty()
-        && (fault != FaultMode::None || findings.is_empty())
-        && host_checks.iter().all(|check| check.passed)
-    {
-        CaseStatus::Passed
-    } else if envelope.case_id == "SIM-PROC-01" {
-        CaseStatus::Incomplete
-    } else {
-        CaseStatus::Failed
-    };
-    finish_artifact(
-        envelope,
+    let status =
+        if resource_limited || (envelope.case_id != "SIM-QUEUE-01" && observations.is_empty()) {
+            CaseStatus::Incomplete
+        } else if case_findings.is_empty()
+            && (fault != FaultMode::None || findings.is_empty())
+            && host_checks.iter().all(|check| check.passed)
+        {
+            CaseStatus::Passed
+        } else if envelope.case_id == "SIM-PROC-01" {
+            CaseStatus::Incomplete
+        } else {
+            CaseStatus::Failed
+        };
+    finish_artifact(envelope, observations, host_checks, queue, findings, status)
+}
+
+#[allow(clippy::too_many_lines)] // Scheduler state is kept together so queue transitions stay auditable.
+fn execute_stream(
+    envelope: &ScenarioEnvelope,
+) -> (Vec<Observation>, QueueAccounting, Vec<HostCheck>, bool) {
+    let mut scheduled = envelope.stimuli.clone();
+    scheduled.sort_by_key(|stimulus| (stimulus.due_tick, stimulus.sequence));
+    let mut ready = VecDeque::new();
+    let mut in_flight: Option<(u64, Stimulus)> = None;
+    let mut completed_ids = BTreeSet::new();
+    let mut offered = 0usize;
+    let mut observations = Vec::new();
+    let mut adapter = StoreStreamAdapter::new(envelope.store);
+    let mut errors = Vec::new();
+    let mut admitted = 0usize;
+    let mut rejected = 0usize;
+    let mut max_depth = 0usize;
+    let service_ticks = usize::from(envelope.case_id == "SIM-QUEUE-01") as u64 * 2;
+    let mut tick = 0u64;
+    let mut resource_limited = false;
+
+    while !scheduled.is_empty() || !ready.is_empty() || in_flight.is_some() {
+        if tick > envelope.limits.max_virtual_tick
+            || observations.len() >= envelope.limits.max_events
+        {
+            resource_limited = true;
+            break;
+        }
+
+        if in_flight
+            .as_ref()
+            .is_some_and(|(complete_at, _)| *complete_at <= tick)
+        {
+            let (_, stimulus) = in_flight.take().expect("checked in-flight");
+            complete_store_step(
+                &mut adapter,
+                &stimulus,
+                FaultMode::for_case(&envelope.case_id),
+                &mut observations,
+                &mut completed_ids,
+                &mut errors,
+            );
+        }
+
+        let mut index = 0;
+        while index < scheduled.len() {
+            if scheduled[index].due_tick > tick {
+                index += 1;
+                continue;
+            }
+            let parent_ready = scheduled[index]
+                .causal_parent
+                .as_ref()
+                .is_none_or(|parent| completed_ids.contains(parent));
+            if !parent_ready {
+                index += 1;
+                continue;
+            }
+            let stimulus = scheduled.remove(index);
+            offered += 1;
+            let occupied = ready.len() + usize::from(in_flight.is_some());
+            if occupied >= envelope.limits.queue_capacity {
+                rejected += 1;
+            } else {
+                ready.push_back(stimulus);
+                admitted += 1;
+                max_depth = max_depth.max(ready.len() + usize::from(in_flight.is_some()));
+            }
+        }
+
+        if service_ticks == 0 {
+            while let Some(stimulus) = ready.pop_front() {
+                if observations.len() >= envelope.limits.max_events {
+                    resource_limited = true;
+                    break;
+                }
+                complete_store_step(
+                    &mut adapter,
+                    &stimulus,
+                    FaultMode::for_case(&envelope.case_id),
+                    &mut observations,
+                    &mut completed_ids,
+                    &mut errors,
+                );
+            }
+        } else if in_flight.is_none()
+            && let Some(stimulus) = ready.pop_front()
+        {
+            in_flight = Some((tick.saturating_add(service_ticks), stimulus));
+        }
+
+        if resource_limited {
+            break;
+        }
+        let next_scheduled = scheduled.iter().map(|item| item.due_tick).min();
+        let next_completion = in_flight.as_ref().map(|(at, _)| *at);
+        let next_tick = match (next_scheduled, next_completion, ready.is_empty()) {
+            (_, _, false) => tick.saturating_add(1),
+            (Some(scheduled), Some(completion), true) => scheduled.min(completion).max(tick + 1),
+            (Some(scheduled), None, true) => scheduled.max(tick + 1),
+            (None, Some(completion), true) => completion.max(tick + 1),
+            (None, None, true) => break,
+        };
+        tick = next_tick;
+    }
+
+    if !scheduled.is_empty() || !ready.is_empty() || in_flight.is_some() {
+        resource_limited = true;
+    }
+    let host_checks = vec![HostCheck {
+        store: envelope.store,
+        check: "resolved-store-stream".to_owned(),
+        passed: errors.is_empty() && !observations.is_empty(),
+        detail: if observations.is_empty() && errors.is_empty() {
+            "no resolved operations reached the store".to_owned()
+        } else if errors.is_empty() {
+            format!(
+                "{} resolved operations executed against one stateful store",
+                observations.len()
+            )
+        } else {
+            errors.join("; ")
+        },
+    }];
+    let completed = observations.len();
+    (
         observations,
+        QueueAccounting {
+            offered,
+            admitted,
+            rejected,
+            completed,
+            delivered: completed,
+            duplicated: 0,
+            dropped: 0,
+            max_depth,
+        },
         host_checks,
-        queue_accounting,
-        findings,
-        status,
+        resource_limited,
     )
+}
+
+fn complete_store_step(
+    adapter: &mut StoreStreamAdapter,
+    stimulus: &Stimulus,
+    fault: FaultMode,
+    observations: &mut Vec<Observation>,
+    completed_ids: &mut BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    let action = store_action(&stimulus.action);
+    match adapter.apply(&stimulus.operation_id, &action) {
+        Ok(receipt) => {
+            let mut observation = Observation {
+                version: ARTIFACT_VERSION.to_owned(),
+                operation_id: stimulus.operation_id.clone(),
+                outcome: receipt.outcome,
+                logical_effects: receipt.logical_effects,
+                authority_revision: receipt.authority_revision,
+            };
+            inject_receipt_fault(fault, &stimulus.action, &mut observation);
+            completed_ids.insert(stimulus.operation_id.clone());
+            observations.push(observation);
+        }
+        Err(error) => errors.push(format!("{}: {error}", stimulus.operation_id)),
+    }
+}
+
+fn store_action(action: &Action) -> StoreStreamAction {
+    match action {
+        Action::Arm => StoreStreamAction::Arm,
+        Action::Offer { event } => StoreStreamAction::Offer {
+            event: event.clone(),
+        },
+        Action::Admit { event } => StoreStreamAction::Admit {
+            event: event.clone(),
+        },
+        Action::Retrieve { request } => StoreStreamAction::Retrieve {
+            request: request.clone(),
+        },
+        Action::StaleRetrieve { request } => StoreStreamAction::StaleRetrieve {
+            request: request.clone(),
+        },
+        Action::Acknowledge { request } => StoreStreamAction::Acknowledge {
+            request: request.clone(),
+        },
+        Action::Terminal => StoreStreamAction::Terminal,
+        Action::Rearm => StoreStreamAction::Rearm,
+        Action::Revoke => StoreStreamAction::Revoke,
+        Action::Restart => StoreStreamAction::Restart,
+        Action::OmitRearm => StoreStreamAction::OmitRearm,
+    }
+}
+
+fn inject_receipt_fault(fault: FaultMode, action: &Action, observation: &mut Observation) {
+    match (fault, action) {
+        (FaultMode::DuplicateAdmission, Action::Admit { .. }) => {
+            observation.logical_effects = observation.logical_effects.saturating_add(1);
+        }
+        (FaultMode::LoseAcknowledgment, Action::Restart) => {
+            observation.authority_revision = observation.authority_revision.saturating_sub(1);
+        }
+        (
+            FaultMode::ResurrectRevokedGrant,
+            Action::Retrieve { .. } | Action::StaleRetrieve { .. },
+        ) => {
+            "retrieved".clone_into(&mut observation.outcome);
+        }
+        (FaultMode::FalsePublication, Action::Acknowledge { .. }) => {
+            observation.authority_revision = observation.authority_revision.saturating_add(1);
+        }
+        _ => {}
+    }
 }
 
 impl FaultMode {
@@ -910,72 +941,6 @@ fn oracle_findings(stimuli: &[Stimulus], observations: &[Observation]) -> Vec<St
             )
         })
         .collect()
-}
-
-fn run_slow_queue(stimuli: &[Stimulus], limits: &RunLimits) -> (Vec<Observation>, QueueAccounting) {
-    let mut pending = std::collections::VecDeque::new();
-    let mut observations = Vec::new();
-    let mut admitted = 0;
-    let mut rejected = 0;
-    let mut max_depth = 0;
-    let final_tick = stimuli
-        .iter()
-        .map(|stimulus| stimulus.due_tick)
-        .max()
-        .unwrap_or(0);
-    for tick in 0..=final_tick + u64::try_from(limits.queue_capacity).expect("queue capacity") {
-        for stimulus in stimuli.iter().filter(|stimulus| stimulus.due_tick == tick) {
-            if pending.len() == limits.queue_capacity {
-                rejected += 1;
-            } else {
-                pending.push_back(stimulus.clone());
-                admitted += 1;
-            }
-        }
-        max_depth = max_depth.max(pending.len());
-        if let Some(completed) = pending.pop_front() {
-            observations.push(queue_completion(completed, observations.len()));
-        }
-    }
-    while let Some(completed) = pending.pop_front() {
-        observations.push(queue_completion(completed, observations.len()));
-    }
-    (
-        observations,
-        QueueAccounting {
-            offered: stimuli.len(),
-            admitted,
-            rejected,
-            completed: admitted,
-            delivered: admitted,
-            duplicated: 0,
-            dropped: 0,
-            max_depth,
-        },
-    )
-}
-
-fn queue_completion(stimulus: Stimulus, prior: usize) -> Observation {
-    Observation {
-        version: ARTIFACT_VERSION.to_owned(),
-        operation_id: stimulus.operation_id,
-        outcome: "completed".to_owned(),
-        logical_effects: 0,
-        authority_revision: u64::try_from(prior + 1).expect("revision"),
-    }
-}
-
-fn host_checks(case_id: &str, store: SimulatorStore) -> Vec<HostCheck> {
-    match case_id {
-        "SIM-CHAIN-01" => vec![run_complete_chain(store)],
-        "SIM-CHAIN-02" | "SIM-CHAIN-03" | "SIM-CHAIN-04" | "SIM-CHAIN-05" | "SIM-CHAIN-06"
-        | "SIM-CHAIN-08" => vec![run_chain_case(store, case_id)],
-        "SIM-CHAIN-07" => vec![
-            run_conformance(store, "replay.ack.exact"),
-            run_conformance(store, "op.recover-authority-state"),
-        ],
-        _ => Vec::new(),
-    }
 }
 
 fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<String> {
@@ -1042,9 +1007,9 @@ fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<Str
     {
         findings.push("omitted rearm was not reported inactive".to_owned());
     }
-    if case_id == "SIM-CHAIN-01" && effects != 2 {
+    if case_id == "SIM-CHAIN-01" && effects != 1 {
         findings.push(format!(
-            "complete chain admitted {effects} logical effects, expected 2"
+            "complete chain admitted {effects} logical effects, expected 1"
         ));
     }
     if case_id == "SIM-REPLAY-01"
@@ -1074,35 +1039,105 @@ fn finish_artifact(
             SimulatorStore::Sqlite => "sqlite",
         }
     );
-    let semantic_fingerprint = fingerprint(&envelope, &observations, &host_checks, &queue);
-    RunArtifact {
+    let platform = PlatformPin {
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+        simulator_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    let semantic_fingerprint =
+        semantic_fingerprint(&envelope, &observations, &queue, &oracle_findings, status);
+    let provenance_fingerprint = provenance_fingerprint(&run_id, &envelope, &platform);
+    let mut artifact = RunArtifact {
         version: ARTIFACT_VERSION.to_owned(),
         run_id,
         oracle_version: ORACLE_VERSION.to_owned(),
         scenario: envelope,
-        platform: PlatformPin {
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
-            simulator_version: env!("CARGO_PKG_VERSION").to_owned(),
-        },
+        platform,
         observations,
         host_checks,
         queue,
         oracle_findings,
         status,
         semantic_fingerprint,
-    }
+        provenance_fingerprint,
+        artifact_digest: String::new(),
+    };
+    artifact.artifact_digest = artifact_digest(&artifact);
+    artifact
 }
 
-fn fingerprint(
+fn semantic_fingerprint(
     envelope: &ScenarioEnvelope,
     observations: &[Observation],
-    host_checks: &[HostCheck],
     queue: &QueueAccounting,
+    findings: &[String],
+    status: CaseStatus,
 ) -> String {
-    let bytes = serde_json::to_vec(&(envelope, observations, host_checks, queue))
-        .expect("serializable simulator state");
+    let bytes = serde_json::to_vec(&(
+        &envelope.version,
+        &envelope.case_id,
+        envelope.seed,
+        &envelope.seeds,
+        &envelope.limits,
+        &envelope.stimuli,
+        observations,
+        queue,
+        findings,
+        status,
+    ))
+    .expect("serializable simulator state");
     blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn provenance_fingerprint(
+    run_id: &str,
+    envelope: &ScenarioEnvelope,
+    platform: &PlatformPin,
+) -> String {
+    let bytes = serde_json::to_vec(&(run_id, envelope.store, platform))
+        .expect("serializable simulator provenance");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn artifact_digest(artifact: &RunArtifact) -> String {
+    let bytes = serde_json::to_vec(&(
+        &artifact.version,
+        &artifact.run_id,
+        &artifact.oracle_version,
+        &artifact.scenario,
+        &artifact.platform,
+        &artifact.observations,
+        &artifact.host_checks,
+        &artifact.queue,
+        &artifact.oracle_findings,
+        artifact.status,
+        &artifact.semantic_fingerprint,
+        &artifact.provenance_fingerprint,
+    ))
+    .expect("serializable artifact integrity fields");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn validate_artifact(artifact: &RunArtifact) -> Result<(), String> {
+    let expected_semantic = semantic_fingerprint(
+        &artifact.scenario,
+        &artifact.observations,
+        &artifact.queue,
+        &artifact.oracle_findings,
+        artifact.status,
+    );
+    if artifact.semantic_fingerprint != expected_semantic {
+        return Err("artifact semantic fingerprint is stale".to_owned());
+    }
+    let expected_provenance =
+        provenance_fingerprint(&artifact.run_id, &artifact.scenario, &artifact.platform);
+    if artifact.provenance_fingerprint != expected_provenance {
+        return Err("artifact provenance fingerprint is stale".to_owned());
+    }
+    if artifact.artifact_digest != artifact_digest(artifact) {
+        return Err("artifact integrity digest is stale".to_owned());
+    }
+    Ok(())
 }
 
 /// Persist a bounded replay bundle.
@@ -1154,6 +1189,7 @@ pub fn read_artifact(path: &Path) -> Result<RunArtifact, String> {
             artifact.version
         ));
     }
+    validate_artifact(&artifact)?;
     Ok(artifact)
 }
 
@@ -1164,6 +1200,7 @@ pub fn read_artifact(path: &Path) -> Result<RunArtifact, String> {
 /// Returns an error when the case requires a real child process or when the
 /// replay produces a different semantic fingerprint.
 pub fn replay(artifact: &RunArtifact) -> Result<RunArtifact, String> {
+    validate_artifact(artifact)?;
     if matches!(
         artifact.scenario.case_id.as_str(),
         "SIM-CHAIN-07" | "SIM-PROC-01"
@@ -1177,24 +1214,42 @@ pub fn replay(artifact: &RunArtifact) -> Result<RunArtifact, String> {
     Ok(replayed)
 }
 
-#[must_use]
-pub fn compare(left: &RunArtifact, right: &RunArtifact) -> Comparison {
-    Comparison {
+/// Compare validated semantic results and their separate provenance identity.
+///
+/// # Errors
+///
+/// Returns an error if either in-memory artifact fails its integrity checks.
+pub fn compare(left: &RunArtifact, right: &RunArtifact) -> Result<Comparison, String> {
+    validate_artifact(left)?;
+    validate_artifact(right)?;
+    Ok(Comparison {
         same_scenario: left.scenario == right.scenario,
         same_semantics: left.semantic_fingerprint == right.semantic_fingerprint,
+        same_provenance: left.provenance_fingerprint == right.provenance_fingerprint,
         left_status: left.status,
         right_status: right.status,
-    }
+    })
 }
 
-/// Run a seeded campaign. Random streams are independent from adapter work.
+/// Resolve a bounded campaign before any adapter work begins.
+///
+/// # Errors
+///
+/// Returns an error when the requested run or aggregate event budget is too
+/// large.
 ///
 /// # Panics
 ///
-/// Panics only if the compile-time case catalog is empty or contains an id
-/// rejected by [`scenario`].
-#[must_use]
-pub fn campaign(seed: u64, runs: usize, store: SimulatorStore) -> Vec<RunArtifact> {
+/// Panics only if the compile-time stable case catalog is empty or contains an
+/// id rejected by [`scenario`].
+pub fn campaign_envelopes(
+    seed: u64,
+    runs: usize,
+    store: SimulatorStore,
+) -> Result<Vec<ScenarioEnvelope>, String> {
+    if runs > MAX_CAMPAIGN_RUNS {
+        return Err(format!("campaign exceeds {MAX_CAMPAIGN_RUNS} run limit"));
+    }
     let mut source = SplitMix64(seed ^ 0x736f_7572_6365);
     let mut schedule = SplitMix64(seed ^ 0x7363_6865_6475_6c65);
     let candidates = CASE_IDS
@@ -1202,17 +1257,139 @@ pub fn campaign(seed: u64, runs: usize, store: SimulatorStore) -> Vec<RunArtifac
         .copied()
         .filter(|id| !matches!(*id, "SIM-CHAIN-07" | "SIM-PROC-01"))
         .collect::<Vec<_>>();
-    (0..runs)
-        .map(|_| {
+    let envelopes = (0..runs)
+        .map(|run_index| {
+            let run_seed = schedule.next();
+            if run_index % 2 == 0 {
+                return generated_chain(run_seed, store);
+            }
             let index = usize::try_from(
                 source.next() % u64::try_from(candidates.len()).expect("case count"),
             )
             .expect("bounded index");
             let case_id = candidates[index];
-            let run_seed = schedule.next();
-            run(scenario(case_id, run_seed, store).expect("catalog id"))
+            scenario(case_id, run_seed, store).expect("catalog id")
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let total_events = envelopes
+        .iter()
+        .map(|envelope| envelope.stimuli.len())
+        .sum::<usize>();
+    if total_events > MAX_CAMPAIGN_EVENTS {
+        return Err(format!(
+            "campaign resolves {total_events} events, exceeding {MAX_CAMPAIGN_EVENTS} event limit"
+        ));
+    }
+    Ok(envelopes)
+}
+
+fn generated_chain(seed: u64, store: SimulatorStore) -> ScenarioEnvelope {
+    let seeds = derive_seeds(seed);
+    let event = format!("event-{:016x}", seeds.actor);
+    let retrieve = format!("retrieve-{:016x}", seeds.actor);
+    let acknowledge = format!("ack-{:016x}", seeds.actor);
+    let mut stimuli = first_acknowledged_chain(&event, &retrieve, &acknowledge);
+    let cycles = 2 + usize::try_from(seeds.source % 3).expect("bounded cycles");
+    let mut sequence = 6u64;
+    for _ in 0..cycles {
+        stimuli.push(stimulus(
+            sequence,
+            sequence,
+            &format!("restart-{sequence}"),
+            Action::Restart,
+        ));
+        sequence += 1;
+        stimuli.push(stimulus(
+            sequence,
+            sequence,
+            "retrieve-1",
+            Action::Retrieve {
+                request: retrieve.clone(),
+            },
+        ));
+        sequence += 1;
+        stimuli.push(stimulus(
+            sequence,
+            sequence,
+            "ack-1",
+            Action::Acknowledge {
+                request: acknowledge.clone(),
+            },
+        ));
+        sequence += 1;
+    }
+    stimuli.push(stimulus(
+        sequence,
+        sequence,
+        "terminal-generated",
+        Action::Terminal,
+    ));
+    sequence += 1;
+    stimuli.push(stimulus(
+        sequence,
+        sequence,
+        "rearm-generated",
+        Action::Rearm,
+    ));
+    let mut prior = None;
+    let mut scheduler = SplitMix64(seeds.scheduler);
+    let mut due = 0u64;
+    for item in &mut stimuli {
+        due = due.saturating_add(1 + scheduler.next() % 3);
+        item.due_tick = due;
+        item.causal_parent.clone_from(&prior);
+        prior = Some(item.operation_id.clone());
+    }
+    let fault_index = seeds.fault % 5;
+    let case_id = if fault_index == 0 {
+        "SIM-GENERATED-NORMAL".to_owned()
+    } else {
+        format!("SIM-GENERATED-ORACLE-{fault_index:02}")
+    };
+    ScenarioEnvelope {
+        version: ARTIFACT_VERSION.to_owned(),
+        case_id,
+        seed,
+        seeds,
+        store,
+        limits: RunLimits::default(),
+        stimuli,
+    }
+}
+
+/// Run a seeded campaign through the shared store stream adapter.
+///
+/// # Errors
+///
+/// Returns an error when campaign resolution exceeds a resource budget.
+pub fn campaign(seed: u64, runs: usize, store: SimulatorStore) -> Result<Vec<RunArtifact>, String> {
+    Ok(campaign_envelopes(seed, runs, store)?
+        .into_iter()
+        .map(run)
+        .collect())
+}
+
+#[must_use]
+pub fn campaign_manifest(seed: u64, runs: usize, store: SimulatorStore) -> CampaignManifest {
+    CampaignManifest {
+        version: ARTIFACT_VERSION.to_owned(),
+        seed,
+        runs,
+        store,
+        max_total_events: MAX_CAMPAIGN_EVENTS,
+    }
+}
+
+/// Save campaign identity and aggregate limits before executing its first run.
+///
+/// # Errors
+///
+/// Returns an error if the output directory cannot be created or the manifest
+/// cannot be serialized or written.
+pub fn write_campaign_manifest(root: &Path, manifest: &CampaignManifest) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?;
+    fs::write(root.join("campaign-manifest.json"), bytes).map_err(|error| error.to_string())
 }
 
 struct SplitMix64(u64);
@@ -1391,7 +1568,7 @@ mod tests {
 
     #[test]
     fn campaigns_exclude_process_cases_and_replay_refuses_them() {
-        let results = campaign(20, 128, SimulatorStore::Fake);
+        let results = campaign(20, 128, SimulatorStore::Fake).expect("campaign");
         assert!(results.iter().all(|artifact| !matches!(
             artifact.scenario.case_id.as_str(),
             "SIM-CHAIN-07" | "SIM-PROC-01"
@@ -1418,10 +1595,13 @@ mod tests {
         ] {
             for store in [SimulatorStore::Fake, SimulatorStore::Sqlite] {
                 let artifact = run(scenario(id, 22, store).expect(id));
-                let check = artifact.host_checks.first().expect("store chain check");
-                assert_eq!(check.check, format!("store-chain-{id}"));
+                let check = artifact.host_checks.first().expect("store stream check");
+                assert_eq!(check.check, "resolved-store-stream");
                 assert!(check.passed, "{id}/{store:?}: {check:?}");
-                assert!(check.detail.contains(';'), "{id}/{store:?}: {check:?}");
+                assert!(
+                    check.detail.contains("stateful store"),
+                    "{id}/{store:?}: {check:?}"
+                );
             }
         }
     }
@@ -1466,7 +1646,7 @@ mod tests {
     #[test]
     fn stable_chain_ids_have_the_required_terminal_observation() {
         for (id, operation_id, outcome) in [
-            ("SIM-CHAIN-01", "claim-2", "admitted"),
+            ("SIM-CHAIN-01", "rearm-1", "rearmed"),
             ("SIM-CHAIN-02", "ack-1", "exact_replay"),
             ("SIM-CHAIN-03", "claim-1", "conflict"),
             ("SIM-CHAIN-04", "retrieve-after-revoke", "unauthorized"),
@@ -1494,7 +1674,7 @@ mod tests {
     fn unknown_artifact_version_is_refused() {
         let mut artifact =
             run(scenario("SIM-CHAIN-01", 31, SimulatorStore::Fake).expect("scenario"));
-        artifact.scenario.stimuli[0].version = "gearwit.sim/v2".to_owned();
+        artifact.scenario.stimuli[0].version = "gearwit.sim/v3".to_owned();
         let root = std::env::temp_dir().join(format!("gearwit-sim-version-{}", std::process::id()));
         let path = root.join("artifact.json");
         write_artifact(&path, &artifact).expect("write");
@@ -1526,5 +1706,175 @@ mod tests {
             first.seeds.fault,
         ];
         assert_eq!(values.iter().collect::<BTreeSet<_>>().len(), values.len());
+    }
+
+    #[test]
+    fn empty_or_reduced_mandatory_stream_cannot_pass_fixed_store_evidence() {
+        let mut empty = scenario("SIM-CHAIN-03", 47, SimulatorStore::Sqlite).expect("scenario");
+        empty.stimuli.clear();
+        let empty_result = run(empty);
+        assert_eq!(empty_result.status, CaseStatus::Incomplete);
+        assert!(empty_result.observations.is_empty());
+        assert!(empty_result.host_checks.iter().all(|check| !check.passed));
+
+        let complete =
+            run(scenario("SIM-CHAIN-03", 47, SimulatorStore::Sqlite).expect("complete scenario"));
+        let mut reduced =
+            scenario("SIM-CHAIN-03", 47, SimulatorStore::Sqlite).expect("reduced scenario");
+        reduced.stimuli.pop();
+        let reduced = run(reduced);
+        assert_ne!(complete.semantic_fingerprint, reduced.semantic_fingerprint);
+        assert_eq!(reduced.status, CaseStatus::Failed);
+        assert_eq!(
+            reduced.observations.last().expect("trace").outcome,
+            "reopened"
+        );
+    }
+
+    #[test]
+    fn injected_store_receipt_violation_reaches_the_oracle() {
+        let result =
+            run(scenario("SIM-ORACLE-01", 49, SimulatorStore::Sqlite).expect("fault scenario"));
+        assert_eq!(result.status, CaseStatus::Passed);
+        assert!(result.host_checks[0].passed);
+        assert!(
+            result
+                .oracle_findings
+                .iter()
+                .any(|finding| finding.contains("logical") || finding.contains("effects="))
+        );
+    }
+
+    #[test]
+    fn scheduled_arrivals_do_not_consume_transport_capacity_early() {
+        let mut envelope = scenario("SIM-CHAIN-01", 51, SimulatorStore::Fake).expect("scenario");
+        envelope.limits.queue_capacity = 1;
+        for (index, item) in envelope.stimuli.iter_mut().enumerate() {
+            item.due_tick = u64::try_from(index).expect("index") * 100;
+        }
+        let result = run(envelope);
+        assert_eq!(result.status, CaseStatus::Passed, "{result:#?}");
+        assert_eq!(result.queue.rejected, 0);
+        assert_eq!(result.queue.max_depth, 1);
+    }
+
+    #[test]
+    fn slow_adapter_accumulates_and_accounts_for_backlog() {
+        let mut envelope = scenario("SIM-QUEUE-01", 53, SimulatorStore::Fake).expect("scenario");
+        envelope.limits.queue_capacity = 2;
+        for item in &mut envelope.stimuli {
+            item.due_tick = 0;
+        }
+        let result = run(envelope);
+        assert_eq!(result.queue.offered, envelope_len_for_queue_test());
+        assert!(result.queue.rejected > 0);
+        assert_eq!(
+            result.queue.admitted + result.queue.rejected,
+            result.queue.offered
+        );
+        assert_eq!(result.queue.completed, result.queue.admitted);
+        assert_eq!(result.queue.max_depth, 2);
+    }
+
+    fn envelope_len_for_queue_test() -> usize {
+        24
+    }
+
+    #[test]
+    fn generated_campaigns_are_bounded_multicycle_and_repeatable() {
+        let first = campaign_envelopes(59, 12, SimulatorStore::Fake).expect("campaign");
+        let second = campaign_envelopes(59, 12, SimulatorStore::Fake).expect("campaign");
+        assert_eq!(first, second);
+        let generated = first
+            .iter()
+            .filter(|envelope| envelope.case_id.starts_with("SIM-GENERATED-"))
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 6);
+        assert!(generated.iter().all(|envelope| {
+            envelope
+                .stimuli
+                .iter()
+                .filter(|item| matches!(item.action, Action::Restart))
+                .count()
+                >= 2
+        }));
+        assert!(
+            generated
+                .iter()
+                .any(|envelope| envelope.case_id.contains("ORACLE"))
+        );
+        let first_results = first.into_iter().map(run).collect::<Vec<_>>();
+        let second_results = second.into_iter().map(run).collect::<Vec<_>>();
+        assert_eq!(
+            first_results
+                .iter()
+                .map(|item| &item.semantic_fingerprint)
+                .collect::<Vec<_>>(),
+            second_results
+                .iter()
+                .map(|item| &item.semantic_fingerprint)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first_results
+                .iter()
+                .all(|result| result.status == CaseStatus::Passed)
+        );
+    }
+
+    #[test]
+    fn artifact_integrity_covers_verdict_findings_and_observations() {
+        let artifact = run(scenario("SIM-CHAIN-01", 61, SimulatorStore::Fake).expect("scenario"));
+        let mut tampered = artifact.clone();
+        tampered.status = CaseStatus::Failed;
+        tampered.oracle_findings.push("edited finding".to_owned());
+        tampered.observations.clear();
+        assert!(
+            replay(&tampered)
+                .expect_err("tampered replay")
+                .contains("stale")
+        );
+        assert!(
+            compare(&artifact, &tampered)
+                .expect_err("tampered comparison")
+                .contains("stale")
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("gearwit-sim-integrity-{}", std::process::id()));
+        let path = root.join("artifact.json");
+        write_artifact(&path, &tampered).expect("write tampered fixture");
+        assert!(
+            read_artifact(&path)
+                .expect_err("tampered read")
+                .contains("stale")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn semantic_equivalence_is_distinct_from_provenance() {
+        let fake = run(scenario("SIM-CHAIN-01", 67, SimulatorStore::Fake).expect("fake scenario"));
+        let sqlite =
+            run(scenario("SIM-CHAIN-01", 67, SimulatorStore::Sqlite).expect("sqlite scenario"));
+        let comparison = compare(&fake, &sqlite).expect("valid comparison");
+        assert!(!comparison.same_scenario);
+        assert!(comparison.same_semantics);
+        assert!(!comparison.same_provenance);
+    }
+
+    #[test]
+    fn campaign_manifest_can_be_saved_before_execution() {
+        let root =
+            std::env::temp_dir().join(format!("gearwit-sim-manifest-{}", std::process::id()));
+        let manifest = campaign_manifest(71, 8, SimulatorStore::Fake);
+        write_campaign_manifest(&root, &manifest).expect("manifest");
+        let saved: CampaignManifest = serde_json::from_slice(
+            &fs::read(root.join("campaign-manifest.json")).expect("saved manifest"),
+        )
+        .expect("manifest json");
+        assert_eq!(saved, manifest);
+        assert!(campaign_envelopes(71, MAX_CAMPAIGN_RUNS + 1, SimulatorStore::Fake).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

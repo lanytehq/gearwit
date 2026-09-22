@@ -5,8 +5,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use gearwit_host::simulator::{SimulatorStore, run_crash_child};
 use gearwit_sim::{
-    CaseStatus, campaign, compare, default_artifact_path, read_artifact, replay, run,
-    run_process_case, scenario, write_artifact,
+    CaseStatus, campaign_envelopes, campaign_manifest, compare, default_artifact_path,
+    read_artifact, replay, run, run_process_case, scenario, write_artifact,
+    write_campaign_manifest,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -123,9 +124,15 @@ fn execute(cli: Cli) -> Result<ExitCode, String> {
             store,
             root,
         } => {
-            let results = campaign(seed, runs, store.into());
-            for result in &results {
-                write_artifact(&default_artifact_path(&root, result), result)?;
+            let store = store.into();
+            let manifest = campaign_manifest(seed, runs, store);
+            write_campaign_manifest(&root, &manifest)?;
+            let envelopes = campaign_envelopes(seed, runs, store)?;
+            let mut results = Vec::with_capacity(envelopes.len());
+            for envelope in envelopes {
+                let result = run(envelope);
+                write_artifact(&default_artifact_path(&root, &result), &result)?;
+                results.push(result);
             }
             println!(
                 "{}",
@@ -151,7 +158,7 @@ fn execute(cli: Cli) -> Result<ExitCode, String> {
             Ok(exit_for(replayed.status))
         }
         Command::Compare { left, right } => {
-            let comparison = compare(&read_artifact(&left)?, &read_artifact(&right)?);
+            let comparison = compare(&read_artifact(&left)?, &read_artifact(&right)?)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&comparison).map_err(|error| error.to_string())?

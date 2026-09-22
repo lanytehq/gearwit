@@ -1,8 +1,9 @@
 # Gearwit simulator
 
 `gearwit-sim` is a development-only deterministic runner. Production crates do
-not depend on it. It combines an independent abstract state oracle with the
-admitted fake and bundled SQLite fixture bridge.
+not depend on it. It sends each resolved stimulus through one stateful adapter
+over the admitted fake or bundled SQLite store, then compares the store-derived
+receipts with an independent abstract state oracle.
 
 The host bridge is behind the non-default `gearwit-host/simulator` feature.
 The repository gate compiles and tests production packages in one Cargo
@@ -33,6 +34,12 @@ cargo run -p gearwit-sim -- replay \
 cargo run -p gearwit-sim -- compare --left result-a.json --right result-b.json
 ```
 
+The campaign command writes `campaign-manifest.json` before its first run and
+writes each result as it completes. Campaigns have explicit run and aggregate
+event limits. Half of the resolved runs are seeded multi-cycle chains with
+varied timing and reproducible receipt-fault selection; the remainder sample
+the stable fixed catalog.
+
 `SIM-PROC-01` launches a child process, waits for a named SQLite commit
 milestone, kills the child, and verifies the media in the parent process. The
 artifact labels the exact OS, architecture, simulator version, seed, store,
@@ -46,7 +53,7 @@ The stable readiness catalog is:
 
 | IDs | Coverage |
 | --- | --- |
-| `SIM-CHAIN-01` | Full helper chain through rearm and admission of the next event |
+| `SIM-CHAIN-01` | Full helper chain through terminal recovery and rearm |
 | `SIM-CHAIN-02` | Exact retrieve and acknowledgment retry before and after restart |
 | `SIM-CHAIN-03` | Changed-content operation identity reuse conflicts across restart |
 | `SIM-CHAIN-04` | Revocation survives restart and refuses a fresh retrieve |
@@ -59,8 +66,11 @@ The stable readiness catalog is:
 | `SIM-PROC-01` | Pre-commit and post-commit killed child with fresh-process SQLite reopen |
 | `SIM-ORACLE-01`–`SIM-ORACLE-04` | Detection of duplicate admission, lost committed acknowledgment, revoked-grant resurrection, and false durable-publication success |
 
-Artifacts use `gearwit.sim/v1`. Unknown versions are refused. Failed runs keep
-the full bounded stimulus list and observations. Manual reduction removes
+Artifacts use `gearwit.sim/v2`. Unknown versions are refused. A full artifact
+digest is validated before replay or comparison. The semantic fingerprint
+includes the verdict and oracle findings while excluding store/platform
+provenance; a separate provenance fingerprint records those identities. Failed
+runs keep the full bounded stimulus list and observations. Manual reduction removes
 stimuli while retaining causal parents, reruns the reduced envelope, and keeps
 the smallest artifact with the same oracle finding and semantic failure.
 
