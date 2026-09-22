@@ -4,15 +4,17 @@
 //! fixture construction and fault controls out of production host surfaces.
 
 use crate::conformance::{self, ConformanceFixture, FakeFixture, Prepared};
-use crate::controller::{ClaimDigest, VerifierRef};
+use crate::controller::{AttemptId, ClaimDigest, SignalId, VerifierRef};
 use crate::persist::{
     AcknowledgeRequest, AcknowledgeResult, AdmissionOutcome, AuthorizedRetrieve,
     HelperRevocationScope, IdempotentResult, Persist, PersistError, RearmJoinResult,
     RearmJoinScope, RetrieveExchange, ValidatedHelperBinding,
 };
 use crate::sqlite_baseline::{self, SqliteBaseline};
+use gearwit_protocol::ProviderEvent;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use time::OffsetDateTime;
 
 /// Admitted synthetic stores. Neither variant is a production provider.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,7 +218,10 @@ fn chain_stale_capability<F: ConformanceFixture>() -> Result<String, String> {
 
 fn chain_event_during_rearm<F: ConformanceFixture>() -> Result<String, String> {
     let Prepared {
-        mut store, binding, ..
+        mut store,
+        binding,
+        attachment,
+        ..
     } = F::prepare();
     let exchange = conformance::retrieve_for(&binding, 131);
     let authorized = recorded_retrieve(&mut store, &exchange)?;
@@ -233,8 +238,35 @@ fn chain_event_during_rearm<F: ConformanceFixture>() -> Result<String, String> {
     if !before_event.rearmed_joins.is_empty() {
         return Err("early rearm was durably published".to_owned());
     }
+    let waiting_event = ProviderEvent {
+        provider: "test".to_owned(),
+        event_ref: "event-during-rearm".to_owned(),
+        actor: None,
+        observed_at: "1970-01-01T00:00:00Z".to_owned(),
+        body: "synthetic queued event".to_owned(),
+    };
+    let waiting_admission = crate::persist::claim_admission_fixture(
+        "claim-during-rearm",
+        binding.arm_id.clone(),
+        binding.generation,
+        SignalId::new("signal-during-rearm").expect("fixture signal"),
+        &[waiting_event],
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    let mut waiting_attachment = attachment;
+    waiting_attachment.attempt_id =
+        AttemptId::new("attempt-during-rearm").expect("fixture attempt");
+    waiting_attachment.verifier_ref = VerifierRef::fixture(133);
+    match store.admit_claim(&waiting_admission, &waiting_attachment) {
+        Err(PersistError::Conflict) => {}
+        other => {
+            return Err(format!(
+                "waiting event admission was not deferred: {other:?}"
+            ));
+        }
+    }
     let mut pending = std::collections::VecDeque::new();
-    pending.push_back("event-during-rearm");
+    pending.push_back(waiting_admission);
     let after_event = store.recover_authority_state().map_err(debug_error)?;
     if pending.len() != 1 || after_event != before_event {
         return Err("queued arrival changed authority before rearm completed".to_owned());
@@ -245,10 +277,17 @@ fn chain_event_during_rearm<F: ConformanceFixture>() -> Result<String, String> {
         .try_rearm_join(join_scope(&binding))
         .map_err(debug_error)?
     {
-        RearmJoinResult::Rearmed if pending.pop_front() == Some("event-during-rearm") => Ok(
-            "acknowledged; rearm waited; event queued without authority mutation; same media reopened; terminal recovered; rearmed; queued event retained"
-                .to_owned(),
-        ),
+        RearmJoinResult::Rearmed
+            if pending.pop_front().is_some_and(|admission| {
+                admission
+                    .event_refs
+                    .as_slice()
+                    .iter()
+                    .any(|event| event.as_str() == "event-during-rearm")
+            }) => Ok(
+                "acknowledged; rearm waited; event admission validated and deferred by active generation; authority unchanged; same media reopened; terminal recovered; rearmed; queued event retained"
+                    .to_owned(),
+            ),
         other => Err(format!("terminal rearm did not complete: {other:?}")),
     }
 }
