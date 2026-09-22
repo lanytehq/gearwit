@@ -1190,7 +1190,7 @@ pub(crate) trait ConformanceFixture {
     fn install_terminal(
         store: &mut Self::Store,
         binding: &ValidatedHelperBinding,
-        fixture: u8,
+        fixture: [u8; 32],
     ) -> Result<(), PersistError>;
 }
 
@@ -1243,17 +1243,20 @@ impl ConformanceFixture for FakeFixture {
     fn install_terminal(
         store: &mut Self::Store,
         binding: &ValidatedHelperBinding,
-        fixture: u8,
+        fixture: [u8; 32],
     ) -> Result<(), PersistError> {
         let payloads = store.claim_payloads();
         let mut snapshot = store.recover_authority_state()?;
-        snapshot.native_turn_facts = vec![PersistedNativeTurnFacts {
+        snapshot
+            .native_turn_facts
+            .retain(|facts| facts.attempt_id != binding.attempt_id);
+        snapshot.native_turn_facts.push(PersistedNativeTurnFacts {
             attempt_id: binding.attempt_id.clone(),
             facts: vec![NativeTurnFact::Terminal {
-                turn_ref: PrivateNativeRef::fixture(fixture),
+                turn_ref: PrivateNativeRef(fixture),
                 class: TerminalClass::Succeeded,
             }],
-        }];
+        });
         *store = FakePersist::restore_from_snapshot(snapshot, payloads)?;
         Ok(())
     }

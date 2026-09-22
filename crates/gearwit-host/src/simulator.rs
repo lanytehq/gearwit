@@ -4,11 +4,14 @@
 //! fixture construction and fault controls out of production host surfaces.
 
 use crate::conformance::{self, ConformanceFixture, FakeFixture, Prepared};
-use crate::controller::{AttemptId, ClaimDigest, SignalId, VerifierRef};
+use crate::controller::{
+    AttemptId, ClaimDigest, ControllerBirthId, EventRef, RequestNonce, SignalId, VerifierRef,
+};
 use crate::persist::{
     AcknowledgeRequest, AcknowledgeResult, AdmissionOutcome, AuthorizedRetrieve,
     HelperRevocationScope, IdempotentResult, Persist, PersistError, RearmJoinResult,
-    RearmJoinScope, RetrieveExchange, ValidatedHelperBinding,
+    RearmJoinScope, RetrieveExchange, ValidatedHelperBinding, canonical_ack_body_digest,
+    canonical_binding_digest, canonical_retrieve_body_digest,
 };
 use crate::sqlite_baseline::{self, SqliteBaseline};
 use gearwit_protocol::ProviderEvent;
@@ -92,6 +95,8 @@ struct StreamDriver<F: ConformanceFixture> {
     admitted_event_ref: Option<String>,
     blueprint: crate::persist::RecoverySnapshot,
     grant_installed: bool,
+    arm_count: u64,
+    cycle_admitted: bool,
     logical_effects: u64,
     revision: u64,
 }
@@ -117,6 +122,8 @@ impl<F: ConformanceFixture> StreamDriver<F> {
             admitted_event_ref: None,
             blueprint,
             grant_installed: false,
+            arm_count: 0,
+            cycle_admitted: false,
             logical_effects: 0,
             revision: 0,
         }
@@ -159,21 +166,55 @@ impl<F: ConformanceFixture> StreamDriver<F> {
         let store = self.store.as_mut().ok_or("store unavailable")?;
         match action {
             StoreStreamAction::Arm => {
-                let birth = self
+                let mut birth = self
                     .blueprint
                     .controller_births
                     .first()
-                    .ok_or("fixture blueprint had no controller birth")?;
-                let reservation = conformance::birth_parts().reservation;
-                store
-                    .reserve_controller_birth(birth, &reservation)
-                    .map_err(debug_error)?;
-                let arm = self
+                    .ok_or("fixture blueprint had no controller birth")?
+                    .clone();
+                let mut reservation = conformance::birth_parts().reservation;
+                let mut arm = self
                     .blueprint
                     .arms
                     .first()
-                    .ok_or("fixture blueprint had no arm")?;
-                store.persist_arm(arm).map_err(debug_error)?;
+                    .ok_or("fixture blueprint had no arm")?
+                    .clone();
+                if self.arm_count > 0 {
+                    let generation = self.binding.generation.saturating_add(1);
+                    arm.generation = generation;
+                    birth.generation = generation;
+                    self.binding.generation = generation;
+                    self.attachment.generation = generation;
+                    let cycle = self.arm_count.to_string();
+                    birth.birth_id = ControllerBirthId(identity_bytes("birth-cycle", &cycle));
+                    birth.verifier_ref =
+                        VerifierRef::from_bytes(identity_bytes("birth-verifier", &cycle));
+                    reservation.birth_id.clone_from(&birth.birth_id);
+                    reservation.create_attempt_id =
+                        RequestNonce(identity_bytes("birth-reservation", &cycle));
+                    self.binding.birth_id.clone_from(&birth.birth_id);
+                    self.attachment.birth_id.clone_from(&birth.birth_id);
+                    self.binding.attempt_id = AttemptId::new(bounded_id("attempt-cycle", &cycle))
+                        .map_err(str::to_owned)?;
+                    self.binding.signal_id =
+                        SignalId::new(bounded_id("signal-cycle", &cycle)).map_err(str::to_owned)?;
+                    self.binding.grant_ref =
+                        VerifierRef::from_bytes(identity_bytes("grant-cycle", &cycle));
+                    self.attachment
+                        .attempt_id
+                        .clone_from(&self.binding.attempt_id);
+                    self.attachment.verifier_ref =
+                        VerifierRef::from_bytes(identity_bytes("attachment-cycle", &cycle));
+                    self.grant_installed = false;
+                    self.cycle_admitted = false;
+                    self.last_retrieve = None;
+                    self.admitted_event_ref = None;
+                }
+                store
+                    .reserve_controller_birth(&birth, &reservation)
+                    .map_err(debug_error)?;
+                store.persist_arm(&arm).map_err(debug_error)?;
+                self.arm_count += 1;
                 self.revision += 1;
                 Ok("armed".to_owned())
             }
@@ -193,11 +234,12 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                 {
                     let mut admission = admission.clone();
                     if original != event {
-                        admission.claim_digest = ClaimDigest::fixture(derive_nonce(event));
+                        admission.claim_digest =
+                            ClaimDigest(identity_bytes("changed-claim", event));
                     }
                     (admission, attachment.clone())
                 } else {
-                    let first = self.admissions.is_empty();
+                    let first = !self.cycle_admitted;
                     let event_record = ProviderEvent {
                         provider: "test".to_owned(),
                         event_ref: bounded_id("event", event),
@@ -205,11 +247,7 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                         observed_at: "1970-01-01T00:00:00Z".to_owned(),
                         body: format!("simulator event {event}"),
                     };
-                    let request_id = if first {
-                        "claim-a".to_owned()
-                    } else {
-                        bounded_id("claim", operation_id)
-                    };
+                    let request_id = bounded_id("claim", operation_id);
                     let admission = crate::persist::claim_admission_fixture(
                         &request_id,
                         self.binding.arm_id.clone(),
@@ -227,7 +265,10 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                     if !first {
                         attachment.attempt_id = AttemptId::new(bounded_id("attempt", operation_id))
                             .map_err(str::to_owned)?;
-                        attachment.verifier_ref = VerifierRef::fixture(derive_nonce(operation_id));
+                        attachment.verifier_ref = VerifierRef::from_bytes(identity_bytes(
+                            "attachment-verifier",
+                            operation_id,
+                        ));
                     }
                     (admission, attachment)
                 };
@@ -242,6 +283,11 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                                 .ok_or("fixture blueprint had no helper grant")?
                                 .clone();
                             grant.claim_digest.clone_from(&admission.claim_digest);
+                            grant.grant_ref.clone_from(&self.binding.grant_ref);
+                            grant.generation = self.binding.generation;
+                            grant.birth_id.clone_from(&self.binding.birth_id);
+                            grant.attempt_id.clone_from(&self.binding.attempt_id);
+                            grant.signal_id.clone_from(&self.binding.signal_id);
                             self.binding
                                 .claim_digest
                                 .clone_from(&admission.claim_digest);
@@ -249,6 +295,7 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                             self.grant_installed = true;
                         }
                         self.admitted_event_ref = Some(bounded_id("event", event));
+                        self.cycle_admitted = true;
                         self.logical_effects += 1;
                         self.revision += 1;
                         "admitted"
@@ -268,7 +315,7 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                 Ok(outcome.to_owned())
             }
             StoreStreamAction::Retrieve { request } => {
-                let exchange = conformance::retrieve_for(&self.binding, derive_nonce(request));
+                let exchange = stream_retrieve(&self.binding, request);
                 match store.record_retrieve_exchange(&exchange) {
                     Ok(IdempotentResult::Recorded(authorized)) => {
                         self.last_retrieve = Some(authorized);
@@ -285,12 +332,29 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                 }
             }
             StoreStreamAction::StaleRetrieve { request } => {
-                store
-                    .revoke_helper_grant(revocation_scope(&self.binding))
-                    .map_err(debug_error)?;
-                let exchange = conformance::retrieve_for(&self.binding, derive_nonce(request));
+                let mut advanced = self
+                    .blueprint
+                    .arms
+                    .first()
+                    .ok_or("fixture blueprint had no arm")?
+                    .clone();
+                advanced.generation = self.binding.generation.saturating_add(1);
+                store.persist_arm(&advanced).map_err(debug_error)?;
+                let exchange = stream_retrieve(&self.binding, request);
                 match store.record_retrieve_exchange(&exchange) {
-                    Err(PersistError::Unauthorized) => Ok("unauthorized".to_owned()),
+                    Err(PersistError::Unauthorized) => {
+                        let recovered = store.recover_authority_state().map_err(debug_error)?;
+                        let current_preserved =
+                            recovered.arms.iter().any(|arm| {
+                                arm.arm_id == advanced.arm_id
+                                    && arm.generation == advanced.generation
+                            }) && recovered.helper_grants.iter().any(|grant| !grant.revoked);
+                        if current_preserved {
+                            Ok("unauthorized".to_owned())
+                        } else {
+                            Err("stale retrieve did not preserve current authority".to_owned())
+                        }
+                    }
                     other => Err(format!("stale retrieve was accepted: {other:?}")),
                 }
             }
@@ -299,13 +363,13 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                     .last_retrieve
                     .as_ref()
                     .ok_or("acknowledgment had no recorded retrieve")?;
-                let ack = conformance::ack_for(
+                let ack = stream_ack(
                     &self.binding,
                     &authorized.recorded.retrieval_id,
                     self.admitted_event_ref
                         .as_deref()
                         .ok_or("acknowledgment had no admitted event")?,
-                    derive_nonce(request),
+                    request,
                 );
                 match store.acknowledge_retrieved_batch(&self.binding, &ack) {
                     Ok(IdempotentResult::Recorded(_)) => {
@@ -319,8 +383,12 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                 }
             }
             StoreStreamAction::Terminal => {
-                F::install_terminal(store, &self.binding, derive_nonce(operation_id))
-                    .map_err(debug_error)?;
+                F::install_terminal(
+                    store,
+                    &self.binding,
+                    identity_bytes("terminal", operation_id),
+                )
+                .map_err(debug_error)?;
                 self.revision += 1;
                 Ok("terminal".to_owned())
             }
@@ -351,12 +419,74 @@ impl<F: ConformanceFixture> StreamDriver<F> {
     }
 }
 
-fn derive_nonce(value: &str) -> u8 {
-    blake3::hash(value.as_bytes()).as_bytes()[0].max(1)
+fn identity_bytes(domain: &str, value: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gearwit.simulator-identity.v1\0");
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn bounded_id(prefix: &str, value: &str) -> String {
-    format!("{prefix}-{:02x}", derive_nonce(value))
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(prefix.len() + 65);
+    output.push_str(prefix);
+    output.push('-');
+    for byte in identity_bytes(prefix, value) {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn copy_binding(binding: &ValidatedHelperBinding) -> ValidatedHelperBinding {
+    ValidatedHelperBinding {
+        grant_ref: binding.grant_ref.clone(),
+        seat_id: binding.seat_id.clone(),
+        arm_id: binding.arm_id.clone(),
+        generation: binding.generation,
+        birth_id: binding.birth_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+        signal_id: binding.signal_id.clone(),
+        claim_digest: binding.claim_digest.clone(),
+        operations: binding.operations,
+        lease_until: binding.lease_until,
+    }
+}
+
+fn stream_retrieve(binding: &ValidatedHelperBinding, request: &str) -> RetrieveExchange {
+    let binding = copy_binding(binding);
+    let request_id = RequestNonce(identity_bytes("retrieve-request", request));
+    let canonical_body_digest =
+        canonical_retrieve_body_digest(&canonical_binding_digest(&binding), &request_id);
+    RetrieveExchange {
+        binding,
+        request_id,
+        canonical_body_digest,
+    }
+}
+
+fn stream_ack(
+    binding: &ValidatedHelperBinding,
+    retrieval_id: &crate::controller::RetrievalId,
+    cursor: &str,
+    request: &str,
+) -> AcknowledgeRequest {
+    let request_id = RequestNonce(identity_bytes("ack-request", request));
+    let cursor = EventRef::new(cursor).expect("admitted event ref is bounded");
+    let canonical_body_digest = canonical_ack_body_digest(
+        &canonical_binding_digest(binding),
+        &request_id,
+        retrieval_id,
+        &cursor,
+    );
+    AcknowledgeRequest {
+        request_id,
+        retrieval_id: retrieval_id.clone(),
+        cursor,
+        canonical_body_digest,
+    }
 }
 
 /// Admitted synthetic stores. Neither variant is a production provider.
@@ -614,7 +744,7 @@ fn chain_event_during_rearm<F: ConformanceFixture>() -> Result<String, String> {
     if pending.len() != 1 || after_event != before_event {
         return Err("queued arrival changed authority before rearm completed".to_owned());
     }
-    F::install_terminal(&mut store, &binding, 131).map_err(debug_error)?;
+    F::install_terminal(&mut store, &binding, [131; 32]).map_err(debug_error)?;
     let mut reopened = reopen::<F>(store)?;
     match reopened
         .try_rearm_join(join_scope(&binding))
@@ -643,7 +773,7 @@ fn chain_omitted_rearm<F: ConformanceFixture>() -> Result<String, String> {
     let authorized = recorded_retrieve(&mut store, &exchange)?;
     let ack = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-b", 142);
     recorded_ack(&mut store, &binding, &ack)?;
-    F::install_terminal(&mut store, &binding, 141).map_err(debug_error)?;
+    F::install_terminal(&mut store, &binding, [141; 32]).map_err(debug_error)?;
     let mut reopened = reopen::<F>(store)?;
     let recovered = reopened.recover_authority_state().map_err(debug_error)?;
     if !recovered.rearmed_joins.is_empty() {
@@ -684,7 +814,7 @@ fn complete_chain<F: ConformanceFixture>() -> Result<(), String> {
     ) {
         return Err("first acknowledgment replayed".to_owned());
     }
-    F::install_terminal(&mut store, &binding, 71).map_err(debug_error)?;
+    F::install_terminal(&mut store, &binding, [71; 32]).map_err(debug_error)?;
     let mut reopened = reopen::<F>(store)?;
     match reopened
         .record_retrieve_exchange(&exchange)

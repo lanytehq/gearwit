@@ -36,9 +36,10 @@ cargo run -p gearwit-sim -- compare --left result-a.json --right result-b.json
 
 The campaign command writes `campaign-manifest.json` before its first run and
 writes each result as it completes. Campaigns have explicit run and aggregate
-event limits. Half of the resolved runs are seeded multi-cycle chains with
-varied timing and reproducible receipt-fault selection; the remainder sample
-the stable fixed catalog.
+event limits. Half of the resolved runs are seeded chains that cross two real
+arm/admit/retrieve/ack/terminal/rearm lifecycles, retain restart/retry loops,
+vary supported retry ordering and timing, and select receipt faults
+reproducibly; the remainder sample the stable fixed catalog.
 
 `SIM-PROC-01` launches a child process, waits for a named SQLite commit
 milestone, kills the child, and verifies the media in the parent process. The
@@ -53,7 +54,7 @@ The stable readiness catalog is:
 
 | IDs | Coverage |
 | --- | --- |
-| `SIM-CHAIN-01` | Full helper chain through terminal recovery and rearm |
+| `SIM-CHAIN-01` | Full helper chain through rearm and admission of the next event |
 | `SIM-CHAIN-02` | Exact retrieve and acknowledgment retry before and after restart |
 | `SIM-CHAIN-03` | Changed-content operation identity reuse conflicts across restart |
 | `SIM-CHAIN-04` | Revocation survives restart and refuses a fresh retrieve |

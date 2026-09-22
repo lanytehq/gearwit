@@ -455,17 +455,20 @@ impl ConformanceFixture for SqliteBaseline {
     fn install_terminal(
         store: &mut Self::Store,
         binding: &ValidatedHelperBinding,
-        fixture: u8,
+        fixture: [u8; 32],
     ) -> Result<(), PersistError> {
         let payloads = store.live.claim_payloads();
         let mut snapshot = store.live.recover_authority_state()?;
-        snapshot.native_turn_facts = vec![PersistedNativeTurnFacts {
+        snapshot
+            .native_turn_facts
+            .retain(|facts| facts.attempt_id != binding.attempt_id);
+        snapshot.native_turn_facts.push(PersistedNativeTurnFacts {
             attempt_id: binding.attempt_id.clone(),
             facts: vec![NativeTurnFact::Terminal {
-                turn_ref: PrivateNativeRef::fixture(fixture),
+                turn_ref: PrivateNativeRef(fixture),
                 class: TerminalClass::Succeeded,
             }],
-        }];
+        });
         store.live = FakePersist::restore_from_snapshot(snapshot, payloads)?;
         store.commit()
     }

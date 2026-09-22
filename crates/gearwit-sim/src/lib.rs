@@ -461,8 +461,26 @@ pub fn scenario(
                     event: "event-during-rearm".to_owned(),
                 },
             ));
-            chain.push(stimulus(7, 8, "terminal-1", Action::Terminal));
-            chain.push(stimulus(8, 9, "rearm-1", Action::Rearm));
+            chain.push(stimulus(
+                7,
+                8,
+                "claim-during-rearm",
+                Action::Admit {
+                    event: "event-during-rearm".to_owned(),
+                },
+            ));
+            chain.push(stimulus(8, 9, "terminal-1", Action::Terminal));
+            chain.push(stimulus(9, 10, "restart-terminal", Action::Restart));
+            chain.push(stimulus(10, 11, "rearm-1", Action::Rearm));
+            chain.push(stimulus(11, 12, "arm-2", Action::Arm));
+            chain.push(stimulus(
+                12,
+                13,
+                "claim-after-rearm",
+                Action::Admit {
+                    event: "event-during-rearm".to_owned(),
+                },
+            ));
             chain
         }
         "SIM-CHAIN-07" | "SIM-PROC-01" => {
@@ -621,31 +639,39 @@ fn complete_chain(event: &str, retrieve: &str, acknowledge: &str) -> Vec<Stimulu
     let mut chain = first_acknowledged_chain(event, retrieve, acknowledge);
     chain.push(stimulus(5, 6, "terminal-1", Action::Terminal));
     chain.push(stimulus(6, 7, "rearm-1", Action::Rearm));
+    chain.push(stimulus(7, 8, "arm-2", Action::Arm));
+    chain.push(stimulus(
+        8,
+        9,
+        "offer-2",
+        Action::Offer {
+            event: "event-next".to_owned(),
+        },
+    ));
+    chain.push(stimulus(
+        9,
+        10,
+        "claim-2",
+        Action::Admit {
+            event: "event-next".to_owned(),
+        },
+    ));
     chain
 }
 
 /// Run a deterministic scenario and return a replayable artifact.
 #[must_use]
 pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
-    let (observations, queue, mut host_checks, resource_limited) = execute_stream(&envelope);
-    let runnable = envelope
-        .stimuli
-        .iter()
-        .filter(|stimulus| {
-            observations
-                .iter()
-                .any(|observation| observation.operation_id == stimulus.operation_id)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let (executed, observations, queue, mut host_checks, resource_limited) =
+        execute_stream(&envelope);
     let mut findings = if envelope.case_id == "SIM-QUEUE-01" {
         Vec::new()
     } else {
-        oracle_findings(&runnable, &observations)
+        oracle_findings(&executed, &observations)
     };
     let case_findings = validate_observations(&envelope.case_id, &observations);
     findings.extend(case_findings.iter().cloned());
-    if envelope.case_id != "SIM-QUEUE-01" && observations.len() != envelope.stimuli.len() {
+    if envelope.case_id != "SIM-QUEUE-01" && executed.len() != envelope.stimuli.len() {
         findings.push(format!(
             "mandatory stream completed {} of {} operations",
             observations.len(),
@@ -695,7 +721,13 @@ pub fn run(envelope: ScenarioEnvelope) -> RunArtifact {
 #[allow(clippy::too_many_lines)] // Scheduler state is kept together so queue transitions stay auditable.
 fn execute_stream(
     envelope: &ScenarioEnvelope,
-) -> (Vec<Observation>, QueueAccounting, Vec<HostCheck>, bool) {
+) -> (
+    Vec<Stimulus>,
+    Vec<Observation>,
+    QueueAccounting,
+    Vec<HostCheck>,
+    bool,
+) {
     let mut scheduled = envelope.stimuli.clone();
     scheduled.sort_by_key(|stimulus| (stimulus.due_tick, stimulus.sequence));
     let mut ready = VecDeque::new();
@@ -703,6 +735,7 @@ fn execute_stream(
     let mut completed_ids = BTreeSet::new();
     let mut offered = 0usize;
     let mut observations = Vec::new();
+    let mut executed = Vec::new();
     let mut adapter = StoreStreamAdapter::new(envelope.store);
     let mut errors = Vec::new();
     let mut admitted = 0usize;
@@ -730,6 +763,7 @@ fn execute_stream(
                 &stimulus,
                 FaultMode::for_case(&envelope.case_id),
                 &mut observations,
+                &mut executed,
                 &mut completed_ids,
                 &mut errors,
             );
@@ -772,6 +806,7 @@ fn execute_stream(
                     &stimulus,
                     FaultMode::for_case(&envelope.case_id),
                     &mut observations,
+                    &mut executed,
                     &mut completed_ids,
                     &mut errors,
                 );
@@ -817,6 +852,7 @@ fn execute_stream(
     }];
     let completed = observations.len();
     (
+        executed,
         observations,
         QueueAccounting {
             offered,
@@ -838,6 +874,7 @@ fn complete_store_step(
     stimulus: &Stimulus,
     fault: FaultMode,
     observations: &mut Vec<Observation>,
+    executed: &mut Vec<Stimulus>,
     completed_ids: &mut BTreeSet<String>,
     errors: &mut Vec<String>,
 ) {
@@ -853,6 +890,7 @@ fn complete_store_step(
             };
             inject_receipt_fault(fault, &stimulus.action, &mut observation);
             completed_ids.insert(stimulus.operation_id.clone());
+            executed.push(stimulus.clone());
             observations.push(observation);
         }
         Err(error) => errors.push(format!("{}: {error}", stimulus.operation_id)),
@@ -993,6 +1031,20 @@ fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<Str
     {
         findings.push("early rearm did not wait for terminal state".to_owned());
     }
+    if case_id == "SIM-CHAIN-06"
+        && !observations.iter().any(|observation| {
+            observation.operation_id == "claim-during-rearm" && observation.outcome == "conflict"
+        })
+    {
+        findings.push("event admission was not deferred while rearm waited".to_owned());
+    }
+    if case_id == "SIM-CHAIN-06"
+        && !observations.iter().any(|observation| {
+            observation.operation_id == "claim-after-rearm" && observation.outcome == "admitted"
+        })
+    {
+        findings.push("deferred event was not admitted in the next lifecycle".to_owned());
+    }
     if case_id == "SIM-CHAIN-07"
         && observations
             .last()
@@ -1007,9 +1059,9 @@ fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<Str
     {
         findings.push("omitted rearm was not reported inactive".to_owned());
     }
-    if case_id == "SIM-CHAIN-01" && effects != 1 {
+    if case_id == "SIM-CHAIN-01" && effects != 2 {
         findings.push(format!(
-            "complete chain admitted {effects} logical effects, expected 1"
+            "complete chain admitted {effects} logical effects, expected 2"
         ));
     }
     if case_id == "SIM-REPLAY-01"
@@ -1283,6 +1335,7 @@ pub fn campaign_envelopes(
     Ok(envelopes)
 }
 
+#[allow(clippy::too_many_lines)] // Both lifecycle boundaries stay visible for evidence review.
 fn generated_chain(seed: u64, store: SimulatorStore) -> ScenarioEnvelope {
     let seeds = derive_seeds(seed);
     let event = format!("event-{:016x}", seeds.actor);
@@ -1291,32 +1344,29 @@ fn generated_chain(seed: u64, store: SimulatorStore) -> ScenarioEnvelope {
     let mut stimuli = first_acknowledged_chain(&event, &retrieve, &acknowledge);
     let cycles = 2 + usize::try_from(seeds.source % 3).expect("bounded cycles");
     let mut sequence = 6u64;
-    for _ in 0..cycles {
-        stimuli.push(stimulus(
-            sequence,
-            sequence,
-            &format!("restart-{sequence}"),
-            Action::Restart,
-        ));
-        sequence += 1;
-        stimuli.push(stimulus(
-            sequence,
-            sequence,
-            "retrieve-1",
+    for cycle in 0..cycles {
+        let restart = (format!("restart-{cycle}"), Action::Restart);
+        let retrieve_retry = (
+            "retrieve-1".to_owned(),
             Action::Retrieve {
                 request: retrieve.clone(),
             },
-        ));
-        sequence += 1;
-        stimuli.push(stimulus(
-            sequence,
-            sequence,
-            "ack-1",
+        );
+        let ack_retry = (
+            "ack-1".to_owned(),
             Action::Acknowledge {
                 request: acknowledge.clone(),
             },
-        ));
-        sequence += 1;
+        );
+        let ordered = if (seeds.scheduler >> cycle) & 1 == 0 {
+            [restart, retrieve_retry, ack_retry]
+        } else {
+            [retrieve_retry, ack_retry, restart]
+        };
+        for (operation_id, action) in ordered {
+            stimuli.push(stimulus(sequence, sequence, &operation_id, action));
+            sequence += 1;
+        }
     }
     stimuli.push(stimulus(
         sequence,
@@ -1331,6 +1381,42 @@ fn generated_chain(seed: u64, store: SimulatorStore) -> ScenarioEnvelope {
         "rearm-generated",
         Action::Rearm,
     ));
+    sequence += 1;
+    let second_event = format!("event-second-{:016x}", seeds.actor.rotate_left(17));
+    let second_retrieve = format!("retrieve-second-{:016x}", seeds.actor.rotate_left(17));
+    let second_ack = format!("ack-second-{:016x}", seeds.actor.rotate_left(17));
+    for (operation_id, action) in [
+        ("arm-generated-2", Action::Arm),
+        (
+            "offer-generated-2",
+            Action::Offer {
+                event: second_event.clone(),
+            },
+        ),
+        (
+            "claim-generated-2",
+            Action::Admit {
+                event: second_event,
+            },
+        ),
+        (
+            "retrieve-generated-2",
+            Action::Retrieve {
+                request: second_retrieve,
+            },
+        ),
+        (
+            "ack-generated-2",
+            Action::Acknowledge {
+                request: second_ack,
+            },
+        ),
+        ("terminal-generated-2", Action::Terminal),
+        ("rearm-generated-2", Action::Rearm),
+    ] {
+        stimuli.push(stimulus(sequence, sequence, operation_id, action));
+        sequence += 1;
+    }
     let mut prior = None;
     let mut scheduler = SplitMix64(seeds.scheduler);
     let mut due = 0u64;
@@ -1798,6 +1884,20 @@ mod tests {
                 .count()
                 >= 2
         }));
+        assert!(generated.iter().all(|envelope| {
+            envelope
+                .stimuli
+                .iter()
+                .filter(|item| matches!(item.action, Action::Admit { .. }))
+                .count()
+                >= 2
+                && envelope
+                    .stimuli
+                    .iter()
+                    .filter(|item| matches!(item.action, Action::Rearm))
+                    .count()
+                    >= 2
+        }));
         assert!(
             generated
                 .iter()
@@ -1876,5 +1976,85 @@ mod tests {
         assert_eq!(saved, manifest);
         assert!(campaign_envelopes(71, MAX_CAMPAIGN_RUNS + 1, SimulatorStore::Fake).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scheduler_order_is_the_oracle_order() {
+        for store in [SimulatorStore::Fake, SimulatorStore::Sqlite] {
+            let original = scenario("SIM-CHAIN-01", 73, store).expect("scenario");
+            let expected = run(original.clone());
+            let mut reordered = original;
+            reordered.stimuli.reverse();
+            let reordered = run(reordered);
+            assert_eq!(
+                reordered.status,
+                CaseStatus::Passed,
+                "{store:?}: {reordered:#?}"
+            );
+            assert_eq!(reordered.observations, expected.observations);
+        }
+    }
+
+    #[test]
+    fn distinct_request_identities_do_not_alias() {
+        for store in [SimulatorStore::Fake, SimulatorStore::Sqlite] {
+            let mut envelope = scenario("SIM-CHAIN-01", 79, store).expect("scenario");
+            envelope.case_id = "SIM-GENERATED-NORMAL".to_owned();
+            envelope.stimuli.truncate(3);
+            envelope.stimuli.push(Stimulus {
+                version: ARTIFACT_VERSION.to_owned(),
+                due_tick: 3,
+                sequence: 4,
+                operation_id: "retrieve-a".to_owned(),
+                causal_parent: Some("claim-1".to_owned()),
+                action: Action::Retrieve {
+                    request: "request-8".to_owned(),
+                },
+            });
+            envelope.stimuli.push(Stimulus {
+                version: ARTIFACT_VERSION.to_owned(),
+                due_tick: 4,
+                sequence: 5,
+                operation_id: "retrieve-b".to_owned(),
+                causal_parent: Some("retrieve-a".to_owned()),
+                action: Action::Retrieve {
+                    request: "request-15".to_owned(),
+                },
+            });
+            let result = run(envelope);
+            assert_ne!(
+                result.observations.last().expect("second retrieve").outcome,
+                "exact_replay",
+                "{store:?}: {result:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continuity_cases_execute_real_intermediate_outcomes() {
+        for store in [SimulatorStore::Fake, SimulatorStore::Sqlite] {
+            let complete = run(scenario("SIM-CHAIN-01", 83, store).expect("complete"));
+            assert!(complete.observations.iter().any(|observation| {
+                observation.operation_id == "claim-2"
+                    && observation.outcome == "admitted"
+                    && observation.logical_effects == 2
+            }));
+
+            let deferred = run(scenario("SIM-CHAIN-06", 83, store).expect("deferred"));
+            assert!(deferred.observations.iter().any(|observation| {
+                observation.operation_id == "claim-during-rearm"
+                    && observation.outcome == "conflict"
+            }));
+            assert!(deferred.observations.iter().any(|observation| {
+                observation.operation_id == "claim-after-rearm" && observation.outcome == "admitted"
+            }));
+
+            let stale = run(scenario("SIM-CHAIN-05", 83, store).expect("stale"));
+            assert_eq!(stale.status, CaseStatus::Passed, "{store:?}: {stale:#?}");
+            assert_eq!(
+                stale.observations.last().expect("stale outcome").outcome,
+                "unauthorized"
+            );
+        }
     }
 }
