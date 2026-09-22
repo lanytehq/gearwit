@@ -7,7 +7,8 @@
 #![forbid(unsafe_code)]
 
 use gearwit_host::simulator::{
-    HostCheck, SimulatorStore, run_complete_chain, run_conformance, verify_crash_reopen,
+    HostCheck, SimulatorStore, run_chain_case, run_complete_chain, run_conformance,
+    verify_crash_reopen,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -965,31 +966,16 @@ fn queue_completion(stimulus: Stimulus, prior: usize) -> Observation {
 }
 
 fn host_checks(case_id: &str, store: SimulatorStore) -> Vec<HostCheck> {
-    let ids: &[&str] = match case_id {
-        "SIM-CHAIN-01" => return vec![run_complete_chain(store)],
-        "SIM-CHAIN-02" => &[
-            "replay.retrieve.exact",
-            "replay.ack.exact",
-            "op.recover-authority-state",
+    match case_id {
+        "SIM-CHAIN-01" => vec![run_complete_chain(store)],
+        "SIM-CHAIN-02" | "SIM-CHAIN-03" | "SIM-CHAIN-04" | "SIM-CHAIN-05" | "SIM-CHAIN-06"
+        | "SIM-CHAIN-08" => vec![run_chain_case(store, case_id)],
+        "SIM-CHAIN-07" => vec![
+            run_conformance(store, "replay.ack.exact"),
+            run_conformance(store, "op.recover-authority-state"),
         ],
-        "SIM-CHAIN-03" => &["op.admit-claim", "op.recover-authority-state"],
-        "SIM-CHAIN-04" => &[
-            "op.revoke-helper-grant",
-            "grant.revocation-survives-admission",
-        ],
-        "SIM-CHAIN-05" => &[
-            "grant.retired-identity-rejected",
-            "op.recover-authority-state",
-        ],
-        "SIM-CHAIN-06" => &[
-            "snapshot.rearm-join-absent-before-handled",
-            "op.try-rearm-join",
-        ],
-        "SIM-CHAIN-07" => &["replay.ack.exact", "op.recover-authority-state"],
-        "SIM-CHAIN-08" => &["snapshot.rearm-join-absent-before-handled"],
-        _ => &[],
-    };
-    ids.iter().map(|id| run_conformance(store, id)).collect()
+        _ => Vec::new(),
+    }
 }
 
 fn validate_observations(case_id: &str, observations: &[Observation]) -> Vec<String> {
@@ -1178,7 +1164,10 @@ pub fn read_artifact(path: &Path) -> Result<RunArtifact, String> {
 /// Returns an error when the case requires a real child process or when the
 /// replay produces a different semantic fingerprint.
 pub fn replay(artifact: &RunArtifact) -> Result<RunArtifact, String> {
-    if artifact.scenario.case_id == "SIM-PROC-01" {
+    if matches!(
+        artifact.scenario.case_id.as_str(),
+        "SIM-CHAIN-07" | "SIM-PROC-01"
+    ) {
         return Err("process case requires a new real child run".to_owned());
     }
     let replayed = run(artifact.scenario.clone());
@@ -1211,7 +1200,7 @@ pub fn campaign(seed: u64, runs: usize, store: SimulatorStore) -> Vec<RunArtifac
     let candidates = CASE_IDS
         .iter()
         .copied()
-        .filter(|id| *id != "SIM-PROC-01")
+        .filter(|id| !matches!(*id, "SIM-CHAIN-07" | "SIM-PROC-01"))
         .collect::<Vec<_>>();
     (0..runs)
         .map(|_| {
@@ -1398,6 +1387,43 @@ mod tests {
         let artifact = run(scenario("SIM-REPLAY-01", 19, SimulatorStore::Fake).expect("scenario"));
         let replayed = replay(&artifact).expect("replay");
         assert_eq!(artifact.semantic_fingerprint, replayed.semantic_fingerprint);
+    }
+
+    #[test]
+    fn campaigns_exclude_process_cases_and_replay_refuses_them() {
+        let results = campaign(20, 128, SimulatorStore::Fake);
+        assert!(results.iter().all(|artifact| !matches!(
+            artifact.scenario.case_id.as_str(),
+            "SIM-CHAIN-07" | "SIM-PROC-01"
+        )));
+        for id in ["SIM-CHAIN-07", "SIM-PROC-01"] {
+            let artifact = run(scenario(id, 21, SimulatorStore::Sqlite).expect(id));
+            assert!(
+                replay(&artifact)
+                    .expect_err("process replay")
+                    .contains("real child")
+            );
+        }
+    }
+
+    #[test]
+    fn named_chain_checks_execute_on_each_selected_store() {
+        for id in [
+            "SIM-CHAIN-02",
+            "SIM-CHAIN-03",
+            "SIM-CHAIN-04",
+            "SIM-CHAIN-05",
+            "SIM-CHAIN-06",
+            "SIM-CHAIN-08",
+        ] {
+            for store in [SimulatorStore::Fake, SimulatorStore::Sqlite] {
+                let artifact = run(scenario(id, 22, store).expect(id));
+                let check = artifact.host_checks.first().expect("store chain check");
+                assert_eq!(check.check, format!("store-chain-{id}"));
+                assert!(check.passed, "{id}/{store:?}: {check:?}");
+                assert!(check.detail.contains(';'), "{id}/{store:?}: {check:?}");
+            }
+        }
     }
 
     #[test]

@@ -4,10 +4,13 @@
 //! fixture construction and fault controls out of production host surfaces.
 
 use crate::conformance::{self, ConformanceFixture, FakeFixture, Prepared};
-use crate::controller::{NativeTurnFact, PrivateNativeRef, TerminalClass};
+use crate::controller::{
+    ClaimDigest, NativeTurnFact, PrivateNativeRef, TerminalClass, VerifierRef,
+};
 use crate::persist::{
-    IdempotentResult, Persist, PersistError, PersistedNativeTurnFacts, RearmJoinResult,
-    RearmJoinScope,
+    AcknowledgeRequest, AcknowledgeResult, AdmissionOutcome, AuthorizedRetrieve,
+    HelperRevocationScope, IdempotentResult, Persist, PersistError, PersistedNativeTurnFacts,
+    RearmJoinResult, RearmJoinScope, RetrieveExchange, ValidatedHelperBinding,
 };
 use crate::sqlite_baseline::{self, SqliteBaseline};
 use serde::{Deserialize, Serialize};
@@ -76,6 +79,192 @@ pub fn run_complete_chain(store: SimulatorStore) -> HostCheck {
     }
 }
 
+/// Execute one named simulator chain through an admitted persistence store.
+#[must_use]
+pub fn run_chain_case(store: SimulatorStore, case_id: &str) -> HostCheck {
+    let result = match store {
+        SimulatorStore::Fake => chain_case::<FakeFixture>(case_id),
+        SimulatorStore::Sqlite => chain_case::<SqliteBaseline>(case_id),
+    };
+    match result {
+        Ok(detail) => HostCheck {
+            store,
+            check: format!("store-chain-{case_id}"),
+            passed: true,
+            detail,
+        },
+        Err(detail) => HostCheck {
+            store,
+            check: format!("store-chain-{case_id}"),
+            passed: false,
+            detail,
+        },
+    }
+}
+
+fn chain_case<F: ConformanceFixture>(case_id: &str) -> Result<String, String> {
+    match case_id {
+        "SIM-CHAIN-02" => chain_exact_retries::<F>(),
+        "SIM-CHAIN-03" => chain_changed_identity::<F>(),
+        "SIM-CHAIN-04" => chain_revocation::<F>(),
+        "SIM-CHAIN-05" => chain_stale_capability::<F>(),
+        "SIM-CHAIN-06" => chain_event_during_rearm::<F>(),
+        "SIM-CHAIN-08" => chain_omitted_rearm::<F>(),
+        _ => Err(format!(
+            "no store-backed chain implementation for {case_id}"
+        )),
+    }
+}
+
+fn chain_exact_retries<F: ConformanceFixture>() -> Result<String, String> {
+    let Prepared {
+        mut store, binding, ..
+    } = F::prepare();
+    let exchange = conformance::retrieve_for(&binding, 111);
+    let authorized = recorded_retrieve(&mut store, &exchange)?;
+    expect_retrieve_replay(&mut store, &exchange, &authorized)?;
+    let ack = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-b", 112);
+    let acknowledged = recorded_ack(&mut store, &binding, &ack)?;
+    expect_ack_replay(&mut store, &binding, &ack, &acknowledged)?;
+    let mut reopened = reopen::<F>(&mut store)?;
+    expect_retrieve_replay(&mut reopened, &exchange, &authorized)?;
+    expect_ack_replay(&mut reopened, &binding, &ack, &acknowledged)?;
+    Ok("recorded; exact retrieve+ack replay; reopened; exact retrieve+ack replay".to_owned())
+}
+
+fn chain_changed_identity<F: ConformanceFixture>() -> Result<String, String> {
+    let Prepared {
+        mut store,
+        admission,
+        attachment,
+        ..
+    } = F::prepare();
+    let mut reopened = reopen::<F>(&mut store)?;
+    let replay = reopened
+        .admit_claim(&admission, &attachment)
+        .map_err(debug_error)?;
+    if replay.outcome != AdmissionOutcome::ExactReplay {
+        return Err(format!("admission did not replay after reopen: {replay:?}"));
+    }
+    let mut changed = admission;
+    changed.claim_digest = ClaimDigest::fixture(91);
+    match reopened.admit_claim(&changed, &attachment) {
+        Err(PersistError::Conflict) => {
+            let recovered = reopened.recover_authority_state().map_err(debug_error)?;
+            if recovered.claims.len() != 1 {
+                return Err(format!(
+                    "changed-content conflict altered claim count: {}",
+                    recovered.claims.len()
+                ));
+            }
+            Ok(
+                "reopened; exact claim replay; changed-content identity conflict; one claim retained"
+                    .to_owned(),
+            )
+        }
+        other => Err(format!(
+            "changed-content identity did not conflict: {other:?}"
+        )),
+    }
+}
+
+fn chain_revocation<F: ConformanceFixture>() -> Result<String, String> {
+    let Prepared {
+        mut store, binding, ..
+    } = F::prepare();
+    store
+        .revoke_helper_grant(revocation_scope(&binding))
+        .map_err(debug_error)?;
+    let mut reopened = reopen::<F>(&mut store)?;
+    let recovered = reopened.recover_authority_state().map_err(debug_error)?;
+    if !recovered.helper_grants.iter().any(|grant| grant.revoked) {
+        return Err("reopened state lost revocation".to_owned());
+    }
+    match reopened.record_retrieve_exchange(&conformance::retrieve_for(&binding, 121)) {
+        Err(PersistError::Unauthorized) => {
+            Ok("revoked; reopened; revoked state recovered; fresh retrieve refused".to_owned())
+        }
+        other => Err(format!("retrieve after reopened revocation: {other:?}")),
+    }
+}
+
+fn chain_stale_capability<F: ConformanceFixture>() -> Result<String, String> {
+    let Prepared {
+        mut store, binding, ..
+    } = F::prepare();
+    let snapshot = store.recover_authority_state().map_err(debug_error)?;
+    let mut replacement = snapshot.helper_grants[0].clone();
+    replacement.grant_verifier = [0x55; 32];
+    replacement.grant_ref = VerifierRef::fixture(122);
+    store
+        .persist_helper_grant(&replacement)
+        .map_err(debug_error)?;
+    let mut reopened = reopen::<F>(&mut store)?;
+    match reopened.record_retrieve_exchange(&conformance::retrieve_for(&binding, 123)) {
+        Err(PersistError::Unauthorized) => Ok(
+            "capability rotated; reopened; retired capability remained stale; retrieve refused"
+                .to_owned(),
+        ),
+        other => Err(format!("stale capability regained access: {other:?}")),
+    }
+}
+
+fn chain_event_during_rearm<F: ConformanceFixture>() -> Result<String, String> {
+    let Prepared {
+        mut store, binding, ..
+    } = F::prepare();
+    let exchange = conformance::retrieve_for(&binding, 131);
+    let authorized = recorded_retrieve(&mut store, &exchange)?;
+    let ack = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-b", 132);
+    recorded_ack(&mut store, &binding, &ack)?;
+    match store
+        .try_rearm_join(join_scope(&binding))
+        .map_err(debug_error)?
+    {
+        RearmJoinResult::WaitingForRecognizedTerminal => {}
+        other => return Err(format!("early rearm did not wait for terminal: {other:?}")),
+    }
+    let before_event = store.recover_authority_state().map_err(debug_error)?;
+    if !before_event.rearmed_joins.is_empty() {
+        return Err("early rearm was durably published".to_owned());
+    }
+    let payloads = F::payloads(&store);
+    let mut terminal = before_event;
+    terminal.native_turn_facts = terminal_facts(&binding, 131);
+    let mut reopened = F::admit_snapshot(terminal, payloads).map_err(debug_error)?;
+    match reopened.try_rearm_join(join_scope(&binding)).map_err(debug_error)? {
+        RearmJoinResult::Rearmed => Ok(
+            "acknowledged; rearm waited; queued event left store unchanged; terminal recovered; rearmed"
+                .to_owned(),
+        ),
+        other => Err(format!("terminal rearm did not complete: {other:?}")),
+    }
+}
+
+fn chain_omitted_rearm<F: ConformanceFixture>() -> Result<String, String> {
+    let Prepared {
+        mut store, binding, ..
+    } = F::prepare();
+    let exchange = conformance::retrieve_for(&binding, 141);
+    let authorized = recorded_retrieve(&mut store, &exchange)?;
+    let ack = conformance::ack_for(&binding, &authorized.recorded.retrieval_id, "event-b", 142);
+    recorded_ack(&mut store, &binding, &ack)?;
+    let payloads = F::payloads(&store);
+    let mut terminal = store.recover_authority_state().map_err(debug_error)?;
+    terminal.native_turn_facts = terminal_facts(&binding, 141);
+    let mut reopened = F::admit_snapshot(terminal, payloads).map_err(debug_error)?;
+    let recovered = reopened.recover_authority_state().map_err(debug_error)?;
+    if !recovered.rearmed_joins.is_empty() {
+        return Err("rearm appeared despite omission".to_owned());
+    }
+    match reopened.record_retrieve_exchange(&conformance::retrieve_for(&binding, 143)) {
+        Err(PersistError::InvalidTransition) => Ok(
+            "acknowledged; terminal recovered; rearm omitted; authority stayed inactive".to_owned(),
+        ),
+        other => Err(format!("omitted rearm did not remain inactive: {other:?}")),
+    }
+}
+
 fn complete_chain<F: ConformanceFixture>() -> Result<(), String> {
     let Prepared {
         mut store, binding, ..
@@ -130,6 +319,97 @@ fn complete_chain<F: ConformanceFixture>() -> Result<(), String> {
         RearmJoinResult::Rearmed => Ok(()),
         other => Err(format!("complete chain did not rearm: {other:?}")),
     }
+}
+
+fn reopen<F: ConformanceFixture>(store: &mut F::Store) -> Result<F::Store, String> {
+    let payloads = F::payloads(store);
+    let snapshot = store.recover_authority_state().map_err(debug_error)?;
+    F::admit_snapshot(snapshot, payloads).map_err(debug_error)
+}
+
+fn recorded_retrieve(
+    store: &mut impl Persist,
+    exchange: &RetrieveExchange,
+) -> Result<AuthorizedRetrieve, String> {
+    match store
+        .record_retrieve_exchange(exchange)
+        .map_err(debug_error)?
+    {
+        IdempotentResult::Recorded(authorized) => Ok(authorized),
+        IdempotentResult::ExactReplay(_) => Err("first retrieve unexpectedly replayed".to_owned()),
+    }
+}
+
+fn expect_retrieve_replay(
+    store: &mut impl Persist,
+    exchange: &RetrieveExchange,
+    expected: &AuthorizedRetrieve,
+) -> Result<(), String> {
+    match store
+        .record_retrieve_exchange(exchange)
+        .map_err(debug_error)?
+    {
+        IdempotentResult::ExactReplay(actual) if actual.recorded == expected.recorded => Ok(()),
+        other => Err(format!("retrieve did not replay exactly: {other:?}")),
+    }
+}
+
+fn recorded_ack(
+    store: &mut impl Persist,
+    binding: &ValidatedHelperBinding,
+    request: &AcknowledgeRequest,
+) -> Result<AcknowledgeResult, String> {
+    match store
+        .acknowledge_retrieved_batch(binding, request)
+        .map_err(debug_error)?
+    {
+        IdempotentResult::Recorded(result) => Ok(result),
+        IdempotentResult::ExactReplay(_) => {
+            Err("first acknowledgment unexpectedly replayed".to_owned())
+        }
+    }
+}
+
+fn expect_ack_replay(
+    store: &mut impl Persist,
+    binding: &ValidatedHelperBinding,
+    request: &AcknowledgeRequest,
+    expected: &AcknowledgeResult,
+) -> Result<(), String> {
+    match store
+        .acknowledge_retrieved_batch(binding, request)
+        .map_err(debug_error)?
+    {
+        IdempotentResult::ExactReplay(actual) if &actual == expected => Ok(()),
+        other => Err(format!("acknowledgment did not replay exactly: {other:?}")),
+    }
+}
+
+fn revocation_scope(binding: &ValidatedHelperBinding) -> HelperRevocationScope {
+    HelperRevocationScope {
+        grant_ref: binding.grant_ref.clone(),
+        birth_id: binding.birth_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+    }
+}
+
+fn join_scope(binding: &ValidatedHelperBinding) -> RearmJoinScope {
+    RearmJoinScope {
+        arm_id: binding.arm_id.clone(),
+        generation: binding.generation,
+        attempt_id: binding.attempt_id.clone(),
+        signal_id: binding.signal_id.clone(),
+    }
+}
+
+fn terminal_facts(binding: &ValidatedHelperBinding, fixture: u8) -> Vec<PersistedNativeTurnFacts> {
+    vec![PersistedNativeTurnFacts {
+        attempt_id: binding.attempt_id.clone(),
+        facts: vec![NativeTurnFact::Terminal {
+            turn_ref: PrivateNativeRef::fixture(fixture),
+            class: TerminalClass::Succeeded,
+        }],
+    }]
 }
 
 fn debug_error(error: PersistError) -> String {

@@ -34,8 +34,10 @@ cargo run -p gearwit-sim -- compare --left result-a.json --right result-b.json
 milestone, kills the child, and verifies the media in the parent process. The
 artifact labels the exact OS, architecture, simulator version, seed, store,
 resolved stimuli, queue accounting, host checks, and semantic fingerprint.
-Seeded campaigns use the in-process catalog; run `SIM-PROC-01` explicitly so a
-campaign cannot hide the cost or platform boundary of a real process kill.
+Seeded campaigns exclude process-backed `SIM-CHAIN-07` and `SIM-PROC-01`; run
+them explicitly so a campaign cannot hide the cost or platform boundary of a
+real process kill. Their bundles are evidence records and `replay --bundle`
+refuses them because reproduction requires a new child-process run.
 
 The stable readiness catalog is:
 
