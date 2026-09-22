@@ -78,7 +78,6 @@ impl StoreStreamAdapter {
 struct StreamDriver<F: ConformanceFixture> {
     store: Option<F::Store>,
     binding: ValidatedHelperBinding,
-    admission: crate::persist::ClaimAdmission,
     attachment: crate::persist::PersistedControllerAttachment,
     admissions: std::collections::BTreeMap<
         String,
@@ -90,6 +89,7 @@ struct StreamDriver<F: ConformanceFixture> {
     >,
     offered: Vec<String>,
     last_retrieve: Option<AuthorizedRetrieve>,
+    admitted_event_ref: Option<String>,
     blueprint: crate::persist::RecoverySnapshot,
     grant_installed: bool,
     logical_effects: u64,
@@ -101,7 +101,7 @@ impl<F: ConformanceFixture> StreamDriver<F> {
         let Prepared {
             mut store,
             binding,
-            admission,
+            admission: _,
             attachment,
         } = F::prepare();
         let blueprint = store
@@ -110,11 +110,11 @@ impl<F: ConformanceFixture> StreamDriver<F> {
         Self {
             store: Some(F::empty()),
             binding,
-            admission,
             attachment,
             admissions: std::collections::BTreeMap::new(),
             offered: Vec::new(),
             last_retrieve: None,
+            admitted_event_ref: None,
             blueprint,
             grant_installed: false,
             logical_effects: 0,
@@ -196,9 +196,8 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                         admission.claim_digest = ClaimDigest::fixture(derive_nonce(event));
                     }
                     (admission, attachment.clone())
-                } else if self.admissions.is_empty() {
-                    (self.admission.clone(), self.attachment.clone())
                 } else {
+                    let first = self.admissions.is_empty();
                     let event_record = ProviderEvent {
                         provider: "test".to_owned(),
                         event_ref: bounded_id("event", event),
@@ -206,32 +205,50 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                         observed_at: "1970-01-01T00:00:00Z".to_owned(),
                         body: format!("simulator event {event}"),
                     };
+                    let request_id = if first {
+                        "claim-a".to_owned()
+                    } else {
+                        bounded_id("claim", operation_id)
+                    };
                     let admission = crate::persist::claim_admission_fixture(
-                        &bounded_id("claim", operation_id),
+                        &request_id,
                         self.binding.arm_id.clone(),
                         self.binding.generation,
-                        SignalId::new(bounded_id("signal", operation_id)).map_err(str::to_owned)?,
+                        if first {
+                            self.binding.signal_id.clone()
+                        } else {
+                            SignalId::new(bounded_id("signal", operation_id))
+                                .map_err(str::to_owned)?
+                        },
                         &[event_record],
                         OffsetDateTime::UNIX_EPOCH,
                     );
                     let mut attachment = self.attachment.clone();
-                    attachment.attempt_id = AttemptId::new(bounded_id("attempt", operation_id))
-                        .map_err(str::to_owned)?;
-                    attachment.verifier_ref = VerifierRef::fixture(derive_nonce(operation_id));
+                    if !first {
+                        attachment.attempt_id = AttemptId::new(bounded_id("attempt", operation_id))
+                            .map_err(str::to_owned)?;
+                        attachment.verifier_ref = VerifierRef::fixture(derive_nonce(operation_id));
+                    }
                     (admission, attachment)
                 };
                 let result = store.admit_claim(&admission, &attachment);
                 let outcome = match result {
                     Ok(result) if result.outcome == AdmissionOutcome::Admitted => {
                         if !self.grant_installed {
-                            let grant = self
+                            let mut grant = self
                                 .blueprint
                                 .helper_grants
                                 .first()
-                                .ok_or("fixture blueprint had no helper grant")?;
-                            store.persist_helper_grant(grant).map_err(debug_error)?;
+                                .ok_or("fixture blueprint had no helper grant")?
+                                .clone();
+                            grant.claim_digest.clone_from(&admission.claim_digest);
+                            self.binding
+                                .claim_digest
+                                .clone_from(&admission.claim_digest);
+                            store.persist_helper_grant(&grant).map_err(debug_error)?;
                             self.grant_installed = true;
                         }
+                        self.admitted_event_ref = Some(bounded_id("event", event));
                         self.logical_effects += 1;
                         self.revision += 1;
                         "admitted"
@@ -285,7 +302,9 @@ impl<F: ConformanceFixture> StreamDriver<F> {
                 let ack = conformance::ack_for(
                     &self.binding,
                     &authorized.recorded.retrieval_id,
-                    "event-b",
+                    self.admitted_event_ref
+                        .as_deref()
+                        .ok_or("acknowledgment had no admitted event")?,
                     derive_nonce(request),
                 );
                 match store.acknowledge_retrieved_batch(&self.binding, &ack) {
