@@ -3,8 +3,9 @@
 VERSION := $(shell tr -d ' \n\r' < VERSION)
 MSRV := $(shell awk -F'"' '/^channel/ { print $$2; exit }' rust-toolchain.toml)
 GONEAT_VERSION ?= v0.6.0
+PRODUCTION_PACKAGES := -p gearwit-domain -p gearwit-protocol -p gearwit-host -p gearwit-cli
 
-.PHONY: all check gate repository-check goneat-version metadata fmt clippy test console-check msrv deny help
+.PHONY: all check gate repository-check goneat-version metadata fmt clippy rust-clippy test rust-test simulator-boundary console-check msrv deny help
 
 all: check
 
@@ -25,17 +26,27 @@ metadata:
 fmt:
 	cargo fmt --all --check
 
-clippy:
-	cargo clippy --workspace --all-targets --locked -- -D warnings
+clippy: rust-clippy simulator-boundary
 
-test:
-	cargo test --workspace --locked
+rust-clippy:
+	cargo clippy $(PRODUCTION_PACKAGES) --all-targets --locked -- -D warnings
+	cargo clippy -p gearwit-sim --all-targets --locked -- -D warnings
+
+test: rust-test
+
+rust-test:
+	cargo test $(PRODUCTION_PACKAGES) --all-targets --locked
+	cargo test -p gearwit-sim --all-targets --locked
+
+simulator-boundary:
+	@! cargo tree -p gearwit-cli --locked -e features | grep -q 'gearwit-host feature "simulator"'
 
 console-check:
 	bun run check:js
 
 msrv:
-	cargo +$(MSRV) check --workspace --locked
+	cargo +$(MSRV) check $(PRODUCTION_PACKAGES) --locked
+	cargo +$(MSRV) check -p gearwit-sim --locked
 
 deny:
 	cargo deny check

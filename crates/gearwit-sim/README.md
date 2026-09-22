@@ -5,12 +5,15 @@ not depend on it. It combines an independent abstract state oracle with the
 admitted fake and bundled SQLite fixture bridge.
 
 The host bridge is behind the non-default `gearwit-host/simulator` feature.
-An ordinary CLI build does not select it; verify the boundary with:
+The repository gate compiles and tests production packages in one Cargo
+invocation and the simulator in a second invocation so feature unification
+cannot enable the bridge in ordinary binaries. Verify the boundary with:
 
 ```sh
 cargo check -p gearwit-cli --locked
 cargo tree -p gearwit-cli -e features --locked
 cargo tree -p gearwit-sim -e features --locked
+make simulator-boundary
 ```
 
 Run a fixed scenario and save its replay bundle:

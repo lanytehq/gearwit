@@ -107,6 +107,16 @@ impl SqliteBaseline {
         store
     }
 
+    fn reopen_same_media(mut self) -> Self {
+        let path = self.path.clone();
+        let ephemeral = self.ephemeral;
+        self.ephemeral = false;
+        drop(self);
+        let mut reopened = Self::open_path(&path);
+        reopened.ephemeral = ephemeral;
+        reopened
+    }
+
     fn reload(&mut self) -> Result<(), PersistError> {
         if self.fault.reload_after_commit {
             self.fault.reload_after_commit = false;
@@ -434,6 +444,30 @@ impl ConformanceFixture for SqliteBaseline {
         store.commit()?;
         store.reload()?;
         Ok(store)
+    }
+
+    #[cfg(feature = "simulator")]
+    fn reopen(store: Self::Store) -> Result<Self::Store, PersistError> {
+        Ok(store.reopen_same_media())
+    }
+
+    #[cfg(feature = "simulator")]
+    fn install_terminal(
+        store: &mut Self::Store,
+        binding: &ValidatedHelperBinding,
+        fixture: u8,
+    ) -> Result<(), PersistError> {
+        let payloads = store.live.claim_payloads();
+        let mut snapshot = store.live.recover_authority_state()?;
+        snapshot.native_turn_facts = vec![PersistedNativeTurnFacts {
+            attempt_id: binding.attempt_id.clone(),
+            facts: vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(fixture),
+                class: TerminalClass::Succeeded,
+            }],
+        }];
+        store.live = FakePersist::restore_from_snapshot(snapshot, payloads)?;
+        store.commit()
     }
 }
 
@@ -1361,6 +1395,7 @@ fn crash_writer(role: &str) {
     let _ = store;
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn run_simulator_crash_child(path: &Path, phase: &str) -> Result<(), String> {
     let mut store = SqliteBaseline::open_path(path);
     let (binding, _, _) = conformance::install_helper(&mut store);
@@ -1400,6 +1435,7 @@ pub(crate) fn run_simulator_crash_child(path: &Path, phase: &str) -> Result<(), 
     Err("crash child returned before termination".to_owned())
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn verify_simulator_crash_reopen(path: &Path) -> Result<(), String> {
     let (journal, synchronous) = read_writer_config(path);
     if journal != "delete" || synchronous != 2 {
@@ -1753,6 +1789,31 @@ mod tests {
             execute::<SqliteBaseline>(case.id)
                 .unwrap_or_else(|error| panic!("{}: {error}", case.id));
         }
+    }
+
+    #[test]
+    fn simulator_reopen_keeps_the_original_media_path() {
+        let Prepared {
+            mut store, binding, ..
+        } = SqliteBaseline::prepare();
+        let path = store.path.clone();
+        store
+            .record_retrieve_exchange(&conformance::retrieve_for(&binding, 201))
+            .expect("record retrieve");
+        let mut reopened = store.reopen_same_media();
+        assert_eq!(reopened.path, path);
+        assert_eq!(
+            reopened
+                .recover_authority_state()
+                .expect("recover")
+                .arms
+                .len(),
+            1
+        );
+        assert!(matches!(
+            reopened.record_retrieve_exchange(&conformance::retrieve_for(&binding, 201)),
+            Ok(IdempotentResult::ExactReplay(_))
+        ));
     }
 
     #[test]

@@ -1184,6 +1184,14 @@ pub(crate) trait ConformanceFixture {
         snapshot: RecoverySnapshot,
         payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
     ) -> Result<Self::Store, PersistError>;
+    #[cfg(feature = "simulator")]
+    fn reopen(store: Self::Store) -> Result<Self::Store, PersistError>;
+    #[cfg(feature = "simulator")]
+    fn install_terminal(
+        store: &mut Self::Store,
+        binding: &ValidatedHelperBinding,
+        fixture: u8,
+    ) -> Result<(), PersistError>;
 }
 
 pub(crate) struct Prepared<S> {
@@ -1222,6 +1230,32 @@ impl ConformanceFixture for FakeFixture {
         payloads: BTreeMap<ClaimPayloadRef, BoundedClaimPayload>,
     ) -> Result<Self::Store, PersistError> {
         FakePersist::restore_from_snapshot(snapshot, payloads)
+    }
+
+    #[cfg(feature = "simulator")]
+    fn reopen(mut store: Self::Store) -> Result<Self::Store, PersistError> {
+        let payloads = store.claim_payloads();
+        let snapshot = store.recover_authority_state()?;
+        FakePersist::restore_from_snapshot(snapshot, payloads)
+    }
+
+    #[cfg(feature = "simulator")]
+    fn install_terminal(
+        store: &mut Self::Store,
+        binding: &ValidatedHelperBinding,
+        fixture: u8,
+    ) -> Result<(), PersistError> {
+        let payloads = store.claim_payloads();
+        let mut snapshot = store.recover_authority_state()?;
+        snapshot.native_turn_facts = vec![PersistedNativeTurnFacts {
+            attempt_id: binding.attempt_id.clone(),
+            facts: vec![NativeTurnFact::Terminal {
+                turn_ref: PrivateNativeRef::fixture(fixture),
+                class: TerminalClass::Succeeded,
+            }],
+        }];
+        *store = FakePersist::restore_from_snapshot(snapshot, payloads)?;
+        Ok(())
     }
 }
 

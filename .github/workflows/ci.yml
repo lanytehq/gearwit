@@ -93,17 +93,17 @@ jobs:
         if: matrix.build
         run: mkdir -p "$TMPDIR"
 
-      - name: Test workspace
+      - name: Test production packages and simulator separately
         if: matrix.build
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: cargo test --workspace --all-targets --locked
+        run: make rust-test
 
-      - name: Lint workspace
+      - name: Lint production packages and simulator separately
         if: matrix.build
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: make rust-clippy
 
       - name: Validate workspace contract
         if: ${{ !matrix.build }}
@@ -150,17 +150,17 @@ jobs:
         if: matrix.build
         run: mkdir -p "$TMPDIR"
 
-      - name: Test workspace
+      - name: Test production packages and simulator separately
         if: matrix.build
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: cargo test --workspace --all-targets --locked
+        run: make rust-test
 
-      - name: Lint workspace
+      - name: Lint production packages and simulator separately
         if: matrix.build
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: make rust-clippy
 
       - name: Validate workspace contract
         if: ${{ !matrix.build }}

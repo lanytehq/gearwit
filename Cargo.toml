@@ -7,6 +7,12 @@ members = [
     "crates/gearwit-cli",
     "crates/gearwit-sim",
 ]
+default-members = [
+    "crates/gearwit-domain",
+    "crates/gearwit-protocol",
+    "crates/gearwit-host",
+    "crates/gearwit-cli",
+]
 exclude = ["apps/console/src-tauri"]
 
 [workspace.package]
