@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::child::ChildSlot;
+use crate::sanitize::{MAX_ID, PARTIAL_BODY_ADVISORY, body_is_displayable, paste_field};
 use crate::wait_on::{
     ChanvoyDrain, DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitOutcome, WaitResult,
     WaiterState, attach_drain, chanvoy_wait_args,
@@ -333,7 +334,7 @@ fn daemon_coverage(wait: WaitResult, current_after: &str) -> DaemonCoverage {
 /// `note_claimed` runs on a new stable claim; `note_delivered` runs only
 /// after a successful delivery write.
 #[must_use]
-pub fn ingest_match<D: EventDrain, I: DeliveryIo>(
+pub fn ingest_match<D: EventDrain, I: DeliveryIo + ?Sized>(
     request: &IngestRequest<'_, D>,
     pipe: &mut DaemonPipe,
     acks: &mut AckStore,
@@ -359,8 +360,28 @@ pub fn ingest_match<D: EventDrain, I: DeliveryIo>(
         drain_error: None,
     };
     let drained = attach_drain(hinted, request.spec, request.drain);
-    if drained.drain_error.is_some() || drained.newest_observed.is_none() {
+    if let Some(error) = drained.drain_error.as_ref() {
+        report_drain_refusal(error);
         return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
+    }
+    if drained.newest_observed.is_none() {
+        return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
+    }
+    if let Some(event) = drained
+        .drained_events
+        .iter()
+        .find(|event| !drained_event_is_displayable(event))
+    {
+        eprintln!(
+            "gearwit: refusing provider page before claim: ref={} body is not displayable without transformation; no dispatch or cursor advance",
+            paste_field(&event.id, MAX_ID)
+        );
+        return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
+    }
+    for event in &drained.drained_events {
+        if let Some(diagnostic) = local_body_loss_diagnostic(event) {
+            eprintln!("{diagnostic}");
+        }
     }
 
     let observed = request
@@ -368,10 +389,22 @@ pub fn ingest_match<D: EventDrain, I: DeliveryIo>(
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned());
     let events = provider_events_from_drain(&drained.drained_events, &observed);
+    let requires_return_completed = drained
+        .drained_events
+        .iter()
+        .any(|event| event.local_loss.is_some());
     let is_new = pipe.claim.is_none();
     match claim_or_reuse(&mut pipe.claim, request.arm, &events, mint_signal()) {
         Ok(live) => {
             if is_new && acks.note_claimed(live.signal_id.clone()).is_err() {
+                return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
+            }
+            if is_new
+                && requires_return_completed
+                && acks
+                    .require_return_completed_before_handled(&live.signal_id)
+                    .is_err()
+            {
                 return pipe.snapshot(DaemonCoverage::Halt { exit: 2 }, waiter_attached);
             }
             deliver_claimed(
@@ -388,7 +421,80 @@ pub fn ingest_match<D: EventDrain, I: DeliveryIo>(
     }
 }
 
-fn deliver_claimed<I: DeliveryIo>(
+fn local_body_loss_diagnostic(event: &DrainedEvent) -> Option<String> {
+    let loss = event.local_loss?;
+    Some(format!(
+        "gearwit: local provider-body loss: ref={} controls_removed={} scalars_clipped={} displayed_bytes={} advisory=untrusted-spoofable",
+        paste_field(&event.id, MAX_ID),
+        loss.controls_removed,
+        loss.scalars_clipped,
+        loss.displayed_bytes
+    ))
+}
+
+fn drained_event_is_displayable(event: &DrainedEvent) -> bool {
+    body_is_displayable(&event.message)
+        && event.local_loss.is_none_or(|loss| {
+            loss.displayed_bytes == event.message.len()
+                && event.message.ends_with(PARTIAL_BODY_ADVISORY)
+        })
+}
+
+fn update_ack_visibility_after_result(acks: &mut AckStore, result: &WaiterLink) {
+    let WaiterLink::DeliveryResult {
+        signal_id, outcome, ..
+    } = result
+    else {
+        return;
+    };
+    if outcome == "return_completed" {
+        if acks.note_return_completed(signal_id).is_err() {
+            eprintln!(
+                "gearwit: successful receipt result did not release the visibility hold for signal={}",
+                paste_field(signal_id, MAX_ID)
+            );
+        }
+    } else if outcome == "return_failed" && acks.requires_return_completed_before_handled(signal_id)
+    {
+        eprintln!(
+            "gearwit: warning-page receipt output failed; handled cursor remains held for signal={} because no successful visible receipt was recorded",
+            paste_field(signal_id, MAX_ID)
+        );
+    }
+}
+
+fn apply_waiter_result_with_ack_visibility(
+    pipe: &mut DaemonPipe,
+    acks: &Mutex<AckStore>,
+    result: &WaiterLink,
+) -> ResultApply {
+    let applied = apply_waiter_result(pipe, result);
+    if applied == ResultApply::RevokeTerminal {
+        update_ack_visibility_after_result(&mut lock_acks(acks), result);
+    }
+    applied
+}
+
+fn report_drain_refusal(error: &DrainError) {
+    match error {
+        DrainError::AdvisoryCannotFit {
+            event_ref,
+            controls_removed,
+            scalars_clipped,
+        } => eprintln!(
+            "gearwit: refusing provider page before claim: advisory cannot fit ref={} controls_removed={} scalars_clipped={}; no dispatch or cursor advance",
+            paste_field(event_ref, MAX_ID),
+            controls_removed,
+            scalars_clipped
+        ),
+        _ => eprintln!(
+            "gearwit: refusing provider page before claim: drain failed ({}) ; no dispatch or cursor advance",
+            error.as_str()
+        ),
+    }
+}
+
+fn deliver_claimed<I: DeliveryIo + ?Sized>(
     live: SignalClaim,
     link: Option<&AdmittedLink>,
     pipe: &mut DaemonPipe,
@@ -483,6 +589,7 @@ fn deliver_claimed<I: DeliveryIo>(
         && record_delivery_result(&mut pipe.ledger, &result).is_ok()
         && let WaiterLink::DeliveryResult { outcome, .. } = &result
     {
+        update_ack_visibility_after_result(acks, &result);
         result_outcome = Some(outcome.clone());
         if outcome == "link_lost" {
             pipe.attempted = false;
@@ -863,6 +970,7 @@ fn poll_result(
     served: &mut Option<ServeAttach>,
     table: &Mutex<LinkTable>,
     pipe: &mut DaemonPipe,
+    acks: &Mutex<AckStore>,
     now: OffsetDateTime,
 ) {
     if served.is_none() {
@@ -900,7 +1008,7 @@ fn poll_result(
         .as_mut()
         .map(|current| read_waiter_link(&mut current.reader));
     match read {
-        Some(Ok(result)) => match apply_waiter_result(pipe, &result) {
+        Some(Ok(result)) => match apply_waiter_result_with_ack_visibility(pipe, acks, &result) {
             ResultApply::Keep => {}
             ResultApply::RevokeLost => revoke_exact(served, table, pipe, now, true),
             ResultApply::RevokeTerminal => revoke_exact(served, table, pipe, now, false),
@@ -1090,7 +1198,7 @@ pub fn run_daemon_wait(spec: WaitOnSpec) -> i32 {
                 return halt(&table, &mut children, &stop, &socket, &mut accept, 2);
             }
         }
-        poll_result(&mut served, &table, &mut pipe, now);
+        poll_result(&mut served, &table, &mut pipe, &acks, now);
         if let Some(code) = poll_chanvoy(
             &mut LoopIo {
                 children: &mut children,
@@ -1214,17 +1322,20 @@ fn flush_current(
 mod tests {
     use super::{
         AckRearmPlan, ClaimError, CoverageChild, DaemonCoverage, DeliveryIo, IngestOutcome,
-        RearmFollowup, ResultApply, apply_waiter_result, claim_or_reuse, ingest_match,
-        lease_expired, on_transport_loss, provider_events_from_drain, restart_after_ack,
-        retain_live_attach, shutdown_daemon, spawn_accept, take_coverage_rearm,
+        RearmFollowup, ResultApply, apply_waiter_result, apply_waiter_result_with_ack_visibility,
+        claim_or_reuse, ingest_match, lease_expired, on_transport_loss, provider_events_from_drain,
+        restart_after_ack, retain_live_attach, shutdown_daemon, spawn_accept, take_coverage_rearm,
     };
     use crate::child::ChildSlot;
+    use crate::sanitize::PARTIAL_BODY_ADVISORY;
     use crate::wait_on::{DrainError, DrainedEvent, EventDrain, WaitOnSpec, WaitResult};
     use gearwit_host::{
-        AckRearm, AckStore, DeliveryAttempt, GearwitPaths, KnownArm, LinkSession, LinkTable,
-        admit_attach,
+        AckRearm, AckStore, DeliveryAttempt, DeliveryLedger, GearwitPaths, KnownArm, LinkSession,
+        LinkTable, admit_attach, prepare_delivery,
     };
-    use gearwit_protocol::{ProviderEvent, SCHEMA, WaiterLink, parse_waiter_link};
+    use gearwit_protocol::{
+        ProviderEvent, SCHEMA, WaiterLink, parse_handled_cursor, parse_waiter_link,
+    };
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1265,6 +1376,7 @@ mod tests {
             id: id.to_owned(),
             username: "peer".to_owned(),
             message: body.to_owned(),
+            local_loss: None,
         }
     }
 
@@ -1334,6 +1446,37 @@ mod tests {
         }
     }
 
+    struct FailedReturnIo {
+        sent: Option<WaiterLink>,
+    }
+
+    impl DeliveryIo for FailedReturnIo {
+        fn send(&mut self, message: &WaiterLink) -> Result<(), &'static str> {
+            self.sent = Some(message.clone());
+            Ok(())
+        }
+
+        fn recv_result(&mut self) -> Result<WaiterLink, &'static str> {
+            let WaiterLink::DeliverEvents {
+                delivery_id,
+                link_id,
+                signal_id,
+                ..
+            } = self.sent.as_ref().ok_or("no send")?
+            else {
+                return Err("type");
+            };
+            Ok(WaiterLink::DeliveryResult {
+                schema: SCHEMA.to_owned(),
+                delivery_id: delivery_id.clone(),
+                link_id: link_id.clone(),
+                signal_id: signal_id.clone(),
+                outcome: "return_failed".to_owned(),
+                observed_at: "2026-01-15T12:05:03Z".to_owned(),
+            })
+        }
+    }
+
     fn provider(id: &str) -> ProviderEvent {
         ProviderEvent {
             provider: "mattermost".to_owned(),
@@ -1349,7 +1492,7 @@ mod tests {
         drain: &FixedDrain,
         link: Option<&gearwit_host::AdmittedLink>,
         pipe: &mut super::DaemonPipe,
-        io: Option<&mut ScriptedIo>,
+        io: Option<&mut dyn DeliveryIo>,
         mint: &str,
     ) -> IngestOutcome {
         let mut acks = AckStore::with_arm(arm());
@@ -1362,7 +1505,7 @@ mod tests {
         link: Option<&gearwit_host::AdmittedLink>,
         pipe: &mut super::DaemonPipe,
         acks: &mut AckStore,
-        io: Option<&mut ScriptedIo>,
+        io: Option<&mut dyn DeliveryIo>,
         mint: &str,
     ) -> IngestOutcome {
         ingest_match(
@@ -1389,6 +1532,7 @@ mod tests {
                 id: "post03".to_owned(),
                 username: String::new(),
                 message: "second bounded event".to_owned(),
+                local_loss: None,
             },
         ];
         let mapped = provider_events_from_drain(&events, "2026-01-15T12:05:00Z");
@@ -1516,9 +1660,16 @@ mod tests {
     #[test]
     fn successful_write_is_attempted_result_does_not_start_turn() {
         let (_table, link) = admitted();
+        let body = format!("one\tline\n\n{PARTIAL_BODY_ADVISORY}");
+        let mut observed = event("post02", &body);
+        observed.local_loss = Some(crate::sanitize::LocalBodyLoss {
+            controls_removed: 1,
+            scalars_clipped: 5,
+            displayed_bytes: body.len(),
+        });
         let drain = FixedDrain {
             after: Mutex::new(None),
-            result: Ok(vec![event("post02", "one")]),
+            result: Ok(vec![observed]),
         };
         let mut pipe = super::DaemonPipe::default();
         let mut acks = AckStore::with_arm(arm());
@@ -1542,7 +1693,11 @@ mod tests {
         assert!(pipe.claim.is_some());
         assert_eq!(outcome.coverage, DaemonCoverage::Pause);
         let sent = io.sent.expect("sent");
-        assert!(matches!(sent, WaiterLink::DeliverEvents { .. }));
+        assert!(matches!(
+            sent,
+            WaiterLink::DeliverEvents { ref events, .. }
+                if events[0].body == body
+        ));
         let accepted = gearwit_host::record_handled(
             &mut acks,
             gearwit_protocol::parse_handled_cursor(include_str!(
@@ -1556,6 +1711,266 @@ mod tests {
             accepted,
             gearwit_protocol::HandledCursor::Accepted { ref cursor, .. } if cursor == "post02"
         ));
+    }
+
+    #[test]
+    fn return_failed_holds_ack_for_measured_loss_but_not_ordinary_pages() {
+        let (_table, link) = admitted();
+        let body = format!("one\tline\n\n{PARTIAL_BODY_ADVISORY}");
+        let mut observed = event("post02", &body);
+        observed.local_loss = Some(crate::sanitize::LocalBodyLoss {
+            controls_removed: 1,
+            scalars_clipped: 5,
+            displayed_bytes: body.len(),
+        });
+        let drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Ok(vec![observed]),
+        };
+        let mut pipe = super::DaemonPipe::default();
+        let mut acks = AckStore::with_arm(arm());
+        let mut io = FailedReturnIo { sent: None };
+        let outcome = ingest_with_acks(
+            WaitResult::Matched,
+            &drain,
+            Some(&link),
+            &mut pipe,
+            &mut acks,
+            Some(&mut io),
+            "01J00000000000000000000021",
+        );
+        assert_eq!(outcome.result_outcome.as_deref(), Some("return_failed"));
+        let refused = gearwit_host::record_handled(
+            &mut acks,
+            parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("handled request"),
+            now(),
+        )
+        .expect("handled refusal");
+        assert!(matches!(
+            refused,
+            gearwit_protocol::HandledCursor::Rejected { code, .. }
+                if code == "ack_before_delivery"
+        ));
+        assert!(gearwit_host::rearm_from_handled(&mut acks, "01J00000000000000000000021").is_err());
+        assert_eq!(acks.arm().expect("arm").generation, 1);
+
+        let ordinary_drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Ok(vec![event("post02", "ordinary page")]),
+        };
+        let mut ordinary_pipe = super::DaemonPipe::default();
+        let mut ordinary_acks = AckStore::with_arm(arm());
+        let mut ordinary_io = FailedReturnIo { sent: None };
+        let ordinary = ingest_with_acks(
+            WaitResult::Matched,
+            &ordinary_drain,
+            Some(&link),
+            &mut ordinary_pipe,
+            &mut ordinary_acks,
+            Some(&mut ordinary_io),
+            "01J00000000000000000000021",
+        );
+        assert_eq!(ordinary.result_outcome.as_deref(), Some("return_failed"));
+        let accepted = gearwit_host::record_handled(
+            &mut ordinary_acks,
+            parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("handled request"),
+            now(),
+        )
+        .expect("ordinary ACK behavior remains unchanged");
+        assert!(matches!(
+            accepted,
+            gearwit_protocol::HandledCursor::Accepted { ref cursor, .. } if cursor == "post02"
+        ));
+    }
+
+    #[test]
+    fn missing_attach_result_keeps_measured_loss_ack_held() {
+        let (_table, link) = admitted();
+        let body = format!("one\tline\n\n{PARTIAL_BODY_ADVISORY}");
+        let mut observed = event("post02", &body);
+        observed.local_loss = Some(crate::sanitize::LocalBodyLoss {
+            controls_removed: 1,
+            scalars_clipped: 5,
+            displayed_bytes: body.len(),
+        });
+        let drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Ok(vec![observed]),
+        };
+        let mut pipe = super::DaemonPipe::default();
+        let mut acks = AckStore::with_arm(arm());
+        let mut io = ScriptedIo {
+            fail_send: false,
+            sent: None,
+            complete: false,
+        };
+        let outcome = ingest_with_acks(
+            WaitResult::Matched,
+            &drain,
+            Some(&link),
+            &mut pipe,
+            &mut acks,
+            Some(&mut io),
+            "01J00000000000000000000021",
+        );
+        assert!(outcome.result_outcome.is_none());
+        let refused = gearwit_host::record_handled(
+            &mut acks,
+            parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("handled request"),
+            now(),
+        )
+        .expect("handled refusal");
+        assert!(matches!(
+            refused,
+            gearwit_protocol::HandledCursor::Rejected { code, .. }
+                if code == "ack_before_delivery"
+        ));
+        assert!(gearwit_host::rearm_from_handled(&mut acks, "01J00000000000000000000021").is_err());
+        assert_eq!(acks.arm().expect("arm").generation, 1);
+    }
+
+    #[test]
+    fn deferred_return_completed_releases_measured_loss_ack_hold() {
+        let (_table, link) = admitted();
+        let signal_id = "01J00000000000000000000021";
+        let mut ledger = DeliveryLedger::default();
+        let delivery = prepare_delivery(
+            &mut ledger,
+            &link,
+            signal_id.to_owned(),
+            vec![provider("post02")],
+            now(),
+        )
+        .expect("pending delivery");
+        let WaiterLink::DeliverEvents {
+            delivery_id,
+            link_id,
+            signal_id,
+            ..
+        } = delivery
+        else {
+            panic!("deliver_events")
+        };
+        let mut acks = AckStore::with_arm(arm());
+        acks.note_claimed(signal_id.clone()).expect("claim");
+        acks.require_return_completed_before_handled(&signal_id)
+            .expect("visibility gate");
+        acks.note_delivered(
+            signal_id.clone(),
+            vec!["post02".to_owned()],
+            &["post02".to_owned()],
+        )
+        .expect("delivered refs");
+        let acks = Mutex::new(acks);
+        let mut pipe = super::DaemonPipe {
+            ledger,
+            claim: None,
+            attempted: true,
+        };
+        let result = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id,
+            link_id,
+            signal_id,
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:03Z".to_owned(),
+        };
+        assert_eq!(
+            apply_waiter_result_with_ack_visibility(&mut pipe, &acks, &result),
+            ResultApply::RevokeTerminal
+        );
+        let accepted = gearwit_host::record_handled(
+            &mut acks.lock().expect("acks"),
+            parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("handled request"),
+            now(),
+        )
+        .expect("ACK after return_completed");
+        assert!(matches!(
+            accepted,
+            gearwit_protocol::HandledCursor::Accepted { ref cursor, .. } if cursor == "post02"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_return_completed_keeps_measured_loss_ack_held() {
+        let (_table, link) = admitted();
+        let signal_id = "01J00000000000000000000021";
+        let mut ledger = DeliveryLedger::default();
+        let delivery = prepare_delivery(
+            &mut ledger,
+            &link,
+            signal_id.to_owned(),
+            vec![provider("post02")],
+            now(),
+        )
+        .expect("pending delivery");
+        let WaiterLink::DeliverEvents {
+            delivery_id: expected_delivery_id,
+            link_id,
+            signal_id,
+            ..
+        } = delivery
+        else {
+            panic!("deliver_events")
+        };
+        let mut acks = AckStore::with_arm(arm());
+        acks.note_claimed(signal_id.clone()).expect("claim");
+        acks.require_return_completed_before_handled(&signal_id)
+            .expect("visibility gate");
+        acks.note_delivered(
+            signal_id.clone(),
+            vec!["post02".to_owned()],
+            &["post02".to_owned()],
+        )
+        .expect("delivered refs");
+        let acks = Mutex::new(acks);
+        let mut pipe = super::DaemonPipe {
+            ledger,
+            claim: None,
+            attempted: true,
+        };
+        let forged_delivery_id = "01J00000000000000000000022".to_owned();
+        assert_ne!(forged_delivery_id, expected_delivery_id);
+        let forged_result = WaiterLink::DeliveryResult {
+            schema: SCHEMA.to_owned(),
+            delivery_id: forged_delivery_id,
+            link_id,
+            signal_id,
+            outcome: "return_completed".to_owned(),
+            observed_at: "2026-01-15T12:05:03Z".to_owned(),
+        };
+        assert_eq!(
+            apply_waiter_result_with_ack_visibility(&mut pipe, &acks, &forged_result),
+            ResultApply::RevokeLost
+        );
+        let served = gearwit_host::apply_handled_request(
+            &mut acks.lock().expect("acks"),
+            parse_handled_cursor(include_str!(
+                "../../gearwit-protocol/fixtures/handled-cursor/conforming/request-prefix.json"
+            ))
+            .expect("handled request"),
+            now(),
+        )
+        .expect("handled refusal");
+        assert!(matches!(
+            served.reply,
+            gearwit_protocol::HandledCursor::Rejected { code, .. }
+                if code == "ack_before_delivery"
+        ));
+        assert!(served.rearm.is_none());
+        assert_eq!(acks.lock().expect("acks").arm().expect("arm").generation, 1);
     }
 
     #[test]
@@ -2053,6 +2468,102 @@ mod tests {
         );
         assert!(pipe.claim.is_none());
         assert_eq!(outcome.coverage, DaemonCoverage::Halt { exit: 2 });
+    }
+
+    #[test]
+    fn advisory_refusal_does_not_claim_dispatch_or_advance_the_cursor() {
+        let drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Err(DrainError::AdvisoryCannotFit {
+                event_ref: "post02".to_owned(),
+                controls_removed: 1,
+                scalars_clipped: 4096,
+            }),
+        };
+        let (_table, link) = admitted();
+        let mut pipe = super::DaemonPipe::default();
+        let mut io = ScriptedIo {
+            fail_send: false,
+            sent: None,
+            complete: true,
+        };
+        let outcome = ingest(
+            WaitResult::Matched,
+            &drain,
+            Some(&link),
+            &mut pipe,
+            Some(&mut io),
+            "01J00000000000000000000021",
+        );
+        assert_eq!(outcome.coverage, DaemonCoverage::Halt { exit: 2 });
+        assert!(pipe.claim.is_none());
+        assert!(!outcome.delivery_attempted);
+        assert!(io.sent.is_none());
+        assert_eq!(
+            drain.after.lock().expect("baseline").as_deref(),
+            Some("cursor1")
+        );
+    }
+
+    #[test]
+    fn local_loss_operator_diagnostic_identifies_ref_and_measured_counts() {
+        let body = format!("partial page\n\n{PARTIAL_BODY_ADVISORY}");
+        let mut observed = event("post02", &body);
+        observed.local_loss = Some(crate::sanitize::LocalBodyLoss {
+            controls_removed: 2,
+            scalars_clipped: 17,
+            displayed_bytes: body.len(),
+        });
+        let diagnostic = super::local_body_loss_diagnostic(&observed).expect("diagnostic");
+        assert!(diagnostic.contains("ref=post02"));
+        assert!(diagnostic.contains("controls_removed=2"));
+        assert!(diagnostic.contains("scalars_clipped=17"));
+        assert!(diagnostic.contains("advisory=untrusted-spoofable"));
+    }
+
+    #[test]
+    fn non_displayable_page_is_withheld_before_claim() {
+        let too_many_bytes = "🧪".repeat(1025);
+        let drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Ok(vec![event("post02", &too_many_bytes)]),
+        };
+        let mut pipe = super::DaemonPipe::default();
+        let outcome = ingest(
+            WaitResult::Matched,
+            &drain,
+            None,
+            &mut pipe,
+            None,
+            "01J00000000000000000000021",
+        );
+        assert_eq!(outcome.coverage, DaemonCoverage::Halt { exit: 2 });
+        assert!(pipe.claim.is_none());
+    }
+
+    #[test]
+    fn measured_loss_without_visible_advisory_is_withheld_before_claim() {
+        let mut observed = event("post02", "partial page");
+        observed.local_loss = Some(crate::sanitize::LocalBodyLoss {
+            controls_removed: 1,
+            scalars_clipped: 12,
+            displayed_bytes: observed.message.len(),
+        });
+        let drain = FixedDrain {
+            after: Mutex::new(None),
+            result: Ok(vec![observed]),
+        };
+        let mut pipe = super::DaemonPipe::default();
+        let outcome = ingest(
+            WaitResult::Matched,
+            &drain,
+            None,
+            &mut pipe,
+            None,
+            "01J00000000000000000000021",
+        );
+        assert_eq!(outcome.coverage, DaemonCoverage::Halt { exit: 2 });
+        assert!(pipe.claim.is_none());
     }
 
     #[test]
