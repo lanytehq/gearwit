@@ -29,6 +29,8 @@ struct SignalBatch {
     drain_snapshot: Vec<String>,
     after_bound: Vec<String>,
     handled: Option<String>,
+    require_return_completed: bool,
+    return_completed: bool,
     closed: bool,
 }
 
@@ -108,6 +110,8 @@ impl AckStore {
                 drain_snapshot: drain_snapshot.to_vec(),
                 after_bound,
                 handled: None,
+                require_return_completed: false,
+                return_completed: false,
                 closed: false,
             },
         );
@@ -152,10 +156,64 @@ impl AckStore {
                 drain_snapshot: Vec::new(),
                 after_bound: Vec::new(),
                 handled: None,
+                require_return_completed: false,
+                return_completed: false,
                 closed: false,
             },
         );
         Ok(())
+    }
+
+    /// Hold handled-cursor acceptance until this signal has a successful
+    /// `return_completed` result from its attach attempt.
+    ///
+    /// Used only when a local display warning must be visible before the
+    /// current handled-cursor route can advance the page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandledCursorError`] when the signal is unknown or closed.
+    pub fn require_return_completed_before_handled(
+        &mut self,
+        signal_id: &str,
+    ) -> Result<(), HandledCursorError> {
+        let batch = self
+            .signals
+            .get_mut(signal_id)
+            .ok_or(HandledCursorError::Semantic("unknown_signal"))?;
+        if batch.closed || batch.handled.is_some() {
+            return Err(HandledCursorError::Semantic("stale_generation"));
+        }
+        batch.require_return_completed = true;
+        Ok(())
+    }
+
+    /// Record successful completion of the correlated attach receipt write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandledCursorError`] when the signal is unknown or no batch
+    /// has been delivered yet.
+    pub fn note_return_completed(&mut self, signal_id: &str) -> Result<(), HandledCursorError> {
+        let batch = self
+            .signals
+            .get_mut(signal_id)
+            .ok_or(HandledCursorError::Semantic("unknown_signal"))?;
+        if batch.delivered.is_empty() {
+            return Err(HandledCursorError::Semantic("ack_before_delivery"));
+        }
+        if batch.require_return_completed {
+            batch.return_completed = true;
+        }
+        Ok(())
+    }
+
+    /// Whether this signal is held for a successful attach result before ACK.
+    #[must_use]
+    pub fn requires_return_completed_before_handled(&self, signal_id: &str) -> bool {
+        self.signals
+            .get(signal_id)
+            .is_some_and(|batch| batch.require_return_completed && !batch.return_completed)
     }
 
     /// Live arm, if any.
@@ -357,6 +415,9 @@ fn decide(store: &mut AckStore, request: &HandledCursor, now: OffsetDateTime) ->
         return rejected("stale_generation");
     }
     if batch.delivered.is_empty() {
+        return rejected("ack_before_delivery");
+    }
+    if batch.require_return_completed && !batch.return_completed {
         return rejected("ack_before_delivery");
     }
     if batch
@@ -677,6 +738,43 @@ mod tests {
         assert!(matches!(
             stale,
             HandledCursor::Rejected { code, .. } if code == "stale_cursor"
+        ));
+    }
+
+    #[test]
+    fn return_completion_gate_holds_ack_until_successful_attach_result() {
+        let signal_id = "01J00000000000000000000021";
+        let mut store = store_with_batch();
+        store
+            .require_return_completed_before_handled(signal_id)
+            .expect("set local visibility gate");
+        assert!(store.requires_return_completed_before_handled(signal_id));
+
+        let failed = record_handled(
+            &mut store,
+            request("post02", "01J00000000000000000000050"),
+            now(),
+        )
+        .expect("rejected ack");
+        assert!(matches!(
+            failed,
+            HandledCursor::Rejected { code, .. } if code == "ack_before_delivery"
+        ));
+        assert!(store.requires_return_completed_before_handled(signal_id));
+
+        store
+            .note_return_completed(signal_id)
+            .expect("correlated attach result");
+        assert!(!store.requires_return_completed_before_handled(signal_id));
+        let accepted = record_handled(
+            &mut store,
+            request("post02", "01J00000000000000000000051"),
+            now(),
+        )
+        .expect("ack after successful display");
+        assert!(matches!(
+            accepted,
+            HandledCursor::Accepted { cursor, .. } if cursor == "post02"
         ));
     }
 

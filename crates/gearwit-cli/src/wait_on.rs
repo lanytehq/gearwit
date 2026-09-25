@@ -7,7 +7,9 @@ use std::fmt::Write as _;
 use std::io;
 use std::process::{Command, ExitStatus};
 
-use crate::sanitize::{MAX_BODY, MAX_ID, MAX_TIMEOUT, paste_body, paste_field, paste_token};
+use crate::sanitize::{
+    BodyPrepareError, LocalBodyLoss, MAX_ID, MAX_TIMEOUT, paste_field, paste_token, prepare_body,
+};
 use gearwit_domain::{
     CoverageEndReason, DeliveryRoute, InterruptPhase, LifecycleFact, LifecycleReceipt,
     PhaseObservation, ReceiptError, ReceiptLog, ReceiptSource, WaiterCompletion,
@@ -112,12 +114,14 @@ pub struct DrainedEvent {
     pub id: String,
     /// Username when present and paste-safe.
     pub username: String,
-    /// Body, control-stripped and bounded.
+    /// Body, with locally measured loss disclosed when required.
     pub message: String,
+    /// Process-local diagnostic; never sent as waiter-link status metadata.
+    pub local_loss: Option<LocalBodyLoss>,
 }
 
 /// Why a post-match drain failed closed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DrainError {
     /// Exclusive `--after` was missing.
     MissingBaseline,
@@ -131,12 +135,21 @@ pub enum DrainError {
     DuplicateId,
     /// Provider CLI could not be started or read.
     Io,
+    /// Local loss could not be disclosed within both body limits.
+    AdvisoryCannotFit {
+        /// Provider ref for the page that could not carry a visible advisory.
+        event_ref: String,
+        /// Disallowed controls measured before any display transform.
+        controls_removed: usize,
+        /// Scalars that would be omitted to fit the advisory safely.
+        scalars_clipped: usize,
+    },
 }
 
 impl DrainError {
     /// Stable token for the local receipt face.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::MissingBaseline => "missing_baseline",
             Self::NonZeroExit => "nonzero_exit",
@@ -144,6 +157,18 @@ impl DrainError {
             Self::Empty => "empty",
             Self::DuplicateId => "duplicate_id",
             Self::Io => "io",
+            Self::AdvisoryCannotFit { .. } => "advisory_cannot_fit",
+        }
+    }
+
+    fn advisory_failure(&self) -> Option<(&str, usize, usize)> {
+        match self {
+            Self::AdvisoryCannotFit {
+                event_ref,
+                controls_removed,
+                scalars_clipped,
+            } => Some((event_ref, *controls_removed, *scalars_clipped)),
+            _ => None,
         }
     }
 }
@@ -385,6 +410,8 @@ return: {return_route}  (self_declared)
 durability: in_process
 chanvoy_exit: {chanvoy_exit}
 drain_error: {drain_error}
+drain_diagnostic_json: {drain_diagnostic}
+drain_failure_disposition: {drain_disposition}
 drained_count: {drained_count}
 newest_observed: {newest_observed}
 {events}
@@ -401,7 +428,16 @@ newest_observed: {newest_observed}
         chanvoy_exit = outcome
             .chanvoy_exit
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-        drain_error = outcome.drain_error.map_or("none", DrainError::as_str),
+        drain_error = outcome
+            .drain_error
+            .as_ref()
+            .map_or("none", DrainError::as_str),
+        drain_diagnostic = render_drain_diagnostic(outcome.drain_error.as_ref()),
+        drain_disposition = if outcome.drain_error.is_some() {
+            "withheld_before_claim_or_dispatch; cursor_not_advanced"
+        } else {
+            "none"
+        },
         drained_count = outcome.drained_events.len(),
         newest_observed = outcome
             .newest_observed
@@ -417,15 +453,43 @@ fn render_drained_events(events: &[DrainedEvent]) -> String {
     }
     let mut out = String::from("drained_events:");
     for event in events {
+        let body_json = serde_json::to_string(&event.message)
+            .unwrap_or_else(|_| "\"<unavailable>\"".to_owned());
         let _ = write!(
             out,
-            "\n- id={id} user={user}\n  {body}",
+            "\n- id={id} user={user}\n  body_json: {body}",
             id = paste_field(&event.id, MAX_ID),
             user = paste_field(&event.username, MAX_ID),
-            body = event.message.replace('\n', " / "),
+            body = body_json,
         );
+        let _ = write!(
+            out,
+            "\n  body_notice_trust: untrusted-provider-text; the source may mimic this notice"
+        );
+        if let Some(loss) = event.local_loss {
+            let _ = write!(
+                out,
+                "\n  local_body_loss: controls_removed={} scalars_clipped={} displayed_bytes={}",
+                loss.controls_removed, loss.scalars_clipped, loss.displayed_bytes
+            );
+        }
     }
     out
+}
+
+fn render_drain_diagnostic(error: Option<&DrainError>) -> String {
+    let Some((event_ref, controls_removed, scalars_clipped)) =
+        error.and_then(DrainError::advisory_failure)
+    else {
+        return "none".to_owned();
+    };
+    serde_json::json!({
+        "reason": "advisory_cannot_fit",
+        "event_ref": event_ref,
+        "controls_removed": controls_removed,
+        "scalars_clipped": scalars_clipped,
+    })
+    .to_string()
 }
 
 /// Parse a full `chanvoy read --json` object. Rejects partial or duplicate sets.
@@ -467,10 +531,18 @@ pub fn parse_drained_events(json: &str) -> Result<Vec<DrainedEvent>, DrainError>
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
+        let prepared = prepare_body(body).map_err(|error: BodyPrepareError| {
+            DrainError::AdvisoryCannotFit {
+                event_ref: id.to_owned(),
+                controls_removed: error.controls_removed,
+                scalars_clipped: error.scalars_clipped,
+            }
+        })?;
         events.push(DrainedEvent {
             id: id.to_owned(),
             username: username.to_owned(),
-            message: paste_body(body, MAX_BODY),
+            message: prepared.body,
+            local_loss: prepared.local_loss,
         });
     }
     Ok(events)
@@ -674,6 +746,7 @@ mod tests {
         WaitRunner, WaiterState, attach_drain, chanvoy_wait_args, coverage_advance,
         execute_wait_on, parse_drained_events, render_wait_receipt, waiter_receipt_log,
     };
+    use crate::sanitize::MAX_BODY;
     use gearwit_domain::InterruptPhase;
     use std::io;
     use std::process::{Command, ExitStatus};
@@ -745,11 +818,13 @@ mod tests {
                     id: "post-a".to_owned(),
                     username: "peer".to_owned(),
                     message: "first".to_owned(),
+                    local_loss: None,
                 },
                 DrainedEvent {
                     id: "post-b".to_owned(),
                     username: "peer".to_owned(),
                     message: "second".to_owned(),
+                    local_loss: None,
                 },
             ],
             newest_observed: Some("post-b".to_owned()),
@@ -839,6 +914,7 @@ mod tests {
             id: id.to_owned(),
             username: "peer".to_owned(),
             message: body.to_owned(),
+            local_loss: None,
         }
     }
 
@@ -851,6 +927,42 @@ mod tests {
         assert_eq!(events[0].message, "one");
         assert_eq!(events[1].id, "bbb");
         assert_eq!(events[1].message, "two");
+    }
+
+    #[test]
+    fn parse_preserves_tabs_and_discloses_local_control_loss() {
+        let json = r#"[{"id":"aaa","username":"peer","message":"left\tright\u001b"}]"#;
+        let events = parse_drained_events(json).expect("loss can be disclosed");
+        assert_eq!(
+            events[0].message,
+            "left\tright\n\nPartial body; full post at source."
+        );
+        let loss = events[0].local_loss.expect("local loss diagnostic");
+        assert_eq!(loss.controls_removed, 1);
+        assert_eq!(loss.scalars_clipped, 0);
+        assert_eq!(loss.displayed_bytes, events[0].message.len());
+        let rendered = super::render_drained_events(&events);
+        assert!(
+            rendered.contains(r#"body_json: "left\tright\n\nPartial body; full post at source.""#)
+        );
+        assert!(rendered.contains(
+            "body_notice_trust: untrusted-provider-text; the source may mimic this notice"
+        ));
+        assert!(rendered.contains("local_body_loss: controls_removed=1 scalars_clipped=0"));
+    }
+
+    #[test]
+    fn parse_refuses_when_a_single_grapheme_cannot_fit_with_the_warning() {
+        let body = "\u{301}".repeat(MAX_BODY);
+        let json = serde_json::json!([{"id":"aaa","message":body}]).to_string();
+        assert_eq!(
+            parse_drained_events(&json).unwrap_err(),
+            DrainError::AdvisoryCannotFit {
+                event_ref: "aaa".to_owned(),
+                controls_removed: 0,
+                scalars_clipped: MAX_BODY,
+            }
+        );
     }
 
     #[test]
@@ -923,6 +1035,29 @@ mod tests {
         );
         assert_eq!(missing.drain_error, Some(DrainError::MissingBaseline));
         assert_eq!(missing.process_exit, 2);
+    }
+
+    #[test]
+    fn undisclosable_loss_stops_follow_without_cursor_advance() {
+        let outcome = attach_drain(
+            execute_wait_on(&spec(), &ExitCodeRunner(0)),
+            &spec(),
+            &FixedDrain(Err(DrainError::AdvisoryCannotFit {
+                event_ref: "source-post".to_owned(),
+                controls_removed: 1,
+                scalars_clipped: MAX_BODY,
+            })),
+        );
+        assert_eq!(outcome.newest_observed, None);
+        assert_eq!(outcome.drained_events, []);
+        assert_eq!(
+            coverage_advance(&outcome, "cursor1"),
+            CoverageAdvance::Stop { exit: 2 }
+        );
+        let receipt = render_wait_receipt(&spec(), &outcome);
+        assert!(receipt.contains("drain_diagnostic_json: {\"controls_removed\":1"));
+        assert!(receipt.contains("\"event_ref\":\"source-post\""));
+        assert!(receipt.contains("withheld_before_claim_or_dispatch; cursor_not_advanced"));
     }
 
     #[test]
